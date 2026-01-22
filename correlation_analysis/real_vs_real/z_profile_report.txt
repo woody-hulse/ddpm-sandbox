@@ -1,82 +1,82 @@
 ================================================================================
-Real vs Real (Matched): Z-Profile Analysis
+Real vs Real: Z-Profile Analysis
 ================================================================================
 
 
 peak_amplitude:
-  Valid samples: 45
-  Correlation: 0.9738
-  Real A: 85.9914 ± 49.2571
-  Real B: 87.1722 ± 48.2170
-  RMSE: 1.1271e+01
-  KS p-value: 0.9952
+  Valid samples: 4096
+  Correlation: 0.9751
+  Event A: 81.4735 ± 49.3694
+  Event B: 81.2850 ± 49.0328
+  RMSE: 1.0982e+01
+  KS p-value: 0.9974
 
 peak_time:
-  Valid samples: 45
-  Correlation: -0.1245
-  Real A: 239.9556 ± 50.1885
-  Real B: 233.5333 ± 41.9881
-  RMSE: 6.9626e+01
-  KS p-value: 0.9479
-
-total_integral:
-  Valid samples: 45
-  Correlation: 0.9979
-  Real A: 17791.8674 ± 10521.3484
-  Real B: 17615.4789 ± 10167.6765
-  RMSE: 7.7124e+02
+  Valid samples: 4096
+  Correlation: 0.3321
+  Event A: 242.3936 ± 45.5517
+  Event B: 242.6528 ± 45.1784
+  RMSE: 5.2433e+01
   KS p-value: 1.0000
 
+total_integral:
+  Valid samples: 4096
+  Correlation: 0.9940
+  Event A: 16428.4933 ± 10701.1177
+  Event B: 16361.3302 ± 10595.4440
+  RMSE: 1.1715e+03
+  KS p-value: 0.9962
+
 rise_time:
-  Valid samples: 45
-  Correlation: 0.1125
-  Real A: 195.8667 ± 46.9272
-  Real B: 194.5556 ± 40.9186
-  RMSE: 5.8703e+01
-  KS p-value: 0.9479
+  Valid samples: 4096
+  Correlation: 0.4262
+  Event A: 196.8259 ± 50.3656
+  Event B: 198.6853 ± 50.4287
+  RMSE: 5.4021e+01
+  KS p-value: 0.8062
 
 fall_time:
-  Valid samples: 45
-  Correlation: 0.4543
-  Real A: 197.8222 ± 66.7773
-  Real B: 203.4222 ± 56.5841
-  RMSE: 6.5264e+01
-  KS p-value: 0.8245
+  Valid samples: 4096
+  Correlation: 0.5160
+  Event A: 193.4543 ± 63.4644
+  Event B: 193.2349 ± 63.1801
+  RMSE: 6.2300e+01
+  KS p-value: 1.0000
 
 fwhm:
-  Valid samples: 45
-  Correlation: 0.1558
-  Real A: 179.0222 ± 62.3362
-  Real B: 162.5556 ± 58.9473
-  RMSE: 8.0542e+01
-  KS p-value: 0.6534
+  Valid samples: 4096
+  Correlation: 0.4997
+  Event A: 173.6199 ± 63.9936
+  Event B: 173.0132 ± 64.0243
+  RMSE: 6.4031e+01
+  KS p-value: 1.0000
 
 std_dev:
-  Valid samples: 45
-  Correlation: 0.4922
-  Real A: 116.9292 ± 22.3744
-  Real B: 113.8696 ± 20.4553
-  RMSE: 2.1859e+01
-  KS p-value: 0.6534
+  Valid samples: 4096
+  Correlation: 0.7483
+  Event A: 114.4048 ± 21.6091
+  Event B: 114.3478 ± 21.0414
+  RMSE: 1.5141e+01
+  KS p-value: 0.9996
 
 skewness:
-  Valid samples: 45
-  Correlation: 0.5209
-  Real A: 0.3057 ± 0.2261
-  Real B: 0.3441 ± 0.2210
-  RMSE: 2.2222e-01
-  KS p-value: 0.8245
+  Valid samples: 4096
+  Correlation: 0.5985
+  Event A: 0.3600 ± 0.2598
+  Event B: 0.3605 ± 0.2584
+  RMSE: 2.3217e-01
+  KS p-value: 1.0000
 
 kurtosis:
-  Valid samples: 45
-  Correlation: 0.4861
-  Real A: -0.7999 ± 0.3491
-  Real B: -0.7260 ± 0.5634
-  RMSE: 5.0357e-01
-  KS p-value: 0.9479
+  Valid samples: 4096
+  Correlation: 0.5980
+  Event A: -0.6834 ± 0.5490
+  Event B: -0.6785 ± 0.5655
+  RMSE: 4.9988e-01
+  KS p-value: 0.9825
 
 ========================================
 SUMMARY:
-  Average correlation: 0.4521
-  Min correlation: -0.1245
-  Max correlation: 0.9979
+  Average correlation: 0.6320
+  Min correlation: 0.3321
+  Max correlation: 0.9940

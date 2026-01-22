@@ -167,18 +167,12 @@ def compute_xy_metrics(xy_profile: np.ndarray, channel_positions: np.ndarray) ->
     spread_x = np.sqrt(np.sum(weights * dx**2))
     spread_y = np.sqrt(np.sum(weights * dy**2))
     
-    peak_channel = np.argmax(xy_profile)
-    peak_x = channel_positions[peak_channel, 0]
-    peak_y = channel_positions[peak_channel, 1]
-
     return {
         'total_intensity': total,
         'centroid_x': centroid_x,
         'centroid_y': centroid_y,
         'spread_x': spread_x,
         'spread_y': spread_y,
-        'peak_x': peak_x,
-        'peak_y': peak_y,
     }
 
 
@@ -623,65 +617,45 @@ def generate_report(
             f.write(f"  Max correlation: {np.max(correlations):.4f}\n")
 
 
-def find_matched_pairs(
+def find_nearest_neighbor(
     conditions: np.ndarray,
-    pool_size: int,
-    n_pairs: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+    exclude_self: bool = True,
+) -> np.ndarray:
     """
-    Find pairs of events matched by z position (dt) and total magnitude.
+    For each event, find the nearest neighbor by (xc, yc, dt, intensity).
     
     Parameters:
     -----------
     conditions : ndarray
-        Shape (pool_size, cond_dim) where columns are [xc, yc, dt, intensity, ...]
-    pool_size : int
-        Number of events in the pool
-    n_pairs : int
-        Number of pairs to find
+        Shape (n, cond_dim) where columns are [xc, yc, dt, intensity, ...]
+    exclude_self : bool
+        If True, don't match an event to itself
         
     Returns:
     --------
-    indices_a, indices_b : arrays of matched pair indices
+    indices : array of nearest neighbor indices for each event
     """
+    xc = conditions[:, 0]
+    yc = conditions[:, 1]
     dt = conditions[:, 2]
     intensity = conditions[:, 3]
     
+    xc_norm = (xc - xc.mean()) / (xc.std() + 1e-8)
+    yc_norm = (yc - yc.mean()) / (yc.std() + 1e-8)
     dt_norm = (dt - dt.mean()) / (dt.std() + 1e-8)
-    intensity_norm = (intensity - intensity.mean()) / (intensity.std() + 1e-8)
+    int_norm = (intensity - intensity.mean()) / (intensity.std() + 1e-8)
     
-    features = np.stack([dt_norm, intensity_norm], axis=1)
+    features = np.stack([xc_norm, yc_norm, dt_norm, int_norm], axis=1)
     
-    used = set()
-    indices_a = []
-    indices_b = []
+    indices = []
+    for i in range(len(features)):
+        dists = np.sum((features - features[i]) ** 2, axis=1)
+        if exclude_self:
+            dists[i] = float('inf')
+        best_j = np.argmin(dists)
+        indices.append(best_j)
     
-    available = list(range(pool_size))
-    np.random.shuffle(available)
-    
-    for i in available:
-        if i in used or len(indices_a) >= n_pairs:
-            break
-            
-        dist_i = features[i]
-        best_j = None
-        best_dist = float('inf')
-        
-        for j in range(pool_size):
-            if j == i or j in used:
-                continue
-            dist = np.sum((features[j] - dist_i) ** 2)
-            if dist < best_dist:
-                best_dist = dist
-                best_j = j
-        
-        if best_j is not None:
-            indices_a.append(i)
-            indices_b.append(best_j)
-            used.add(i)
-            used.add(best_j)
-    
-    return np.array(indices_a), np.array(indices_b)
+    return np.array(indices)
 
 
 def run_real_vs_real_analysis(
@@ -689,22 +663,21 @@ def run_real_vs_real_analysis(
     n_samples: int,
     output_dir: str,
 ):
-    """Compare pairs of real events matched by z position and magnitude."""
+    """Compare pairs of real events matched by conditioning parameters (xc, yc, dt, intensity)."""
     print("\n" + "=" * 60)
-    print("REAL vs REAL ANALYSIS (Matched by z position & magnitude)")
+    print("REAL vs REAL ANALYSIS (Matched by xc, yc, dt, intensity)")
     print("=" * 60)
     
     os.makedirs(output_dir, exist_ok=True)
     
-    pool_size = min(n_samples * 4, data_loader.n_samples)
-    print(f"Loading pool of {pool_size} real samples...")
+    print(f"Loading {n_samples} real samples...")
     
     all_data = []
     all_cond = []
     batch_size = 64
     
-    for _ in tqdm(range((pool_size + batch_size - 1) // batch_size), desc="Loading data"):
-        remaining = pool_size - len(all_data)
+    for _ in tqdm(range((n_samples + batch_size - 1) // batch_size), desc="Loading data"):
+        remaining = n_samples - len(all_data)
         if remaining <= 0:
             break
         current_batch = min(batch_size, remaining)
@@ -716,79 +689,108 @@ def run_real_vs_real_analysis(
     all_data = np.array(all_data)
     all_cond = np.array(all_cond)
     
-    print(f"Finding {n_samples} matched pairs based on z position and magnitude...")
-    indices_a, indices_b = find_matched_pairs(all_cond, len(all_data), n_samples)
+    print(f"Finding nearest neighbor for each sample by (xc, yc, dt, intensity)...")
+    neighbor_indices = find_nearest_neighbor(all_cond, exclude_self=True)
     
-    print(f"  Found {len(indices_a)} matched pairs")
+    cond_a = all_cond
+    cond_b = all_cond[neighbor_indices]
     
-    batch_a = standardize_batch(all_data[indices_a])
-    batch_b = standardize_batch(all_data[indices_b])
-    cond_a = all_cond[indices_a]
-    cond_b = all_cond[indices_b]
-    
-    dt_diff = np.abs(cond_a[:, 2] - cond_b[:, 2])
-    intensity_ratio = cond_a[:, 3] / (cond_b[:, 3] + 1e-8)
-    print(f"  Avg |dt_a - dt_b|: {np.mean(dt_diff):.3f}")
-    print(f"  Avg intensity ratio: {np.mean(intensity_ratio):.3f} (ideal=1.0)")
+    param_diff = np.abs(cond_a[:, :4] - cond_b[:, :4])
+    print(f"  Avg |xc_a - xc_b|: {np.mean(param_diff[:, 0]):.3f}")
+    print(f"  Avg |yc_a - yc_b|: {np.mean(param_diff[:, 1]):.3f}")
+    print(f"  Avg |dt_a - dt_b|: {np.mean(param_diff[:, 2]):.3f}")
+    print(f"  Avg intensity ratio: {np.mean(cond_a[:, 3] / (cond_b[:, 3] + 1e-8)):.3f}")
     
     n_channels = data_loader.n_channels
     n_time = data_loader.n_time_points
     channel_positions = data_loader.channel_positions
     
-    print("Computing metrics for matched pairs (correlations)...")
+    batch_a = standardize_batch(all_data)
+    batch_b = standardize_batch(all_data[neighbor_indices])
+    
+    print("Computing extracted metrics...")
     z_metrics_a, xy_metrics_a = collect_metrics(batch_a, n_channels, n_time, channel_positions)
     z_metrics_b, xy_metrics_b = collect_metrics(batch_b, n_channels, n_time, channel_positions)
     
-    print("Computing metrics for all samples (distributions)...")
-    all_data_std = standardize_batch(all_data)
-    z_metrics_all, xy_metrics_all = collect_metrics(all_data_std, n_channels, n_time, channel_positions)
+    cond_metrics_a = {
+        'xc (true)': cond_a[:, 0],
+        'yc (true)': cond_a[:, 1],
+        'dt (true)': cond_a[:, 2],
+        'intensity (true)': cond_a[:, 3],
+    }
+    cond_metrics_b = {
+        'xc (true)': cond_b[:, 0],
+        'yc (true)': cond_b[:, 1],
+        'dt (true)': cond_b[:, 2],
+        'intensity (true)': cond_b[:, 3],
+    }
     
     print("Generating plots...")
+    
+    cond_corr = plot_correlation_matrix(
+        cond_metrics_a, cond_metrics_b,
+        os.path.join(output_dir, 'conditioning_params_correlation.png'),
+        title="Real vs Real: Conditioning Parameters (xc, yc, dt, intensity)",
+        label_a="Event A", label_b="Event B (nearest neighbor)"
+    )
     
     z_corr = plot_correlation_matrix(
         z_metrics_a, z_metrics_b,
         os.path.join(output_dir, 'z_profile_correlation.png'),
-        title="Real vs Real (Matched): Z-Profile (Time) Metrics",
-        label_a="Real Event A", label_b="Real Event B (matched)"
-    )
-    
-    plot_single_distribution(
-        z_metrics_all,
-        os.path.join(output_dir, 'z_profile_distributions.png'),
-        title="Real Data: Z-Profile (Time) Metrics Distribution"
+        title="Real vs Real: Z-Profile (Time) Extracted Metrics",
+        label_a="Event A", label_b="Event B (nearest neighbor)"
     )
     
     xy_corr = plot_correlation_matrix(
         xy_metrics_a, xy_metrics_b,
         os.path.join(output_dir, 'xy_profile_correlation.png'),
-        title="Real vs Real (Matched): XY-Profile (Spatial) Metrics",
-        label_a="Real Event A", label_b="Real Event B (matched)"
+        title="Real vs Real: XY-Profile (Spatial) Extracted Metrics",
+        label_a="Event A", label_b="Event B (nearest neighbor)"
     )
     
     plot_single_distribution(
-        xy_metrics_all,
+        cond_metrics_a,
+        os.path.join(output_dir, 'conditioning_params_distributions.png'),
+        title="Real Data: Conditioning Parameters Distribution"
+    )
+    
+    plot_single_distribution(
+        z_metrics_a,
+        os.path.join(output_dir, 'z_profile_distributions.png'),
+        title="Real Data: Z-Profile Metrics Distribution"
+    )
+    
+    plot_single_distribution(
+        xy_metrics_a,
         os.path.join(output_dir, 'xy_profile_distributions.png'),
-        title="Real Data: XY-Profile (Spatial) Metrics Distribution"
+        title="Real Data: XY-Profile Metrics Distribution"
     )
     
     plot_sample_profiles(
         batch_a, batch_b, n_channels, n_time,
         os.path.join(output_dir, 'sample_z_profiles.png'),
-        label_a="Real A", label_b="Real B (matched)", n_samples=5
+        label_a="Event A", label_b="Event B (nearest)", n_samples=5
     )
     
     generate_report(
+        cond_metrics_a, cond_metrics_b,
+        os.path.join(output_dir, 'conditioning_params_report.txt'),
+        "Real vs Real: Conditioning Parameters", "Event A", "Event B"
+    )
+    generate_report(
         z_metrics_a, z_metrics_b,
         os.path.join(output_dir, 'z_profile_report.txt'),
-        "Real vs Real (Matched): Z-Profile Analysis", "Real A", "Real B"
+        "Real vs Real: Z-Profile Analysis", "Event A", "Event B"
     )
     generate_report(
         xy_metrics_a, xy_metrics_b,
         os.path.join(output_dir, 'xy_profile_report.txt'),
-        "Real vs Real (Matched): XY-Profile Analysis", "Real A", "Real B"
+        "Real vs Real: XY-Profile Analysis", "Event A", "Event B"
     )
     
     print(f"\nResults saved to: {output_dir}")
+    if cond_corr:
+        print(f"  Conditioning params avg correlation: {np.mean(cond_corr):.4f}")
     if z_corr:
         print(f"  Z-profile avg correlation: {np.mean(z_corr):.4f}")
     if xy_corr:
@@ -802,7 +804,7 @@ def run_real_vs_generated_analysis(
     output_dir: str,
     device: torch.device,
 ):
-    """Compare real data vs DDPM-generated data."""
+    """Compare real data vs DDPM-generated data conditioned on the same parameters."""
     print("\n" + "=" * 60)
     print("REAL vs GENERATED ANALYSIS")
     print("=" * 60)
@@ -819,7 +821,7 @@ def run_real_vs_generated_analysis(
         z_hops=cfg.graph.z_hops
     )
     
-    print(f"Generating {n_samples} samples...")
+    print(f"Generating {n_samples} samples conditioned on real event parameters...")
     real_data, gen_data, conditions = generate_samples(
         core, cond_proj, schedule, data_loader, graph, cfg,
         n_samples, device, batch_size=8
@@ -833,7 +835,60 @@ def run_real_vs_generated_analysis(
     z_metrics_real, xy_metrics_real = collect_metrics(real_data, n_channels, n_time, channel_positions)
     z_metrics_gen, xy_metrics_gen = collect_metrics(gen_data, n_channels, n_time, channel_positions)
     
+    true_params = {
+        'xc (true)': conditions[:, 0],
+        'yc (true)': conditions[:, 1],
+        'dt (true)': conditions[:, 2],
+        'intensity (true)': conditions[:, 3],
+    }
+    
+    gen_extracted = {
+        'centroid_x (gen)': xy_metrics_gen.get('centroid_x', np.zeros(len(conditions))),
+        'centroid_y (gen)': xy_metrics_gen.get('centroid_y', np.zeros(len(conditions))),
+        'peak_time (gen)': z_metrics_gen.get('peak_time', np.zeros(len(conditions))),
+        'total_intensity (gen)': xy_metrics_gen.get('total_intensity', np.zeros(len(conditions))),
+    }
+    
+    real_extracted = {
+        'centroid_x (real)': xy_metrics_real.get('centroid_x', np.zeros(len(conditions))),
+        'centroid_y (real)': xy_metrics_real.get('centroid_y', np.zeros(len(conditions))),
+        'peak_time (real)': z_metrics_real.get('peak_time', np.zeros(len(conditions))),
+        'total_intensity (real)': xy_metrics_real.get('total_intensity', np.zeros(len(conditions))),
+    }
+    
     print("Generating plots...")
+    
+    true_vs_gen = {
+        'xc': (true_params['xc (true)'], gen_extracted['centroid_x (gen)']),
+        'yc': (true_params['yc (true)'], gen_extracted['centroid_y (gen)']),
+        'dt': (true_params['dt (true)'], gen_extracted['peak_time (gen)']),
+        'intensity': (true_params['intensity (true)'], gen_extracted['total_intensity (gen)']),
+    }
+    true_metrics = {k: v[0] for k, v in true_vs_gen.items()}
+    gen_metrics = {k: v[1] for k, v in true_vs_gen.items()}
+    
+    param_corr = plot_correlation_matrix(
+        true_metrics, gen_metrics,
+        os.path.join(output_dir, 'true_vs_generated_params.png'),
+        title="True Conditioning vs Generated Extracted Parameters",
+        label_a="True (conditioning)", label_b="Generated (extracted)"
+    )
+    
+    true_vs_real = {
+        'xc': (true_params['xc (true)'], real_extracted['centroid_x (real)']),
+        'yc': (true_params['yc (true)'], real_extracted['centroid_y (real)']),
+        'dt': (true_params['dt (true)'], real_extracted['peak_time (real)']),
+        'intensity': (true_params['intensity (true)'], real_extracted['total_intensity (real)']),
+    }
+    true_metrics_r = {k: v[0] for k, v in true_vs_real.items()}
+    real_metrics_r = {k: v[1] for k, v in true_vs_real.items()}
+    
+    real_param_corr = plot_correlation_matrix(
+        true_metrics_r, real_metrics_r,
+        os.path.join(output_dir, 'true_vs_real_params.png'),
+        title="True Conditioning vs Real Extracted Parameters (baseline)",
+        label_a="True (conditioning)", label_b="Real (extracted)"
+    )
     
     z_corr = plot_correlation_matrix(
         z_metrics_real, z_metrics_gen,
@@ -868,6 +923,11 @@ def run_real_vs_generated_analysis(
     )
     
     generate_report(
+        true_metrics, gen_metrics,
+        os.path.join(output_dir, 'true_vs_generated_params_report.txt'),
+        "True Conditioning vs Generated Extracted", "True", "Generated"
+    )
+    generate_report(
         z_metrics_real, z_metrics_gen,
         os.path.join(output_dir, 'z_profile_report.txt'),
         "Real vs Generated: Z-Profile Analysis", "Real", "Generated"
@@ -879,6 +939,10 @@ def run_real_vs_generated_analysis(
     )
     
     print(f"\nResults saved to: {output_dir}")
+    if param_corr:
+        print(f"  True vs Generated params avg correlation: {np.mean(param_corr):.4f}")
+    if real_param_corr:
+        print(f"  True vs Real params avg correlation: {np.mean(real_param_corr):.4f} (baseline)")
     if z_corr:
         print(f"  Z-profile avg correlation: {np.mean(z_corr):.4f}")
     if xy_corr:
@@ -887,7 +951,7 @@ def run_real_vs_generated_analysis(
 
 def main():
     parser = argparse.ArgumentParser(description="DDPM Correlation Analysis")
-    parser.add_argument('--n_samples', type=int, default=256, help='Number of samples for analysis')
+    parser.add_argument('--n_samples', type=int, default=4096, help='Number of samples for analysis')
     parser.add_argument('--output_dir', type=str, default='correlation_analysis', help='Output directory')
     parser.add_argument('--mode', type=str, choices=['all', 'real_vs_real', 'real_vs_generated'], 
                         default='all', help='Analysis mode')
