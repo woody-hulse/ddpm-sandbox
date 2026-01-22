@@ -24,7 +24,7 @@ class ModelConfig:
 @dataclass
 class DiffusionConfig:
     """Diffusion process parameters."""
-    timesteps: int = 1000
+    timesteps: int = 250
     parametrization: str = "v"  # "v" or "eps"
     p2_gamma: float = 0.5       # P2 loss weighting
     p2_k: float = 1.0
