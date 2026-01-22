@@ -1,0 +1,66 @@
+================================================================================
+Real vs Real (Matched): XY-Profile Analysis
+================================================================================
+
+
+total_intensity:
+  Valid samples: 45
+  Correlation: 0.9980
+  Real A: 17803.7773 ± 10524.2461
+  Real B: 17624.6426 ± 10170.0127
+  RMSE: 7.7188e+02
+  KS p-value: 1.0000
+
+centroid_x:
+  Valid samples: 45
+  Correlation: 0.2142
+  Real A: -1.1542 ± 10.7622
+  Real B: 0.2017 ± 11.0905
+  RMSE: 1.3767e+01
+  KS p-value: 0.9479
+
+centroid_y:
+  Valid samples: 45
+  Correlation: -0.0377
+  Real A: 2.4721 ± 9.8896
+  Real B: 1.1759 ± 10.5601
+  RMSE: 1.4794e+01
+  KS p-value: 0.8245
+
+spread_x:
+  Valid samples: 45
+  Correlation: 0.2489
+  Real A: 12.1143 ± 1.5172
+  Real B: 11.9822 ± 1.7561
+  RMSE: 2.0191e+00
+  KS p-value: 0.9479
+
+spread_y:
+  Valid samples: 45
+  Correlation: 0.5185
+  Real A: 12.2426 ± 1.6848
+  Real B: 11.9188 ± 1.5780
+  RMSE: 1.6360e+00
+  KS p-value: 0.4800
+
+peak_x:
+  Valid samples: 45
+  Correlation: 0.1529
+  Real A: -0.5111 ± 17.7555
+  Real B: 1.8400 ± 18.3591
+  RMSE: 2.3625e+01
+  KS p-value: 0.9952
+
+peak_y:
+  Valid samples: 45
+  Correlation: -0.1113
+  Real A: 4.0722 ± 16.9325
+  Real B: 1.0623 ± 17.2607
+  RMSE: 2.5667e+01
+  KS p-value: 0.9952
+
+========================================
+SUMMARY:
+  Average correlation: 0.2834
+  Min correlation: -0.1113
+  Max correlation: 0.9980

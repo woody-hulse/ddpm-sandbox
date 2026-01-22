@@ -1,0 +1,82 @@
+================================================================================
+Real vs Real (Matched): Z-Profile Analysis
+================================================================================
+
+
+peak_amplitude:
+  Valid samples: 45
+  Correlation: 0.9738
+  Real A: 85.9914 ± 49.2571
+  Real B: 87.1722 ± 48.2170
+  RMSE: 1.1271e+01
+  KS p-value: 0.9952
+
+peak_time:
+  Valid samples: 45
+  Correlation: -0.1245
+  Real A: 239.9556 ± 50.1885
+  Real B: 233.5333 ± 41.9881
+  RMSE: 6.9626e+01
+  KS p-value: 0.9479
+
+total_integral:
+  Valid samples: 45
+  Correlation: 0.9979
+  Real A: 17791.8674 ± 10521.3484
+  Real B: 17615.4789 ± 10167.6765
+  RMSE: 7.7124e+02
+  KS p-value: 1.0000
+
+rise_time:
+  Valid samples: 45
+  Correlation: 0.1125
+  Real A: 195.8667 ± 46.9272
+  Real B: 194.5556 ± 40.9186
+  RMSE: 5.8703e+01
+  KS p-value: 0.9479
+
+fall_time:
+  Valid samples: 45
+  Correlation: 0.4543
+  Real A: 197.8222 ± 66.7773
+  Real B: 203.4222 ± 56.5841
+  RMSE: 6.5264e+01
+  KS p-value: 0.8245
+
+fwhm:
+  Valid samples: 45
+  Correlation: 0.1558
+  Real A: 179.0222 ± 62.3362
+  Real B: 162.5556 ± 58.9473
+  RMSE: 8.0542e+01
+  KS p-value: 0.6534
+
+std_dev:
+  Valid samples: 45
+  Correlation: 0.4922
+  Real A: 116.9292 ± 22.3744
+  Real B: 113.8696 ± 20.4553
+  RMSE: 2.1859e+01
+  KS p-value: 0.6534
+
+skewness:
+  Valid samples: 45
+  Correlation: 0.5209
+  Real A: 0.3057 ± 0.2261
+  Real B: 0.3441 ± 0.2210
+  RMSE: 2.2222e-01
+  KS p-value: 0.8245
+
+kurtosis:
+  Valid samples: 45
+  Correlation: 0.4861
+  Real A: -0.7999 ± 0.3491
+  Real B: -0.7260 ± 0.5634
+  RMSE: 5.0357e-01
+  KS p-value: 0.9479
+
+========================================
+SUMMARY:
+  Average correlation: 0.4521
+  Min correlation: -0.1245
+  Max correlation: 0.9979
