@@ -11,11 +11,11 @@ class ModelConfig:
     """Graph U-Net architecture parameters."""
     in_dim: int = 1
     out_dim: int = 1
-    hidden_dim: int = 64
-    depth: int = 2
+    hidden_dim: int = 16
+    depth: int = 4
     blocks_per_stage: int = 2
-    pool_ratio: float = 0.35
-    dropout: float = 0.00
+    pool_ratio: float = 0.5
+    dropout: float = 0.0
     pos_dim: int = 3
     pos_dropout: float = 0.0
     cache_norm_top: bool = True
@@ -34,16 +34,16 @@ class DiffusionConfig:
 class ConditioningConfig:
     """Conditioning network parameters."""
     cond_in_dim: int = 5        # Input condition dimension
-    cond_proj_dim: int = 32     # Projected condition dimension  
-    time_dim: int = 64          # Time embedding dimension
+    cond_proj_dim: int = 16     # Projected condition dimension  
+    time_dim: int = 16          # Time embedding dimension
 
 
 @dataclass 
 class GraphConfig:
     """Graph construction parameters."""
-    radius: float = 20.0        # Spatial radius for adjacency
+    radius: float = 16.0        # Spatial radius for adjacency
     z_sep: float = 20.0         # Z separation between time layers
-    z_hops: int = 8             # Number of z-hops for connectivity
+    z_hops: int = 4             # Number of z-hops for connectivity
 
 
 @dataclass
@@ -52,9 +52,9 @@ class TrainingConfig:
     epochs: int = 10_000
     batch_size: int = 8
     steps_per_epoch: int = 64   # Optimizer steps per epoch
-    lr: float = 5e-5
-    weight_decay: float = 1e-4
-    ema_decay: float = 0.9995
+    lr: float = 1e-4
+    weight_decay: float = 0
+    ema_decay: float = 0.999
     grad_clip: float = 1.0
     
     # Checkpointing
