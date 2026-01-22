@@ -5,46 +5,46 @@ Real vs Real: XY-Profile Analysis
 
 total_intensity:
   Valid samples: 4096
-  Correlation: 0.9940
-  Event A: 16436.0781 ± 10705.5361
-  Event B: 16369.0469 ± 10600.0254
-  RMSE: 1.1722e+03
-  KS p-value: 0.9962
+  Correlation: 0.9938
+  Event A: 16306.8779 ± 10588.7861
+  Event B: 16263.4062 ± 10531.3613
+  RMSE: 1.1739e+03
+  KS p-value: 0.8688
 
 centroid_x:
   Valid samples: 4096
-  Correlation: 0.9832
-  Event A: -0.6374 ± 10.3988
-  Event B: -0.6515 ± 10.4218
-  RMSE: 1.9111e+00
+  Correlation: 0.9848
+  Event A: -0.8667 ± 10.4594
+  Event B: -0.8697 ± 10.5017
+  RMSE: 1.8273e+00
   KS p-value: 1.0000
 
 centroid_y:
   Valid samples: 4096
-  Correlation: 0.9844
-  Event A: 1.1898 ± 10.6989
-  Event B: 1.1949 ± 10.6998
-  RMSE: 1.8913e+00
+  Correlation: 0.9850
+  Event A: 0.9054 ± 10.6949
+  Event B: 0.9293 ± 10.7048
+  RMSE: 1.8532e+00
   KS p-value: 1.0000
 
 spread_x:
   Valid samples: 4096
-  Correlation: 0.8850
-  Event A: 12.2728 ± 1.8442
-  Event B: 12.2501 ± 1.8263
-  RMSE: 8.8062e-01
-  KS p-value: 0.9658
+  Correlation: 0.9019
+  Event A: 12.2539 ± 1.8435
+  Event B: 12.2317 ± 1.8259
+  RMSE: 8.1303e-01
+  KS p-value: 0.7179
 
 spread_y:
   Valid samples: 4096
-  Correlation: 0.8544
-  Event A: 12.2972 ± 1.6416
-  Event B: 12.2812 ± 1.6262
-  RMSE: 8.8189e-01
-  KS p-value: 0.9924
+  Correlation: 0.8685
+  Event A: 12.2698 ± 1.6281
+  Event B: 12.2430 ± 1.6092
+  RMSE: 8.3066e-01
+  KS p-value: 0.9658
 
 ========================================
 SUMMARY:
-  Average correlation: 0.9402
-  Min correlation: 0.8544
-  Max correlation: 0.9940
+  Average correlation: 0.9468
+  Min correlation: 0.8685
+  Max correlation: 0.9938

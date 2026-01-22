@@ -9,6 +9,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+from scipy import signal
 from tqdm import tqdm
 
 from config import Config, default_config
@@ -203,6 +204,205 @@ def extract_profiles(data: np.ndarray, n_channels: int, n_time: int) -> Tuple[np
     xy_profile = data_2d.sum(axis=1)
     
     return z_profile, xy_profile
+
+
+def _nearest_neighbor_index(channel_positions_xy: np.ndarray) -> np.ndarray:
+    """
+    For each channel, find its nearest neighbor by Euclidean distance in XY.
+
+    Returns:
+    --------
+    nn_idx : ndarray, shape (n_channels,)
+        nn_idx[i] is the nearest neighbor channel index for channel i.
+    """
+    pos = np.asarray(channel_positions_xy)
+    if pos.ndim != 2 or pos.shape[1] != 2:
+        raise ValueError("channel_positions_xy must have shape (n_channels, 2)")
+
+    n = pos.shape[0]
+    nn_idx = np.zeros(n, dtype=np.int64)
+
+    for i in range(n):
+        d = np.sum((pos - pos[i]) ** 2, axis=1)
+        d[i] = np.inf
+        nn_idx[i] = int(np.argmin(d))
+
+    return nn_idx
+
+
+def compute_noise_metrics(
+    data_list: np.ndarray,
+    n_channels: int,
+    n_time: int,
+    channel_positions: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """
+    Quantify temporal + spatial noise properties (per event).
+
+    Notes:
+    - Operates on the standardized data used elsewhere in this script.
+    - Temporal metrics are computed on the z-profile (sum over channels).
+    - Spatial metrics are computed across channels, using nearest-neighbor
+      adjacency in XY.
+    """
+    eps = 1e-8
+    nn_idx = _nearest_neighbor_index(np.asarray(channel_positions)[:, :2])
+
+    out: Dict[str, List[float]] = {
+        # Temporal
+        "lag1_autocorr": [],
+        "diff_rms": [],
+        "high_freq_power_ratio": [],
+        "baseline_std": [],
+        "snr_peak_over_baseline": [],
+        "smooth_residual_var": [],
+        # Spatial
+        "adjacent_channel_cov": [],
+        "adjacent_channel_corr": [],
+        "spatial_to_temporal_var_ratio": [],
+    }
+
+    for data in data_list:
+        x = data.flatten()
+        x2d = x.reshape(n_channels, n_time, order="F")
+
+        z = x2d.sum(axis=0).astype(np.float64)
+        z = z - np.mean(z)
+
+        # 1) Lag-1 autocorrelation (adjacent time bins)
+        z0 = z[:-1]
+        z1 = z[1:]
+        denom = (np.sqrt(np.mean(z0**2)) * np.sqrt(np.mean(z1**2))) + eps
+        out["lag1_autocorr"].append(float(np.mean(z0 * z1) / denom))
+
+        # 2) Point-to-point fluctuation magnitude
+        dz = np.diff(z)
+        out["diff_rms"].append(float(np.sqrt(np.mean(dz**2))))
+
+        # 3) High-frequency power ratio (top quartile of frequencies)
+        z_demean = z - np.mean(z)
+        fft = np.fft.rfft(z_demean)
+        power = (np.abs(fft) ** 2).astype(np.float64)
+        if power.shape[0] > 2:
+            power[0] = 0.0  # ignore DC
+            k0 = int(np.floor(0.75 * (power.shape[0] - 1)))
+            hf = float(np.sum(power[k0:]))
+            tot = float(np.sum(power)) + eps
+            out["high_freq_power_ratio"].append(hf / tot)
+        else:
+            out["high_freq_power_ratio"].append(np.nan)
+
+        # 4) Baseline noise estimate (std in low-signal bins)
+        peak_amp = float(np.max(np.abs(z_demean)))
+        if not np.isfinite(peak_amp) or peak_amp <= 0:
+            baseline_std = np.nan
+        else:
+            mask = np.abs(z_demean) < (0.1 * peak_amp)
+            if np.count_nonzero(mask) < max(10, int(0.1 * n_time)):
+                # fallback: use lowest 20% absolute bins
+                q = np.quantile(np.abs(z_demean), 0.2)
+                mask = np.abs(z_demean) <= q
+            baseline_std = float(np.std(z_demean[mask])) if np.count_nonzero(mask) > 1 else np.nan
+        out["baseline_std"].append(baseline_std)
+
+        # 5) SNR proxy: peak amplitude over baseline std
+        out["snr_peak_over_baseline"].append(float(peak_amp / (baseline_std + eps)) if np.isfinite(baseline_std) else np.nan)
+
+        # 6) Smoothing residual variance (Savitzky-Golay on z-profile)
+        z_for_smooth = z_demean
+        if n_time >= 7:
+            win = min(21, n_time if (n_time % 2 == 1) else (n_time - 1))
+            win = max(win, 7)
+            try:
+                z_smooth = signal.savgol_filter(z_for_smooth, window_length=win, polyorder=3, mode="interp")
+                resid = z_for_smooth - z_smooth
+                out["smooth_residual_var"].append(float(np.var(resid)))
+            except Exception:
+                out["smooth_residual_var"].append(np.nan)
+        else:
+            out["smooth_residual_var"].append(np.nan)
+
+        # 7) Spatial covariance/correlation between nearest-neighbor channels
+        #    Treat each channel as a time-series.
+        X = x2d.astype(np.float64)
+        X = X - np.mean(X, axis=1, keepdims=True)
+        Xn = X[nn_idx]
+        cov_per_ch = np.mean(X * Xn, axis=1)
+        out["adjacent_channel_cov"].append(float(np.mean(cov_per_ch)))
+
+        std_i = np.sqrt(np.mean(X**2, axis=1)) + eps
+        std_j = np.sqrt(np.mean(Xn**2, axis=1)) + eps
+        corr_per_ch = cov_per_ch / (std_i * std_j)
+        out["adjacent_channel_corr"].append(float(np.mean(corr_per_ch)))
+
+        # 8) Inter-channel variance ratio
+        spatial_var = float(np.mean(np.var(x2d, axis=0)))
+        temporal_var = float(np.mean(np.var(x2d, axis=1)))
+        out["spatial_to_temporal_var_ratio"].append(float(spatial_var / (temporal_var + eps)))
+
+    return {k: np.asarray(v, dtype=np.float64) for k, v in out.items()}
+
+
+def plot_noise_summary(
+    noise_metrics: Dict[str, np.ndarray],
+    save_path: str,
+    title: str,
+):
+    """Single-figure summary of per-event noise metrics (distributions)."""
+    metrics_names = list(noise_metrics.keys())
+    n_metrics = len(metrics_names)
+    if n_metrics == 0:
+        return
+
+    n_cols = 3
+    n_rows = (n_metrics + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows))
+    axes = np.atleast_2d(axes).flatten()
+
+    for i, metric in enumerate(metrics_names):
+        ax = axes[i]
+        vals = noise_metrics[metric]
+        vals = vals[np.isfinite(vals)]
+        if vals.size < 10:
+            ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(metric.replace("_", " ").title(), fontweight="bold")
+            continue
+
+        p1 = np.percentile(vals, 1)
+        p99 = np.percentile(vals, 99)
+        vals_plot = vals[(vals >= p1) & (vals <= p99)]
+
+        ax.hist(vals_plot, bins=50, alpha=0.75, density=True, color="slateblue", edgecolor="black", linewidth=0.5)
+
+        mean_val = float(np.mean(vals))
+        std_val = float(np.std(vals))
+        ax.axvline(mean_val, color="red", linestyle="--", alpha=0.9, linewidth=2, label=f"Mean: {mean_val:.3g}")
+
+        display_name = metric.replace("_", " ").title()
+        ax.set_xlabel(display_name, fontsize=11, fontweight="bold")
+        ax.set_ylabel("Density", fontsize=11, fontweight="bold")
+        ax.set_title(display_name, fontsize=12, fontweight="bold")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+        ax.text(
+            0.02,
+            0.98,
+            f"Mean: {mean_val:.3g}\nStd: {std_val:.3g}\nN: {vals.size}",
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        )
+
+    for i in range(n_metrics, len(axes)):
+        fig.delaxes(axes[i])
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
 
 
 @torch.no_grad()
@@ -711,6 +911,10 @@ def run_real_vs_real_analysis(
     print("Computing extracted metrics...")
     z_metrics_a, xy_metrics_a = collect_metrics(batch_a, n_channels, n_time, channel_positions)
     z_metrics_b, xy_metrics_b = collect_metrics(batch_b, n_channels, n_time, channel_positions)
+
+    print("Computing noise metrics...")
+    noise_metrics_a = compute_noise_metrics(batch_a, n_channels, n_time, channel_positions)
+    noise_metrics_b = compute_noise_metrics(batch_b, n_channels, n_time, channel_positions)
     
     cond_metrics_a = {
         'xc (true)': cond_a[:, 0],
@@ -747,6 +951,15 @@ def run_real_vs_real_analysis(
         title="Real vs Real: XY-Profile (Spatial) Extracted Metrics",
         label_a="Event A", label_b="Event B (nearest neighbor)"
     )
+
+    noise_corr = plot_correlation_matrix(
+        noise_metrics_a,
+        noise_metrics_b,
+        os.path.join(output_dir, "noise_metrics_correlation.png"),
+        title="Real vs Real: Noise Metrics (A vs nearest-neighbor B)",
+        label_a="Event A",
+        label_b="Event B (nearest neighbor)",
+    )
     
     plot_single_distribution(
         cond_metrics_a,
@@ -764,6 +977,17 @@ def run_real_vs_real_analysis(
         xy_metrics_a,
         os.path.join(output_dir, 'xy_profile_distributions.png'),
         title="Real Data: XY-Profile Metrics Distribution"
+    )
+
+    plot_noise_summary(
+        noise_metrics_a,
+        os.path.join(output_dir, "noise_metrics_event_a.png"),
+        title="Noise Metrics Summary (Event A)",
+    )
+    plot_noise_summary(
+        noise_metrics_b,
+        os.path.join(output_dir, "noise_metrics_event_b.png"),
+        title="Noise Metrics Summary (Event B: nearest neighbor)",
     )
     
     plot_sample_profiles(
@@ -795,6 +1019,8 @@ def run_real_vs_real_analysis(
         print(f"  Z-profile avg correlation: {np.mean(z_corr):.4f}")
     if xy_corr:
         print(f"  XY-profile avg correlation: {np.mean(xy_corr):.4f}")
+    if noise_corr:
+        print(f"  Noise metrics avg correlation: {np.mean(noise_corr):.4f}")
 
 
 def run_real_vs_generated_analysis(
@@ -834,6 +1060,10 @@ def run_real_vs_generated_analysis(
     print("Computing metrics...")
     z_metrics_real, xy_metrics_real = collect_metrics(real_data, n_channels, n_time, channel_positions)
     z_metrics_gen, xy_metrics_gen = collect_metrics(gen_data, n_channels, n_time, channel_positions)
+
+    print("Computing noise metrics...")
+    noise_metrics_real = compute_noise_metrics(real_data, n_channels, n_time, channel_positions)
+    noise_metrics_gen = compute_noise_metrics(gen_data, n_channels, n_time, channel_positions)
     
     true_params = {
         'xc (true)': conditions[:, 0],
@@ -920,6 +1150,17 @@ def run_real_vs_generated_analysis(
         real_data, gen_data, n_channels, n_time,
         os.path.join(output_dir, 'sample_z_profiles.png'),
         label_a="Real", label_b="Generated", n_samples=5
+    )
+
+    plot_noise_summary(
+        noise_metrics_real,
+        os.path.join(output_dir, "noise_metrics_real.png"),
+        title="Noise Metrics Summary (Real Data)",
+    )
+    plot_noise_summary(
+        noise_metrics_gen,
+        os.path.join(output_dir, "noise_metrics_generated.png"),
+        title="Noise Metrics Summary (Generated Samples)",
     )
     
     generate_report(

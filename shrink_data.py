@@ -267,6 +267,74 @@ def shrink_lz_data(
     return tritium_out, pmt_xy_out, plot_out
 
 
+def shrink_to_single_node(
+    *,
+    tritium_in: Path,
+    out_dir: Optional[Path] = None,
+    batch_rows: int = 512,
+) -> Path:
+    """Shrink waveforms by collapsing the spatial (channel) dimension.
+
+    Input shape: (S, C, T) where C = channels (spatial), T = time.
+    Output shape: (S, 1, T) where each time bin is the sum over all channels.
+
+    This produces a single-node graph per layer (time step) representing the
+    total XY cross-section at that layer. No event pruning is applied.
+
+    Returns the path to the output H5 file.
+    """
+    tritium_in = Path(tritium_in)
+    out_dir = Path(out_dir) if out_dir is not None else tritium_in.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tritium_out = out_dir / f"{tritium_in.stem}_single_node.h5"
+
+    with h5py.File(tritium_in, "r") as fin:
+        if "waveforms" not in fin:
+            raise ValueError(f"{tritium_in} must contain a waveforms dataset.")
+        wf_in = fin["waveforms"]
+        if wf_in.ndim != 3:
+            raise ValueError(f"Expected waveforms to be (S,C,T); got shape={wf_in.shape}")
+        s, c, t = map(int, wf_in.shape)
+
+        with h5py.File(tritium_out, "w") as fout:
+            _copy_attrs(fin, fout)
+            fout.attrs["shrink_mode"] = "single_node"
+            fout.attrs["original_channels"] = int(c)
+            fout.attrs["original_time"] = int(t)
+
+            wf_out = fout.create_dataset(
+                "waveforms",
+                shape=(s, 1, t),
+                dtype=np.float32,
+                chunks=(min(batch_rows, s), 1, t),
+                compression=wf_in.compression,
+                compression_opts=wf_in.compression_opts,
+            )
+            _copy_attrs(wf_in, wf_out)
+
+            for start in range(0, s, int(batch_rows)):
+                end = min(s, start + int(batch_rows))
+                block = np.asarray(wf_in[start:end], dtype=np.float64)
+                sums = block.sum(axis=1, keepdims=True).astype(np.float32)
+                wf_out[start:end, :, :] = sums
+
+            for name, obj in fin.items():
+                if name == "waveforms":
+                    continue
+                if not isinstance(obj, h5py.Dataset):
+                    continue
+                ds_in = obj
+                ds_out = _create_like(ds_in, fout, name, shape=ds_in.shape)
+                _copy_attrs(ds_in, ds_out)
+                for start in range(0, ds_in.shape[0], int(batch_rows)):
+                    end = min(ds_in.shape[0], start + int(batch_rows))
+                    ds_out[start:end, ...] = ds_in[start:end, ...]
+
+    print(f"Shrunk {s} events from ({c},{t}) to single-node ({1},{t}). Wrote {tritium_out}")
+    return tritium_out
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Reduce LZ/Tritium SS H5 data to N center PMTs and a middle time window, with activity filtering.")
     p.add_argument("--tritium-in", type=str, default="data/tritium_ss.h5", help="Input H5 with waveforms/xc/yc/dt.")
@@ -281,11 +349,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--center-y", type=float, default=None, help="Override center y (cm) for PMT selection. Default: mean PMT y.")
     p.add_argument("--out-dir", type=str, default=None, help="Output directory (defaults to input tritium dir).")
     p.add_argument("--batch-rows", type=int, default=512, help="Rows per chunk when copying waveforms.")
+    p.add_argument("--single-node", action="store_true", help="Shrink to single-node graph (sum all channels and time).")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+
+    if args.single_node:
+        tritium_out = shrink_to_single_node(
+            tritium_in=Path(args.tritium_in),
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            batch_rows=int(args.batch_rows),
+        )
+        print(f"Wrote {tritium_out}")
+        return
+
     if (args.center_x is None) ^ (args.center_y is None):
         raise ValueError("Provide both --center-x and --center-y, or neither.")
     center_xy = (float(args.center_x), float(args.center_y)) if args.center_x is not None else None
