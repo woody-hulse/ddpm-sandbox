@@ -70,7 +70,13 @@ def sample_core(
         coef1 = betas_t * torch.sqrt(torch.clamp(alpha_bar_prev_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
         coef2 = torch.clamp(1.0 - alpha_bar_prev_t, min=0.0) * torch.sqrt(torch.clamp(1.0 - betas_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
         mean = coef1 * x0_pred + coef2 * x
-        x = mean
+        
+        if i > 0:
+            posterior_var = schedule['posterior_variance'][i].view(1, 1, 1)
+            noise = torch.randn_like(x)
+            x = mean + torch.sqrt(posterior_var) * noise
+        else:
+            x = mean
     
     return x
 
