@@ -298,6 +298,9 @@ def train(cfg: Config = default_config):
                 rec_xy = rec_int.reshape(n_channels, n_time_points, order='F').sum(axis=1)
                 true_xy = true_int.reshape(n_channels, n_time_points, order='F').sum(axis=1)
 
+                rec_z = rec_int.reshape(n_channels, n_time_points, order='F')
+                true_z = true_int.reshape(n_channels, n_time_points, order='F')
+
                 adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
                 Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))
                 
