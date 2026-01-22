@@ -14,7 +14,7 @@ class ModelConfig:
     hidden_dim: int = 64
     depth: int = 2
     blocks_per_stage: int = 2
-    pool_ratio: float = 0.5
+    pool_ratio: float = 0.35
     dropout: float = 0.00
     pos_dim: int = 3
     pos_dropout: float = 0.0
@@ -24,14 +24,10 @@ class ModelConfig:
 @dataclass
 class DiffusionConfig:
     """Diffusion process parameters."""
-    timesteps: int = 500
+    timesteps: int = 1000
     parametrization: str = "v"  # "v" or "eps"
     p2_gamma: float = 0.5       # P2 loss weighting
     p2_k: float = 1.0
-    
-    # Auxiliary losses to capture temporal correlation structure
-    spectral_loss_weight: float = 0.1   # Frequency-domain loss (0 = disabled)
-    multiscale_loss_weight: float = 0.1 # Multi-resolution loss (0 = disabled)
 
 
 @dataclass
@@ -47,7 +43,7 @@ class GraphConfig:
     """Graph construction parameters."""
     radius: float = 20.0        # Spatial radius for adjacency
     z_sep: float = 20.0         # Z separation between time layers
-    z_hops: int = 8             # Number of z-hops for connectivity
+    z_hops: int = 32             # Number of z-hops for connectivity
 
 
 @dataclass
@@ -56,8 +52,8 @@ class TrainingConfig:
     epochs: int = 10_000
     batch_size: int = 8
     steps_per_epoch: int = 64   # Optimizer steps per epoch
-    lr: float = 5e-5
-    weight_decay: float = 1e-4
+    lr: float = 1e-4
+    weight_decay: float = 5e-5
     ema_decay: float = 0.9995
     grad_clip: float = 1.0
     

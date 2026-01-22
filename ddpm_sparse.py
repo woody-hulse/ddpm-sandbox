@@ -81,49 +81,10 @@ def sample_core(
     return x
 
 
-def standardize_batch(x: np.ndarray, mean: float = None, std: float = None) -> np.ndarray:
-    """Standardize batch. If mean/std not provided, compute from data."""
+def standardize_batch(x: np.ndarray, mean: float = 0., std: float = 0.09) -> np.ndarray:
+    """Standardize batch to zero mean and unit variance."""
     eps = 1e-8
-    if mean is None:
-        mean = x.mean()
-    if std is None:
-        std = x.std()
     return (x - mean) / (std + eps)
-
-
-def spectral_loss(pred: torch.Tensor, target: torch.Tensor, n_channels: int, n_time: int) -> torch.Tensor:
-    """Compute loss in frequency domain to penalize missing high-frequency structure.
-    
-    Reshapes (N,) predictions to (C, T) and compares FFT magnitudes along time axis.
-    """
-    pred_2d = pred.view(n_channels, n_time)
-    target_2d = target.view(n_channels, n_time)
-    
-    pred_fft = torch.fft.rfft(pred_2d, dim=1)
-    target_fft = torch.fft.rfft(target_2d, dim=1)
-    
-    pred_mag = torch.abs(pred_fft)
-    target_mag = torch.abs(target_fft)
-    
-    return F.mse_loss(pred_mag, target_mag)
-
-
-def multiscale_loss(pred: torch.Tensor, target: torch.Tensor, n_channels: int, n_time: int, scales: list = [1, 2, 4]) -> torch.Tensor:
-    """Compute MSE at multiple temporal resolutions."""
-    total_loss = torch.tensor(0.0, device=pred.device)
-    
-    pred_2d = pred.view(n_channels, n_time)
-    target_2d = target.view(n_channels, n_time)
-    
-    for scale in scales:
-        if scale == 1:
-            total_loss = total_loss + F.mse_loss(pred_2d, target_2d)
-        else:
-            pred_down = F.avg_pool1d(pred_2d.unsqueeze(0), kernel_size=scale, stride=scale).squeeze(0)
-            target_down = F.avg_pool1d(target_2d.unsqueeze(0), kernel_size=scale, stride=scale).squeeze(0)
-            total_loss = total_loss + F.mse_loss(pred_down, target_down)
-    
-    return total_loss / len(scales)
 
 
 def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: bool = False):
@@ -279,10 +240,8 @@ def train(cfg: Config = default_config):
 
                 if cfg.diffusion.parametrization == "eps":
                     target = noise
-                    x0_pred = (x_t - sqrt_om * pred) / torch.clamp(sqrt_ab, min=1e-8)
                 elif cfg.diffusion.parametrization == "v":
                     target = sqrt_ab * noise - sqrt_om * x0[b]
-                    x0_pred = sqrt_ab * x_t - sqrt_om * pred
                 else:
                     raise ValueError("parametrization must be 'eps' or 'v'")
 
@@ -291,17 +250,7 @@ def train(cfg: Config = default_config):
                     weight = torch.pow(cfg.diffusion.p2_k + snr_tb, -cfg.diffusion.p2_gamma)
                     mse = mse * weight
 
-                sample_loss = mse
-                
-                if cfg.diffusion.spectral_loss_weight > 0.0:
-                    spec_loss = spectral_loss(x0_pred.squeeze(), x0[b].squeeze(), n_channels, n_time_points)
-                    sample_loss = sample_loss + cfg.diffusion.spectral_loss_weight * spec_loss
-                
-                if cfg.diffusion.multiscale_loss_weight > 0.0:
-                    ms_loss = multiscale_loss(x0_pred.squeeze(), x0[b].squeeze(), n_channels, n_time_points)
-                    sample_loss = sample_loss + cfg.diffusion.multiscale_loss_weight * ms_loss
-
-                loss_total = loss_total + sample_loss
+                loss_total = loss_total + mse
 
             loss = loss_total / float(cfg.training.batch_size)
             epoch_loss += float(loss.item())
