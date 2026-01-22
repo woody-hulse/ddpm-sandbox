@@ -42,8 +42,8 @@ class ConditioningConfig:
 class GraphConfig:
     """Graph construction parameters."""
     radius: float = 20.0        # Spatial radius for adjacency
-    z_sep: float = 5.0          # Z separation between time layers
-    z_hops: int = 2             # Number of z-hops for connectivity
+    z_sep: float = 20.0         # Z separation between time layers
+    z_hops: int = 8             # Number of z-hops for connectivity
 
 
 @dataclass
