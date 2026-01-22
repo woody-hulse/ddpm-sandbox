@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+checkpoints/
+
+plots/
+
+data/*.npz
+data/*.h5
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+.DS_Store
+Thumbs.db
+
+archive/
