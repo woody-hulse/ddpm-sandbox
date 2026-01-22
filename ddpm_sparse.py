@@ -310,6 +310,28 @@ def train(cfg: Config = default_config):
                 fig.savefig(f"{plots_dir}/event_{idx}_xy.png")
                 plt.close(fig)
 
+                fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+                visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), true_z, None, ax=axes[0])
+                axes[0].set_title("Ground truth")
+                visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), rec_z, None, ax=axes[1])
+                axes[1].set_title("DDPM sample")
+                plt.tight_layout()
+                fig.savefig(f"{plots_dir}/event_{idx}_z.png")
+                plt.close(fig)
+
+                # 3D scatter plot
+                fig = plt.figure(figsize=(10, 8))
+                ax = fig.add_subplot(111, projection="3d")
+                visualize_event_3d(graph, true_int, ax=ax, colorbar=True)
+                fig.savefig(f"{plots_dir}/event_{idx}_true_3d.png", dpi=300)
+                plt.close(fig)
+
+                fig = plt.figure(figsize=(10, 8))
+                ax = fig.add_subplot(111, projection="3d")
+                visualize_event_3d(graph, rec_int, ax=ax, colorbar=True)
+                fig.savefig(f"{plots_dir}/event_{idx}_rec_3d.png", dpi=300)
+                plt.close(fig)
+
 
 if __name__ == "__main__":
     train(default_config)
