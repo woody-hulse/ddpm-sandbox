@@ -14,7 +14,7 @@ class ModelConfig:
     hidden_dim: int = 64
     depth: int = 2
     blocks_per_stage: int = 2
-    pool_ratio: float = 0.35
+    pool_ratio: float = 0.5
     dropout: float = 0.00
     pos_dim: int = 3
     pos_dropout: float = 0.0
@@ -24,10 +24,14 @@ class ModelConfig:
 @dataclass
 class DiffusionConfig:
     """Diffusion process parameters."""
-    timesteps: int = 250
+    timesteps: int = 500
     parametrization: str = "v"  # "v" or "eps"
-    p2_gamma: float = 0.0       # P2 loss weighting (0 = disabled)
+    p2_gamma: float = 0.5       # P2 loss weighting
     p2_k: float = 1.0
+    
+    # Auxiliary losses to capture temporal correlation structure
+    spectral_loss_weight: float = 0.1   # Frequency-domain loss (0 = disabled)
+    multiscale_loss_weight: float = 0.1 # Multi-resolution loss (0 = disabled)
 
 
 @dataclass
