@@ -272,7 +272,7 @@ def shrink_to_single_node(
     tritium_in: Path,
     out_dir: Optional[Path] = None,
     batch_rows: int = 512,
-) -> Path:
+) -> Tuple[Path, Path]:
     """Shrink waveforms by collapsing the spatial (channel) dimension.
 
     Input shape: (S, C, T) where C = channels (spatial), T = time.
@@ -281,13 +281,14 @@ def shrink_to_single_node(
     This produces a single-node graph per layer (time step) representing the
     total XY cross-section at that layer. No event pruning is applied.
 
-    Returns the path to the output H5 file.
+    Returns (tritium_out, pmt_xy_out) paths.
     """
     tritium_in = Path(tritium_in)
     out_dir = Path(out_dir) if out_dir is not None else tritium_in.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tritium_out = out_dir / f"{tritium_in.stem}_single_node.h5"
+    pmt_xy_out = out_dir / "pmt_xy_single_node.h5"
 
     with h5py.File(tritium_in, "r") as fin:
         if "waveforms" not in fin:
@@ -331,8 +332,14 @@ def shrink_to_single_node(
                     end = min(ds_in.shape[0], start + int(batch_rows))
                     ds_out[start:end, ...] = ds_in[start:end, ...]
 
-    print(f"Shrunk {s} events from ({c},{t}) to single-node ({1},{t}). Wrote {tritium_out}")
-    return tritium_out
+    with h5py.File(pmt_xy_out, "w") as fpos:
+        ds = fpos.create_dataset("TA_PMTs_xy", data=np.array([[0.0, 0.0]], dtype=np.float32))
+        ds.attrs["note"] = "Single-node graph: one PMT at origin (0, 0)."
+
+    print(f"Shrunk {s} events from ({c},{t}) to single-node ({1},{t}).")
+    print(f"Wrote {tritium_out}")
+    print(f"Wrote {pmt_xy_out}")
+    return tritium_out, pmt_xy_out
 
 
 def _parse_args() -> argparse.Namespace:
@@ -357,12 +364,11 @@ def main() -> None:
     args = _parse_args()
 
     if args.single_node:
-        tritium_out = shrink_to_single_node(
+        shrink_to_single_node(
             tritium_in=Path(args.tritium_in),
             out_dir=Path(args.out_dir) if args.out_dir else None,
             batch_rows=int(args.batch_rows),
         )
-        print(f"Wrote {tritium_out}")
         return
 
     if (args.center_x is None) ^ (args.center_y is None):

@@ -111,7 +111,8 @@ def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: boo
     
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
-    ax.set_zlabel('Z (time)')
+    ax.set_zlabel('t')
+    ax.set_box_aspect([1, 1, 3])
     return ax
 
 
