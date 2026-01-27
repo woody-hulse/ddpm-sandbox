@@ -34,28 +34,36 @@ class FiLMFromCond(nn.Module):
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-    def forward(self, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, cond: torch.Tensor, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
         if cond.dim() == 1:
             cond = cond.unsqueeze(0)
-        film = self.mlp(cond)
-        film = film[0].view(self.num_layers, 2, self.hidden_dim)
-        gamma, beta = film[:, 0, :], film[:, 1, :]
+        film = self.mlp(cond)  # (B, num_layers * 2 * hidden_dim)
+        film = film.view(batch_size, self.num_layers, 2, self.hidden_dim)
+        gamma, beta = film[:, :, 0, :], film[:, :, 1, :]  # (B, num_layers, hidden_dim)
         gamma = 1.0 + gamma
         return gamma, beta
 
 
 class GraphResBlock(nn.Module):
-    def __init__(self, hidden_dim: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, cond_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
         self.conv = SparseGraphConv(hidden_dim, hidden_dim, bias=True)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
+        self.cond_proj = nn.Linear(cond_dim, hidden_dim)
+        nn.init.zeros_(self.cond_proj.weight)
+        nn.init.zeros_(self.cond_proj.bias)
 
-    def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
+    def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, cond: torch.Tensor,
+                gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        cond_signal = self.cond_proj(cond)
+        h = h + cond_signal
         h = self.act(h)
         h = self.conv(h, adj_hat)
+        h = self.norm2(h)
         h = h * gamma + beta
         h = self.dropout(h)
         return x + h
@@ -72,16 +80,25 @@ class TopKPool(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
-        nn.init.constant_(self.scorer[-1].bias, 0.0)
-        nn.init.zeros_(self.scorer[-1].weight)
+        nn.init.constant_(self.scorer[-1].bias, 1.0)
+        nn.init.xavier_uniform_(self.scorer[-1].weight)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        N = x.size(0)
-        k = max(1, int(math.ceil(self.ratio * N)))
-        s = self.scorer(self.norm(x)).squeeze(-1)
-        keep_idx = torch.topk(s, k=k, largest=True, sorted=True).indices
-        x_pool = x[keep_idx]
-        return x_pool, keep_idx
+    def forward(self, x: torch.Tensor, nodes_per_graph: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        total_nodes = x.size(0)
+        batch_size = total_nodes // nodes_per_graph
+        k_per_graph = max(1, int(math.ceil(self.ratio * nodes_per_graph)))
+        
+        s = self.scorer(self.norm(x)).squeeze(-1)  # (total_nodes,)
+        s = s.view(batch_size, nodes_per_graph)
+        
+        topk_local = torch.topk(s, k=k_per_graph, dim=1, largest=True, sorted=True)
+        local_indices = topk_local.indices  # (B, k_per_graph)
+        
+        batch_offsets = torch.arange(batch_size, device=x.device).unsqueeze(1) * nodes_per_graph
+        global_indices = (local_indices + batch_offsets).view(-1)
+        
+        x_pool = x[global_indices]
+        return x_pool, global_indices, k_per_graph
 
 
 def _unpool_like(x_small: torch.Tensor, keep_idx: torch.Tensor, N: int) -> torch.Tensor:
@@ -92,20 +109,50 @@ def _unpool_like(x_small: torch.Tensor, keep_idx: torch.Tensor, N: int) -> torch
 
 
 class GraphUNetStage(nn.Module):
-    def __init__(self, hidden_dim: int, blocks_per_stage: int = 1, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, cond_dim: int, blocks_per_stage: int = 1, dropout: float = 0.0):
         super().__init__()
-        self.blocks = nn.ModuleList([GraphResBlock(hidden_dim, dropout=dropout)
+        self.blocks = nn.ModuleList([GraphResBlock(hidden_dim, cond_dim=cond_dim, dropout=dropout)
                                      for _ in range(blocks_per_stage)])
 
-    def forward(self, x: torch.Tensor, adj_hat: torch.Tensor,
-                gammas: torch.Tensor, betas: torch.Tensor, gamma_offset: int) -> Tuple[torch.Tensor, int]:
+    def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, cond_expanded: torch.Tensor,
+                gammas: torch.Tensor, betas: torch.Tensor, gamma_offset: int,
+                batch_size: int) -> Tuple[torch.Tensor, int]:
         i = gamma_offset
-        for b in self.blocks:
-            g = gammas[i].unsqueeze(0)
-            bt = betas[i].unsqueeze(0)
-            x = b(x, adj_hat, g, bt)
+        for blk in self.blocks:
+            g = gammas[:, i, :]  # (B, hidden_dim)
+            bt = betas[:, i, :]  # (B, hidden_dim)
+            nodes_per_graph = x.size(0) // batch_size
+            g_expanded = g.repeat_interleave(nodes_per_graph, dim=0)  # (B*N, hidden_dim)
+            bt_expanded = bt.repeat_interleave(nodes_per_graph, dim=0)
+            x = blk(x, adj_hat, cond_expanded, g_expanded, bt_expanded)
             i += 1
         return x, i
+
+
+def build_block_diagonal_adj(adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Create block-diagonal adjacency for batched graph processing."""
+    adj = to_coalesced_coo(adj)
+    N = adj.size(0)
+    indices = adj.indices()
+    values = adj.values()
+    
+    all_indices = []
+    all_values = []
+    for b in range(batch_size):
+        offset = b * N
+        shifted_indices = indices + offset
+        all_indices.append(shifted_indices)
+        all_values.append(values)
+    
+    final_indices = torch.cat(all_indices, dim=1)
+    final_values = torch.cat(all_values, dim=0)
+    
+    block_adj = torch.sparse_coo_tensor(
+        final_indices, final_values, 
+        size=(batch_size * N, batch_size * N),
+        device=adj.device, dtype=adj.dtype
+    ).coalesce()
+    return block_adj
 
 
 class GraphDDPMUNet(nn.Module):
@@ -140,20 +187,26 @@ class GraphDDPMUNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.pos_drop = nn.Dropout(pos_dropout)
+        
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
         self.total_stages = 2 * depth + 1
         self.total_blocks = self.total_stages * blocks_per_stage
 
         self.in_proj = nn.Linear(in_dim, hidden_dim)
         self.enc_stages = nn.ModuleList(
-            [GraphUNetStage(hidden_dim, blocks_per_stage, dropout=dropout) for _ in range(depth)]
+            [GraphUNetStage(hidden_dim, cond_dim=cond_dim, blocks_per_stage=blocks_per_stage, dropout=dropout) for _ in range(depth)]
         )
         self.pools = nn.ModuleList([TopKPool(hidden_dim, ratio=pool_ratio) for _ in range(depth)])
 
-        self.bottleneck = GraphUNetStage(hidden_dim, blocks_per_stage, dropout=dropout)
+        self.bottleneck = GraphUNetStage(hidden_dim, cond_dim=cond_dim, blocks_per_stage=blocks_per_stage, dropout=dropout)
 
         self.dec_stages = nn.ModuleList(
-            [GraphUNetStage(hidden_dim, blocks_per_stage, dropout=dropout) for _ in range(depth)]
+            [GraphUNetStage(hidden_dim, cond_dim=cond_dim, blocks_per_stage=blocks_per_stage, dropout=dropout) for _ in range(depth)]
         )
 
         self.out_norm = nn.LayerNorm(hidden_dim)
@@ -164,6 +217,7 @@ class GraphDDPMUNet(nn.Module):
         self.cache_norm_top = cache_norm_top
         self._cached_key = None
         self._cached_adj = None
+        self._cached_block_adj = {}
 
         self.reset_parameters()
 
@@ -181,6 +235,9 @@ class GraphDDPMUNet(nn.Module):
         for m in self.pos_mlp:
             if isinstance(m, nn.Linear):
                 init_linear(m)
+        for m in self.cond_mlp:
+            if isinstance(m, nn.Linear):
+                init_linear(m)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -195,46 +252,83 @@ class GraphDDPMUNet(nn.Module):
             self._cached_adj = adj_hat
         return adj_hat
 
-    def forward(self, x0: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor, pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+        key = (adj.device, adj.size(), adj._nnz(), batch_size)
+        if key in self._cached_block_adj:
+            return self._cached_block_adj[key]
+        adj_normed = self._maybe_norm_top(adj)
+        block_adj = build_block_diagonal_adj(adj_normed, batch_size)
+        block_adj = gcn_norm(block_adj, add_self_loops=False)
+        self._cached_block_adj[key] = block_adj
+        return block_adj
+
+    def forward(self, x0: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor, 
+                pos: Optional[torch.Tensor] = None, batch_size: int = 1) -> torch.Tensor:
+        """
+        Forward pass with batched graph inputs.
+        
+        Args:
+            x0: Node features (B*N, in_dim) stacked for all graphs
+            adj: Single graph adjacency (N, N) - will be block-diagonalized
+            cond: Conditioning vectors (B, cond_dim)
+            pos: Node positions (N, pos_dim) for single graph - will be tiled
+            batch_size: Number of graphs in batch
+        """
+        N_single = adj.size(0)
+        total_nodes = x0.size(0)
+        
         assert x0.dim() == 2 and x0.size(1) == self.in_dim
+        assert total_nodes == batch_size * N_single, f"Expected {batch_size * N_single} nodes, got {total_nodes}"
+        
         if pos is None:
             raise ValueError("per-node positions `pos` (N, pos_dim) are required but got None")
-        if pos.dim() != 2 or pos.size(0) != x0.size(0) or pos.size(1) != self.pos_dim:
-            raise ValueError(f"`pos` must be shape (N,{self.pos_dim}), got {tuple(pos.shape)}")
+        if pos.dim() != 2 or pos.size(0) != N_single or pos.size(1) != self.pos_dim:
+            raise ValueError(f"`pos` must be shape ({N_single},{self.pos_dim}), got {tuple(pos.shape)}")
 
-        adj0 = self._maybe_norm_top(adj).to(device=x0.device, dtype=x0.dtype)
+        adj0 = self._get_block_adj(adj, batch_size).to(device=x0.device, dtype=x0.dtype)
 
-        gammas, betas = self.film(cond)
+        gammas, betas = self.film(cond, batch_size=batch_size)  # (B, num_layers, hidden_dim)
         g_ptr = 0
 
         h = self.in_proj(x0)
-        pos_emb = self.pos_mlp(pos.to(x0.dtype))
+        
+        pos_tiled = pos.repeat(batch_size, 1)
+        pos_emb = self.pos_mlp(pos_tiled.to(x0.dtype))
         h = h + self.pos_drop(pos_emb)
+        
+        cond_emb = self.cond_mlp(cond)  # (B, hidden_dim)
+        cond_expanded = cond.repeat_interleave(N_single, dim=0)  # (B*N, cond_dim)
+        cond_emb_expanded = cond_emb.repeat_interleave(N_single, dim=0)  # (B*N, hidden_dim)
+        h = h + cond_emb_expanded
 
-        N0 = h.size(0)
+        nodes_per_graph = N_single
 
-        skips: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
+        skips: List[Tuple[torch.Tensor, torch.Tensor, int, int]] = []
         adjs: List[torch.Tensor] = []
-        h_cur, adj_cur, N_cur = h, adj0, N0
+        h_cur, adj_cur = h, adj0
 
         for d in range(self.depth):
-            h_cur, g_ptr = self.enc_stages[d](h_cur, adj_cur, gammas, betas, g_ptr)
+            cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
+            h_cur, g_ptr = self.enc_stages[d](h_cur, adj_cur, cond_exp_cur, gammas, betas, g_ptr, batch_size)
             h_skip = h_cur
-            h_pool, keep_idx = self.pools[d](h_cur)
+            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
             K = h_pool.size(0)
             adj_next = gcn_norm(subgraph_coo(adj_cur, keep_idx, K), add_self_loops=True)
-            skips.append((h_skip, keep_idx, N_cur))
+            skips.append((h_skip, keep_idx, h_cur.size(0), nodes_per_graph))
             adjs.append(adj_cur)
-            h_cur, adj_cur, N_cur = h_pool, adj_next, K
+            h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
 
-        h_cur, g_ptr = self.bottleneck(h_cur, adj_cur, gammas, betas, g_ptr)
+        cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
+        h_cur, g_ptr = self.bottleneck(h_cur, adj_cur, cond_exp_cur, gammas, betas, g_ptr, batch_size)
 
         for d in reversed(range(self.depth)):
-            h_skip, keep_idx, N_prev = skips[d]
+            h_skip, keep_idx, N_prev, npg_prev = skips[d]
             h_up = _unpool_like(h_cur, keep_idx, N_prev)
             h_cur = h_up + h_skip
             adj_prev = adjs[d]
-            h_cur, g_ptr = self.dec_stages[d](h_cur, adj_prev, gammas, betas, g_ptr)
+            nodes_per_graph = npg_prev
+            cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
+            h_cur, g_ptr = self.dec_stages[d](h_cur, adj_prev, cond_exp_cur, gammas, betas, g_ptr, batch_size)
 
         h_cur = F.silu(self.out_norm(h_cur))
         y = self.out_proj(h_cur)

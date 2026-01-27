@@ -11,7 +11,7 @@ class ModelConfig:
     """Graph U-Net architecture parameters."""
     in_dim: int = 1
     out_dim: int = 1
-    hidden_dim: int = 16
+    hidden_dim: int = 128
     depth: int = 4
     blocks_per_stage: int = 2
     pool_ratio: float = 0.5
@@ -34,8 +34,8 @@ class DiffusionConfig:
 class ConditioningConfig:
     """Conditioning network parameters."""
     cond_in_dim: int = 5        # Input condition dimension
-    cond_proj_dim: int = 16     # Projected condition dimension  
-    time_dim: int = 16          # Time embedding dimension
+    cond_proj_dim: int = 64     # Projected condition dimension  
+    time_dim: int = 64          # Time embedding dimension
 
 
 @dataclass 

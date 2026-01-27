@@ -35,27 +35,25 @@ def sample_core(
     parametrization: str = 'v',
     pbar: bool = False
 ) -> torch.Tensor:
-    """DDPM sampling loop for graph diffusion."""
+    """DDPM sampling loop for graph diffusion with batched processing."""
     B, C, N = shape
     device = cond_proj.device
-    x = torch.randn(shape, device=device)
+    x = torch.randn((B, N, C), device=device)  # (B, N, C)
     T = schedule['betas'].shape[0]
     
     for i in tqdm(reversed(range(T)), desc="Sampling", disable=not pbar, total=T, ncols=150):
-        t_tensor = torch.full((B,), i, device=device, dtype=torch.long)
-        betas_t = schedule['betas'][i].view(1, 1, 1)
-        sqrt_one_minus_ab_t = schedule['sqrt_one_minus_alphas_cumprod'][i].view(1, 1, 1)
-        alpha_bar_t = schedule['alphas_cumprod'][i].view(1, 1, 1)
-        alpha_bar_prev_t = schedule['alphas_cumprod_prev'][i].view(1, 1, 1)
-
-        eps_list = []
-        for b in range(B):
-            xb = x[b, 0].unsqueeze(1)
-            t_emb = sinusoidal_embedding(t_tensor[b:b+1], time_dim).squeeze(0)
-            cond_full_b = torch.cat([cond_proj[b], t_emb], dim=-1)
-            pred_b = core(xb, A_sparse, cond_full_b, pos)
-            eps_list.append(pred_b.t())
-        pred = torch.stack(eps_list, dim=0)
+        betas_t = schedule['betas'][i]
+        sqrt_one_minus_ab_t = schedule['sqrt_one_minus_alphas_cumprod'][i]
+        alpha_bar_t = schedule['alphas_cumprod'][i]
+        alpha_bar_prev_t = schedule['alphas_cumprod_prev'][i]
+        
+        t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)  # (1, time_dim)
+        t_emb_batch = t_emb.expand(B, -1)  # (B, time_dim)
+        cond_full = torch.cat([cond_proj, t_emb_batch], dim=-1)  # (B, cond_proj_dim + time_dim)
+        
+        x_flat = x.view(B * N, C)  # (B*N, C)
+        pred_flat = core(x_flat, A_sparse, cond_full, pos, batch_size=B)  # (B*N, C)
+        pred = pred_flat.view(B, N, C)  # (B, N, C)
 
         if parametrization == 'eps':
             eps_theta = pred
@@ -72,19 +70,39 @@ def sample_core(
         mean = coef1 * x0_pred + coef2 * x
         
         if i > 0:
-            posterior_var = schedule['posterior_variance'][i].view(1, 1, 1)
+            posterior_var = schedule['posterior_variance'][i]
             noise = torch.randn_like(x)
             x = mean + torch.sqrt(posterior_var) * noise
         else:
             x = mean
     
-    return x
+    return x.permute(0, 2, 1)  # (B, C, N)
 
 
-def standardize_batch(x: np.ndarray, mean: float = 0., std: float = 0.09) -> np.ndarray:
-    """Standardize batch to zero mean and unit variance."""
-    eps = 1e-8
-    return (x - mean) / (std + eps)
+class DataStats:
+    """Compute and store data statistics for normalization."""
+    def __init__(self, mean: float = 0.0, std: float = 1.0):
+        self.mean = mean
+        self.std = std
+    
+    @classmethod
+    def from_loader(cls, loader, n_samples: int = 1000, batch_size: int = 32) -> 'DataStats':
+        """Compute statistics from data loader samples."""
+        all_data = []
+        samples_collected = 0
+        while samples_collected < n_samples:
+            batch_np, _ = loader.get_batch(min(batch_size, n_samples - samples_collected))
+            all_data.append(batch_np.flatten())
+            samples_collected += batch_np.shape[0]
+        
+        all_data = np.concatenate(all_data)
+        return cls(mean=float(np.mean(all_data)), std=float(np.std(all_data)))
+    
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.mean) / (self.std + 1e-8)
+    
+    def denormalize(self, x: np.ndarray) -> np.ndarray:
+        return x * self.std + self.mean
 
 
 def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: bool = False):
@@ -138,15 +156,19 @@ def train(cfg: Config = default_config):
     n_nodes = n_channels * n_time_points
 
     print(f"Graph: {n_nodes} nodes, {A_sparse._nnz()} edges")
+    
+    print("Computing data statistics...")
+    data_stats = DataStats.from_loader(tr, n_samples=1000, batch_size=32)
+    print(f"Data mean: {data_stats.mean:.4f}, std: {data_stats.std:.4f}")
 
     # Build schedule
     schedule = build_cosine_schedule(cfg.diffusion.timesteps, device_t)
 
     # Build models
     cond_proj = nn.Sequential(
-        nn.Linear(cfg.conditioning.cond_in_dim, 64), 
+        nn.Linear(cfg.conditioning.cond_in_dim, 128), 
         nn.SiLU(), 
-        nn.Linear(64, cfg.conditioning.cond_proj_dim)
+        nn.Linear(128, cfg.conditioning.cond_proj_dim)
     ).to(device_t)
     
     core = GraphDDPMUNet(
@@ -160,6 +182,10 @@ def train(cfg: Config = default_config):
         dropout=cfg.model.dropout,
         pos_dim=cfg.model.pos_dim,
     ).to(device_t)
+    
+    n_params = sum(p.numel() for p in core.parameters() if p.requires_grad)
+    n_params += sum(p.numel() for p in cond_proj.parameters() if p.requires_grad)
+    print(f"Total trainable parameters: {n_params:,}")
 
     # Optimizer
     optim = torch.optim.AdamW(
@@ -171,13 +197,18 @@ def train(cfg: Config = default_config):
 
     os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
 
+    # EMA model (create before checkpoint loading so we can load EMA weights)
+    ema_core = deepcopy(core).to(device_t)
+
     # Checkpoint functions
     def save_checkpoint(epoch_idx: int):
         state = {
             "core": core.state_dict(),
+            "ema_core": ema_core.state_dict(),
             "cond_proj": cond_proj.state_dict(),
             "optim": optim.state_dict(),
             "epoch": epoch_idx,
+            "data_stats": {"mean": data_stats.mean, "std": data_stats.std},
         }
         path = os.path.join(cfg.paths.checkpoint_dir, f"ckpt_epoch_{epoch_idx:04d}.pt")
         torch.save(state, path)
@@ -190,8 +221,15 @@ def train(cfg: Config = default_config):
     def load_checkpoint(path: str) -> int:
         chk = torch.load(path, map_location=device_t)
         core.load_state_dict(chk["core"])
+        if "ema_core" in chk:
+            ema_core.load_state_dict(chk["ema_core"])
+        else:
+            ema_core.load_state_dict(chk["core"])
         cond_proj.load_state_dict(chk["cond_proj"])
         optim.load_state_dict(chk["optim"])
+        if "data_stats" in chk:
+            data_stats.mean = chk["data_stats"]["mean"]
+            data_stats.std = chk["data_stats"]["std"]
         return int(chk.get("epoch", 0))
 
     # Resume
@@ -206,55 +244,81 @@ def train(cfg: Config = default_config):
                 print(f"Could not resume: {e}")
                 start_epoch = 0
 
-    # EMA model
-    ema_core = deepcopy(core).to(device_t)
     for g in optim.param_groups:
         g["lr"] = cfg.training.lr
+
+    B = cfg.training.batch_size
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.epochs):
         core.train()
         epoch_loss = 0.0
+        loss_by_t_range = {'low': 0.0, 'mid': 0.0, 'high': 0.0, 'count_low': 0, 'count_mid': 0, 'count_high': 0}
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
-            batch_np, batch_cond = tr.get_batch(cfg.training.batch_size)
+            batch_np, batch_cond = tr.get_batch(B)
             batch_cond = torch.from_numpy(batch_cond.astype(np.float32)).to(device_t)
-            batch_np = standardize_batch(batch_np)
-            x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t).reshape(cfg.training.batch_size, -1, 1)
-            cond_base = cond_proj(batch_cond)
-            t = torch.randint(0, cfg.diffusion.timesteps, (cfg.training.batch_size,), device=device_t, dtype=torch.long)
+            batch_np = data_stats.normalize(batch_np)
+            
+            x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
+            x0_flat = x0.view(B * n_nodes, 1)  # (B*N, 1)
+            
+            cond_base = cond_proj(batch_cond)  # (B, cond_proj_dim)
+            
+            t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=device_t, dtype=torch.long)
+            t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)  # (B, time_dim)
+            cond_full = torch.cat([cond_base, t_emb], dim=-1)  # (B, cond_proj_dim + time_dim)
 
-            loss_total = 0.0
-            for b in range(cfg.training.batch_size):
-                tb = t[b]
-                sqrt_ab = schedule['sqrt_alphas_cumprod'][tb]
-                sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][tb]
-                snr_tb = schedule['snr'][tb]
+            sqrt_ab = schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
+            sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
+            snr_t = schedule['snr'][t].view(B)
 
-                noise = torch.randn_like(x0[b])
-                x_t = sqrt_ab * x0[b] + sqrt_om * noise
+            noise = torch.randn_like(x0)  # (B, N, 1)
+            x_t = sqrt_ab * x0 + sqrt_om * noise  # (B, N, 1)
+            x_t_flat = x_t.view(B * n_nodes, 1)  # (B*N, 1)
 
-                t_emb = sinusoidal_embedding(tb.view(1), cfg.conditioning.time_dim).squeeze(0)
-                cond_full = torch.cat([cond_base[b], t_emb], dim=-1)
-                pred = core(x_t, A_sparse, cond_full, pos)
+            pred_flat = core(x_t_flat, A_sparse, cond_full, pos, batch_size=B)  # (B*N, 1)
+            pred = pred_flat.view(B, n_nodes, 1)  # (B, N, 1)
+            
+            # Monitor prediction scale (every 100 steps)
+            if step == 0 and epoch % 10 == 0:
+                with torch.no_grad():
+                    pred_mean = pred.mean().item()
+                    pred_std = pred.std().item()
+                    target_std = (sqrt_ab * noise - sqrt_om * x0).std().item() if cfg.diffusion.parametrization == "v" else noise.std().item()
+                    print(f"  Pred stats: mean={pred_mean:.4f}, std={pred_std:.4f}, target_std={target_std:.4f}")
 
-                if cfg.diffusion.parametrization == "eps":
-                    target = noise
-                elif cfg.diffusion.parametrization == "v":
-                    target = sqrt_ab * noise - sqrt_om * x0[b]
-                else:
-                    raise ValueError("parametrization must be 'eps' or 'v'")
+            if cfg.diffusion.parametrization == "eps":
+                target = noise
+            elif cfg.diffusion.parametrization == "v":
+                target = sqrt_ab * noise - sqrt_om * x0
+            else:
+                raise ValueError("parametrization must be 'eps' or 'v'")
 
-                mse = F.mse_loss(pred, target)
-                if cfg.diffusion.p2_gamma > 0.0:
-                    weight = torch.pow(cfg.diffusion.p2_k + snr_tb, -cfg.diffusion.p2_gamma)
-                    mse = mse * weight
+            mse_per_sample = F.mse_loss(pred, target, reduction='none').mean(dim=(1, 2))  # (B,)
+            
+            if cfg.diffusion.p2_gamma > 0.0:
+                weight = torch.pow(cfg.diffusion.p2_k + snr_t, -cfg.diffusion.p2_gamma)
+                mse_per_sample = mse_per_sample * weight
 
-                loss_total = loss_total + mse
-
-            loss = loss_total / float(cfg.training.batch_size)
+            loss = mse_per_sample.mean()
             epoch_loss += float(loss.item())
+            
+            # Track loss by timestep range
+            T_max = cfg.diffusion.timesteps
+            for bi in range(B):
+                ti = t[bi].item()
+                li = mse_per_sample[bi].item()
+                if ti < T_max // 3:
+                    loss_by_t_range['low'] += li
+                    loss_by_t_range['count_low'] += 1
+                elif ti < 2 * T_max // 3:
+                    loss_by_t_range['mid'] += li
+                    loss_by_t_range['count_mid'] += 1
+                else:
+                    loss_by_t_range['high'] += li
+                    loss_by_t_range['count_high'] += 1
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -271,19 +335,67 @@ def train(cfg: Config = default_config):
 
             pbar.set_postfix(loss=epoch_loss / (step + 1))
 
+        # Print loss by timestep range
+        if epoch % 10 == 0:
+            avg_low = loss_by_t_range['low'] / max(loss_by_t_range['count_low'], 1)
+            avg_mid = loss_by_t_range['mid'] / max(loss_by_t_range['count_mid'], 1)
+            avg_high = loss_by_t_range['high'] / max(loss_by_t_range['count_high'], 1)
+            print(f"  Loss by t: low(0-{cfg.diffusion.timesteps//3})={avg_low:.4f}, "
+                  f"mid={avg_mid:.4f}, high({2*cfg.diffusion.timesteps//3}-{cfg.diffusion.timesteps})={avg_high:.4f}")
+
+        # Quick validation: check model prediction at low noise level
+        if epoch % cfg.training.visualize_every == 0:
+            core.eval()
+            with torch.no_grad():
+                val_np, val_cond = tr.get_batch(4)
+                val_cond_t = torch.from_numpy(val_cond.astype(np.float32)).to(device_t)
+                val_np_norm = data_stats.normalize(val_np)
+                x0_val = torch.from_numpy(val_np_norm.astype(np.float32)).to(device_t)
+                
+                t_low = torch.full((4,), 10, device=device_t, dtype=torch.long)
+                sqrt_ab_low = schedule['sqrt_alphas_cumprod'][t_low].view(4, 1, 1)
+                sqrt_om_low = schedule['sqrt_one_minus_alphas_cumprod'][t_low].view(4, 1, 1)
+                
+                noise_val = torch.randn_like(x0_val)
+                x_t_val = sqrt_ab_low * x0_val + sqrt_om_low * noise_val
+                
+                cond_val = cond_proj(val_cond_t)
+                t_emb_val = sinusoidal_embedding(t_low, cfg.conditioning.time_dim)
+                cond_full_val = torch.cat([cond_val, t_emb_val], dim=-1)
+                
+                pred_val = core(x_t_val.view(4 * n_nodes, 1), A_sparse, cond_full_val, pos, batch_size=4)
+                pred_val = pred_val.view(4, n_nodes, 1)
+                
+                if cfg.diffusion.parametrization == "v":
+                    x0_pred_val = sqrt_ab_low * x_t_val - sqrt_om_low * pred_val
+                else:
+                    x0_pred_val = (x_t_val - sqrt_om_low * pred_val) / sqrt_ab_low
+                
+                recon_mse = F.mse_loss(x0_pred_val, x0_val).item()
+                
+                # Also check prediction variance vs target variance
+                pred_std = pred_val.std().item()
+                if cfg.diffusion.parametrization == "v":
+                    target_val = sqrt_ab_low * noise_val - sqrt_om_low * x0_val
+                else:
+                    target_val = noise_val
+                target_std = target_val.std().item()
+                
+                print(f"  Validation (t=10): x0 recon MSE={recon_mse:.6f}, pred_std={pred_std:.4f}, target_std={target_std:.4f}")
+            core.train()
+
         # Checkpointing
         if (epoch + 1) % cfg.training.checkpoint_every == 0:
             save_checkpoint(epoch)
 
         # Visualization
         if cfg.visualize and (epoch % cfg.training.visualize_every == 0 or epoch == cfg.training.epochs - 1):
-            core.eval()
+            ema_core.eval()
             with torch.no_grad():
                 b_vis = min(cfg.training.batch_size, 4)
                 batch_np, batch_cond = tr.get_batch(b_vis)
-                batch_cond = torch.from_numpy(batch_cond.astype(np.float32)).to(device_t)
-                batch_np = standardize_batch(batch_np)
-                cond_vis = cond_proj(batch_cond)
+                batch_cond_t = torch.from_numpy(batch_cond.astype(np.float32)).to(device_t)
+                cond_vis = cond_proj(batch_cond_t)
                 samples = sample_core(
                     core=ema_core,
                     schedule=schedule,
@@ -293,13 +405,23 @@ def train(cfg: Config = default_config):
                     shape=(b_vis, 1, n_nodes),
                     parametrization=cfg.diffusion.parametrization,
                     pos=pos,
-                ).clamp_min_(0.0)
+                )
+                samples_denorm = data_stats.denormalize(samples.cpu().numpy())
+                samples_denorm = np.clip(samples_denorm, 0, None)
+                
+                # Diagnostic: compare statistics
+                true_data = batch_np[:, :, 0]  # (B, N)
+                gen_data = samples_denorm[:, 0, :]  # (B, N)
+                print(f"\n  [Vis] True data - mean: {true_data.mean():.4f}, std: {true_data.std():.4f}, "
+                      f"min: {true_data.min():.4f}, max: {true_data.max():.4f}")
+                print(f"  [Vis] Gen data  - mean: {gen_data.mean():.4f}, std: {gen_data.std():.4f}, "
+                      f"min: {gen_data.min():.4f}, max: {gen_data.max():.4f}")
 
             plots_dir = f"{cfg.paths.plot_dir}/epoch_{epoch}"
             os.makedirs(plots_dir, exist_ok=True)
             
             for idx in range(samples.shape[0]):
-                rec_int = samples[idx, 0].detach().cpu().numpy()
+                rec_int = samples_denorm[idx, 0]
                 true_int = batch_np[idx, :, 0]
 
                 rec_xy = rec_int.reshape(n_channels, n_time_points, order='F').sum(axis=1)
