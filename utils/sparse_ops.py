@@ -54,7 +54,6 @@ def gcn_norm(adj: torch.Tensor, add_self_loops: bool = True) -> torch.Tensor:
     return norm_adj.coalesce()
 
 
-@torch.no_grad()
 def subgraph_coo(adj_hat: torch.Tensor, keep_idx: torch.Tensor, newN: int) -> torch.Tensor:
     adj_hat = to_coalesced_coo(adj_hat)
     oldN = adj_hat.size(0)

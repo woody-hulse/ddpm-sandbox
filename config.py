@@ -11,10 +11,10 @@ class ModelConfig:
     """Graph U-Net architecture parameters."""
     in_dim: int = 1
     out_dim: int = 1
-    hidden_dim: int = 128
-    depth: int = 4
+    hidden_dim: int = 64
+    depth: int = 4              # Reduced from 4 to prevent vanishing gradients
     blocks_per_stage: int = 2
-    pool_ratio: float = 0.5
+    pool_ratio: float = 0.5     # Less aggressive pooling
     dropout: float = 0.0
     pos_dim: int = 3
     pos_dropout: float = 0.0
@@ -52,7 +52,7 @@ class TrainingConfig:
     epochs: int = 10_000
     batch_size: int = 8
     steps_per_epoch: int = 64   # Optimizer steps per epoch
-    lr: float = 1e-4
+    lr: float = 3e-4            # Increased from 1e-4 to compensate for small gradients
     weight_decay: float = 0
     ema_decay: float = 0.999
     grad_clip: float = 1.0

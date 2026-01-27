@@ -186,6 +186,11 @@ def train(cfg: Config = default_config):
     n_params = sum(p.numel() for p in core.parameters() if p.requires_grad)
     n_params += sum(p.numel() for p in cond_proj.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {n_params:,}")
+    
+    # Verify requires_grad is set
+    n_grad = sum(1 for p in core.parameters() if p.requires_grad)
+    n_total = sum(1 for p in core.parameters())
+    print(f"Parameters with requires_grad: {n_grad}/{n_total}")
 
     # Optimizer
     optim = torch.optim.AdamW(
@@ -247,6 +252,23 @@ def train(cfg: Config = default_config):
     for g in optim.param_groups:
         g["lr"] = cfg.training.lr
 
+    # Quick gradient test
+    print("\nRunning quick gradient test...")
+    core.train()
+    test_B = 2
+    test_x = torch.randn(test_B * n_nodes, 1, device=device_t)
+    test_cond = torch.randn(test_B, cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim, device=device_t)
+    test_out = core(test_x, A_sparse, test_cond, pos, batch_size=test_B)
+    test_loss = test_out.sum()
+    test_loss.backward()
+    test_grad_norm = sum(p.grad.norm().item() for p in core.parameters() if p.grad is not None)
+    print(f"Quick test gradient norm: {test_grad_norm:.4f}")
+    if test_grad_norm == 0:
+        print("*** ERROR: No gradients in quick test! Model is broken. ***")
+    else:
+        print("Quick test passed - gradients are flowing\n")
+    optim.zero_grad()
+
     B = cfg.training.batch_size
 
     # Training loop
@@ -281,18 +303,21 @@ def train(cfg: Config = default_config):
             pred_flat = core(x_t_flat, A_sparse, cond_full, pos, batch_size=B)  # (B*N, 1)
             pred = pred_flat.view(B, n_nodes, 1)  # (B, N, 1)
             
-            # Monitor prediction scale (every 100 steps)
+            # Monitor prediction scale (every 10 epochs, first step)
             if step == 0 and epoch % 10 == 0:
-                with torch.no_grad():
-                    pred_mean = pred.mean().item()
-                    pred_std = pred.std().item()
-                    target_std = (sqrt_ab * noise - sqrt_om * x0).std().item() if cfg.diffusion.parametrization == "v" else noise.std().item()
-                    
-                    # Check if output layer weights are changing
-                    out_w_norm = core.out_proj.weight.norm().item()
-                    in_w_norm = core.in_proj.weight.norm().item()
-                    print(f"  Pred stats: mean={pred_mean:.4f}, std={pred_std:.4f}, target_std={target_std:.4f}")
-                    print(f"  Weight norms: out_proj={out_w_norm:.6f}, in_proj={in_w_norm:.4f}")
+                # Check input stats
+                print(f"  Input stats: x_t mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}")
+                print(f"  x0 stats: mean={x0.mean().item():.4f}, std={x0.std().item():.4f}")
+                pred_mean = pred.mean().item()
+                pred_std = pred.std().item()
+                target_std = (sqrt_ab * noise - sqrt_om * x0).std().item() if cfg.diffusion.parametrization == "v" else noise.std().item()
+                
+                # Check if output layer weights are changing
+                out_w_norm = core.out_proj.weight.norm().item()
+                in_w_norm = core.in_proj.weight.norm().item()
+                print(f"  Pred stats: mean={pred_mean:.4f}, std={pred_std:.4f}, target_std={target_std:.4f}")
+                print(f"  Weight norms: out_proj={out_w_norm:.6f}, in_proj={in_w_norm:.4f}")
+                print(f"  pred.requires_grad={pred.requires_grad}")
 
             if cfg.diffusion.parametrization == "eps":
                 target = noise
@@ -308,6 +333,15 @@ def train(cfg: Config = default_config):
                 mse_per_sample = mse_per_sample * weight
 
             loss = mse_per_sample.mean()
+            
+            # NaN detection
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"  WARNING: NaN/Inf loss detected at step {step}! Skipping...")
+                print(f"    pred stats: min={pred.min().item():.4f}, max={pred.max().item():.4f}")
+                print(f"    target stats: min={target.min().item():.4f}, max={target.max().item():.4f}")
+                optim.zero_grad(set_to_none=True)
+                continue
+            
             epoch_loss += float(loss.item())
             
             # Track loss by timestep range
@@ -327,6 +361,30 @@ def train(cfg: Config = default_config):
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
+            
+            # Debug: Check if gradients exist
+            if step == 0 and epoch % 10 == 0:
+                out_grad = core.out_proj.weight.grad
+                in_grad = core.in_proj.weight.grad
+                out_grad_norm = out_grad.norm().item() if out_grad is not None else 0.0
+                in_grad_norm = in_grad.norm().item() if in_grad is not None else 0.0
+                
+                # Check layer gradients
+                conv_grad_norm = 0.0
+                for stage in core.enc_stages:
+                    for blk in stage.blocks:
+                        if blk.lin1.weight.grad is not None:
+                            conv_grad_norm += blk.lin1.weight.grad.norm().item()
+                        if blk.lin2.weight.grad is not None:
+                            conv_grad_norm += blk.lin2.weight.grad.norm().item()
+                
+                # Check total gradient norm
+                total_grad_norm = sum(p.grad.norm().item() for p in core.parameters() if p.grad is not None)
+                n_with_grad = sum(1 for p in core.parameters() if p.grad is not None)
+                
+                print(f"  Gradient norms: out_proj={out_grad_norm:.6f}, in_proj={in_grad_norm:.6f}, conv_sum={conv_grad_norm:.6f}")
+                print(f"  Total grad norm={total_grad_norm:.6f}, params with grad={n_with_grad}")
+            
             torch.nn.utils.clip_grad_norm_(
                 list(core.parameters()) + list(cond_proj.parameters()), 
                 max_norm=cfg.training.grad_clip

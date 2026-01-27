@@ -40,33 +40,56 @@ class FiLMFromCond(nn.Module):
         film = self.mlp(cond)  # (B, num_layers * 2 * hidden_dim)
         film = film.view(batch_size, self.num_layers, 2, self.hidden_dim)
         gamma, beta = film[:, :, 0, :], film[:, :, 1, :]  # (B, num_layers, hidden_dim)
-        gamma = 1.0 + gamma
+        gamma = 1.0 + 0.1 * torch.tanh(gamma)  # Bounded to [0.9, 1.1]
+        beta = 0.1 * torch.tanh(beta)  # Bounded to [-0.1, 0.1]
         return gamma, beta
 
 
 class GraphResBlock(nn.Module):
     def __init__(self, hidden_dim: int, cond_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.conv = SparseGraphConv(hidden_dim, hidden_dim, bias=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.lin1 = nn.Linear(hidden_dim, hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim, hidden_dim)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
-        self.cond_proj = nn.Linear(cond_dim, hidden_dim)
+        
+        # Conditioning projection for scale and shift
+        self.cond_proj = nn.Linear(cond_dim, hidden_dim * 2)
+        
+        # Initialize for stable training
+        nn.init.xavier_uniform_(self.lin1.weight, gain=0.5)
+        nn.init.zeros_(self.lin1.bias)
+        nn.init.xavier_uniform_(self.lin2.weight, gain=0.1)  # Small for residual
+        nn.init.zeros_(self.lin2.bias)
         nn.init.xavier_uniform_(self.cond_proj.weight, gain=0.1)
         nn.init.zeros_(self.cond_proj.bias)
 
     def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, cond: torch.Tensor,
                 gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
-        cond_signal = self.cond_proj(cond)
-        h = h + cond_signal
+        # Normalize input for stability
+        h = self.norm(x)
+        
+        # Message passing: aggregate neighbors
+        h = torch.sparse.mm(adj_hat, h)
+        
+        # Conditioning with bounded scale
+        cond_out = self.cond_proj(cond)
+        cond_scale, cond_shift = cond_out.chunk(2, dim=-1)
+        cond_scale = torch.sigmoid(cond_scale) * 0.5 + 0.75  # Range [0.75, 1.25]
+        
+        # Transform
+        h = self.lin1(h)
+        h = h * cond_scale + cond_shift
         h = self.act(h)
-        h = self.conv(h, adj_hat)
-        h = self.norm2(h)
+        h = self.lin2(h)
+        
+        # FiLM with bounded gamma
+        gamma = torch.clamp(gamma, 0.5, 2.0)  # Prevent extreme scaling
         h = h * gamma + beta
         h = self.dropout(h)
-        return x + h
+        
+        return x + 0.1 * h  # Scaled residual for stability
 
 
 class TopKPool(nn.Module):
@@ -229,16 +252,14 @@ class GraphDDPMUNet(nn.Module):
                 bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
                 nn.init.uniform_(m.bias, -bound, bound)
         init_linear(self.in_proj)
-        for st in list(self.enc_stages) + [self.bottleneck] + list(self.dec_stages):
-            for b in st.blocks:
-                init_linear(b.conv.lin)
         for m in self.pos_mlp:
             if isinstance(m, nn.Linear):
                 init_linear(m)
         for m in self.cond_mlp:
             if isinstance(m, nn.Linear):
                 init_linear(m)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.01)
+        # Use larger gain for output to produce non-trivial outputs
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
         nn.init.zeros_(self.out_proj.bias)
 
     def _maybe_norm_top(self, adj: torch.Tensor) -> torch.Tensor:
