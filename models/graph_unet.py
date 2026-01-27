@@ -31,7 +31,7 @@ class FiLMFromCond(nn.Module):
             nn.SiLU(),
             nn.Linear(width, out_dim),
         )
-        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.01)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, cond: torch.Tensor, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -53,7 +53,7 @@ class GraphResBlock(nn.Module):
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.cond_proj = nn.Linear(cond_dim, hidden_dim)
-        nn.init.zeros_(self.cond_proj.weight)
+        nn.init.xavier_uniform_(self.cond_proj.weight, gain=0.1)
         nn.init.zeros_(self.cond_proj.bias)
 
     def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, cond: torch.Tensor,
@@ -238,7 +238,7 @@ class GraphDDPMUNet(nn.Module):
         for m in self.cond_mlp:
             if isinstance(m, nn.Linear):
                 init_linear(m)
-        nn.init.zeros_(self.out_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.01)
         nn.init.zeros_(self.out_proj.bias)
 
     def _maybe_norm_top(self, adj: torch.Tensor) -> torch.Tensor:
@@ -258,7 +258,6 @@ class GraphDDPMUNet(nn.Module):
             return self._cached_block_adj[key]
         adj_normed = self._maybe_norm_top(adj)
         block_adj = build_block_diagonal_adj(adj_normed, batch_size)
-        block_adj = gcn_norm(block_adj, add_self_loops=False)
         self._cached_block_adj[key] = block_adj
         return block_adj
 

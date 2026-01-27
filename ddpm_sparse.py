@@ -287,7 +287,12 @@ def train(cfg: Config = default_config):
                     pred_mean = pred.mean().item()
                     pred_std = pred.std().item()
                     target_std = (sqrt_ab * noise - sqrt_om * x0).std().item() if cfg.diffusion.parametrization == "v" else noise.std().item()
+                    
+                    # Check if output layer weights are changing
+                    out_w_norm = core.out_proj.weight.norm().item()
+                    in_w_norm = core.in_proj.weight.norm().item()
                     print(f"  Pred stats: mean={pred_mean:.4f}, std={pred_std:.4f}, target_std={target_std:.4f}")
+                    print(f"  Weight norms: out_proj={out_w_norm:.6f}, in_proj={in_w_norm:.4f}")
 
             if cfg.diffusion.parametrization == "eps":
                 target = noise
