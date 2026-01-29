@@ -4,9 +4,10 @@ DDPM training on sparse 3D graphs for tritium detector simulation.
 import os
 import sys
 import glob
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
-from matplotlib import pyplot as plt
 
+from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,6 +22,141 @@ from config import Config, default_config, print_config
 from models.graph_unet import GraphDDPMUNet
 from diffusion.schedule import build_cosine_schedule, sinusoidal_embedding
 from utils.visualization import build_xy_adjacency_radius
+
+
+@dataclass
+class ModelContext:
+    """Holds all model components and data for training/inference."""
+    cfg: Config
+    device: torch.device
+    loader: TritiumSSDataLoader
+    graph: SparseGraph
+    A_sparse: torch.Tensor
+    pos: torch.Tensor
+    n_channels: int
+    n_time_points: int
+    n_nodes: int
+    data_stats: 'DataStats'
+    schedule: dict
+    core: nn.Module
+    cond_proj: nn.Module
+    ema_core: Optional[nn.Module] = None
+    optim: Optional[torch.optim.Optimizer] = None
+
+    @classmethod
+    def build(cls, cfg: Config, for_training: bool = True, verbose: bool = True) -> 'ModelContext':
+        """Build model context from configuration."""
+        device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        if verbose:
+            print(f"Using device: {device}")
+
+        loader = TritiumSSDataLoader(cfg.paths.tritium_h5, cfg.paths.channel_positions)
+        graph = loader.load_adjacency_sparse(
+            z_sep=cfg.graph.z_sep,
+            radius=cfg.graph.radius,
+            z_hops=cfg.graph.z_hops
+        )
+        A_sparse = graph.adjacency.to(device)
+        pos = graph.positions_xyz.to(device)
+        n_channels = loader.n_channels
+        n_time_points = loader.n_time_points
+        n_nodes = n_channels * n_time_points
+
+        if verbose:
+            print(f"Graph: {n_nodes} nodes, {A_sparse._nnz()} edges")
+            print("Computing data statistics...")
+
+        data_stats = DataStats.from_loader(loader, n_samples=1000, batch_size=32)
+        if verbose:
+            print(f"Data mean: {data_stats.mean:.4f}, std: {data_stats.std:.4f}")
+
+        schedule = build_cosine_schedule(cfg.diffusion.timesteps, device)
+
+        cond_proj = nn.Sequential(
+            nn.Linear(cfg.conditioning.cond_in_dim, 128),
+            nn.SiLU(),
+            nn.Linear(128, cfg.conditioning.cond_proj_dim)
+        ).to(device)
+
+        core = GraphDDPMUNet(
+            in_dim=cfg.model.in_dim,
+            cond_dim=cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim,
+            hidden_dim=cfg.model.hidden_dim,
+            depth=cfg.model.depth,
+            blocks_per_stage=cfg.model.blocks_per_stage,
+            pool_ratio=cfg.model.pool_ratio,
+            out_dim=cfg.model.out_dim,
+            dropout=cfg.model.dropout,
+            pos_dim=cfg.model.pos_dim,
+        ).to(device)
+
+        ema_core = None
+        optim = None
+        if for_training:
+            ema_core = deepcopy(core).to(device)
+            optim = torch.optim.AdamW(
+                list(core.parameters()) + list(cond_proj.parameters()),
+                lr=cfg.training.lr,
+                betas=(0.9, 0.999),
+                weight_decay=cfg.training.weight_decay,
+            )
+            os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
+
+        if verbose:
+            n_params = sum(p.numel() for p in core.parameters() if p.requires_grad)
+            n_params += sum(p.numel() for p in cond_proj.parameters() if p.requires_grad)
+            print(f"Total trainable parameters: {n_params:,}")
+
+        return cls(
+            cfg=cfg,
+            device=device,
+            loader=loader,
+            graph=graph,
+            A_sparse=A_sparse,
+            pos=pos,
+            n_channels=n_channels,
+            n_time_points=n_time_points,
+            n_nodes=n_nodes,
+            data_stats=data_stats,
+            schedule=schedule,
+            core=core,
+            cond_proj=cond_proj,
+            ema_core=ema_core,
+            optim=optim,
+        )
+
+    def latest_checkpoint(self) -> Optional[str]:
+        files = sorted(glob.glob(os.path.join(self.cfg.paths.checkpoint_dir, "ckpt_epoch_*.pt")))
+        return files[-1] if files else None
+
+    def save_checkpoint(self, epoch: int) -> str:
+        state = {
+            "core": self.core.state_dict(),
+            "ema_core": self.ema_core.state_dict() if self.ema_core else self.core.state_dict(),
+            "cond_proj": self.cond_proj.state_dict(),
+            "optim": self.optim.state_dict() if self.optim else None,
+            "epoch": epoch,
+            "data_stats": {"mean": self.data_stats.mean, "std": self.data_stats.std},
+        }
+        path = os.path.join(self.cfg.paths.checkpoint_dir, f"ckpt_epoch_{epoch:04d}.pt")
+        torch.save(state, path)
+        return path
+
+    def load_checkpoint(self, path: str, load_optim: bool = True) -> int:
+        chk = torch.load(path, map_location=self.device)
+        self.core.load_state_dict(chk["core"])
+        if self.ema_core is not None:
+            if "ema_core" in chk:
+                self.ema_core.load_state_dict(chk["ema_core"])
+            else:
+                self.ema_core.load_state_dict(chk["core"])
+        self.cond_proj.load_state_dict(chk["cond_proj"])
+        if load_optim and self.optim is not None and chk.get("optim"):
+            self.optim.load_state_dict(chk["optim"])
+        if "data_stats" in chk:
+            self.data_stats.mean = chk["data_stats"]["mean"]
+            self.data_stats.std = chk["data_stats"]["std"]
+        return int(chk.get("epoch", 0))
 
 
 @torch.no_grad()
@@ -76,7 +212,16 @@ def sample_core(
         else:
             x = mean
     
-    return x.permute(0, 2, 1)  # (B, C, N)
+    out = x.permute(0, 2, 1)  # (B, C, N)
+
+    # Perform 1d Gaussian convolution over time axis
+    kernel = torch.tensor([0.25, 0.5, 0.25], device=device, dtype=torch.float32).view(1, 1, 3)
+    B, C, N = out.shape
+    out = F.conv1d(
+        out.reshape(B * C, 1, N), weight=kernel, padding=1, stride=1, groups=1
+    ).reshape(B, C, N)
+
+    return out
 
 
 class DataStats:
@@ -138,112 +283,37 @@ def train(cfg: Config = default_config):
     """Main training function using configuration."""
     print_config(cfg)
     
-    device_t = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"\nUsing device: {device_t}")
-
-    # Load data
-    tr = TritiumSSDataLoader(cfg.paths.tritium_h5, cfg.paths.channel_positions)
+    ctx = ModelContext.build(cfg, for_training=True, verbose=True)
+    
+    # Aliases for readability
+    device_t = ctx.device
+    core = ctx.core
+    cond_proj = ctx.cond_proj
+    ema_core = ctx.ema_core
+    optim = ctx.optim
+    schedule = ctx.schedule
+    data_stats = ctx.data_stats
+    A_sparse = ctx.A_sparse
+    pos = ctx.pos
+    n_nodes = ctx.n_nodes
+    n_channels = ctx.n_channels
+    n_time_points = ctx.n_time_points
+    graph = ctx.graph
+    tr = ctx.loader
     channel_positions = tr.channel_positions
-    graph = tr.load_adjacency_sparse(
-        z_sep=cfg.graph.z_sep, 
-        radius=cfg.graph.radius, 
-        z_hops=cfg.graph.z_hops
-    )
-    A_sparse = graph.adjacency.to(device_t)
-    pos = graph.positions_xyz.to(device_t)
-    n_channels = tr.n_channels
-    n_time_points = tr.n_time_points
-    n_nodes = n_channels * n_time_points
-
-    print(f"Graph: {n_nodes} nodes, {A_sparse._nnz()} edges")
-    
-    print("Computing data statistics...")
-    data_stats = DataStats.from_loader(tr, n_samples=1000, batch_size=32)
-    print(f"Data mean: {data_stats.mean:.4f}, std: {data_stats.std:.4f}")
-
-    # Build schedule
-    schedule = build_cosine_schedule(cfg.diffusion.timesteps, device_t)
-
-    # Build models
-    cond_proj = nn.Sequential(
-        nn.Linear(cfg.conditioning.cond_in_dim, 128), 
-        nn.SiLU(), 
-        nn.Linear(128, cfg.conditioning.cond_proj_dim)
-    ).to(device_t)
-    
-    core = GraphDDPMUNet(
-        in_dim=cfg.model.in_dim,
-        cond_dim=cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim,
-        hidden_dim=cfg.model.hidden_dim,
-        depth=cfg.model.depth,
-        blocks_per_stage=cfg.model.blocks_per_stage,
-        pool_ratio=cfg.model.pool_ratio,
-        out_dim=cfg.model.out_dim,
-        dropout=cfg.model.dropout,
-        pos_dim=cfg.model.pos_dim,
-    ).to(device_t)
-    
-    n_params = sum(p.numel() for p in core.parameters() if p.requires_grad)
-    n_params += sum(p.numel() for p in cond_proj.parameters() if p.requires_grad)
-    print(f"Total trainable parameters: {n_params:,}")
     
     # Verify requires_grad is set
     n_grad = sum(1 for p in core.parameters() if p.requires_grad)
     n_total = sum(1 for p in core.parameters())
     print(f"Parameters with requires_grad: {n_grad}/{n_total}")
 
-    # Optimizer
-    optim = torch.optim.AdamW(
-        list(core.parameters()) + list(cond_proj.parameters()),
-        lr=cfg.training.lr,
-        betas=(0.9, 0.999),
-        weight_decay=cfg.training.weight_decay,
-    )
-
-    os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
-
-    # EMA model (create before checkpoint loading so we can load EMA weights)
-    ema_core = deepcopy(core).to(device_t)
-
-    # Checkpoint functions
-    def save_checkpoint(epoch_idx: int):
-        state = {
-            "core": core.state_dict(),
-            "ema_core": ema_core.state_dict(),
-            "cond_proj": cond_proj.state_dict(),
-            "optim": optim.state_dict(),
-            "epoch": epoch_idx,
-            "data_stats": {"mean": data_stats.mean, "std": data_stats.std},
-        }
-        path = os.path.join(cfg.paths.checkpoint_dir, f"ckpt_epoch_{epoch_idx:04d}.pt")
-        torch.save(state, path)
-        return path
-
-    def latest_checkpoint() -> Optional[str]:
-        files = sorted(glob.glob(os.path.join(cfg.paths.checkpoint_dir, "ckpt_epoch_*.pt")))
-        return files[-1] if files else None
-
-    def load_checkpoint(path: str) -> int:
-        chk = torch.load(path, map_location=device_t)
-        core.load_state_dict(chk["core"])
-        if "ema_core" in chk:
-            ema_core.load_state_dict(chk["ema_core"])
-        else:
-            ema_core.load_state_dict(chk["core"])
-        cond_proj.load_state_dict(chk["cond_proj"])
-        optim.load_state_dict(chk["optim"])
-        if "data_stats" in chk:
-            data_stats.mean = chk["data_stats"]["mean"]
-            data_stats.std = chk["data_stats"]["std"]
-        return int(chk.get("epoch", 0))
-
     # Resume
     start_epoch = 0
     if cfg.resume:
-        last = latest_checkpoint()
+        last = ctx.latest_checkpoint()
         if last is not None:
             try:
-                start_epoch = load_checkpoint(last) + 1
+                start_epoch = ctx.load_checkpoint(last) + 1
                 print(f"Resumed from epoch {start_epoch}")
             except Exception as e:
                 print(f"Could not resume: {e}")
@@ -449,7 +519,7 @@ def train(cfg: Config = default_config):
 
         # Checkpointing
         if (epoch + 1) % cfg.training.checkpoint_every == 0:
-            save_checkpoint(epoch)
+            ctx.save_checkpoint(epoch)
 
         # Visualization
         if cfg.visualize and (epoch % cfg.training.visualize_every == 0 or epoch == cfg.training.epochs - 1):
@@ -528,5 +598,92 @@ def train(cfg: Config = default_config):
                 plt.close(fig)
 
 
+def generate_samples(cfg: Config):
+    """Generate samples from a trained model."""
+    ctx = ModelContext.build(cfg, for_training=False, verbose=True)
+    
+    # Aliases for readability
+    core = ctx.core
+    cond_proj = ctx.cond_proj
+    schedule = ctx.schedule
+    data_stats = ctx.data_stats
+    A_sparse = ctx.A_sparse
+    pos = ctx.pos
+    n_nodes = ctx.n_nodes
+    n_channels = ctx.n_channels
+    n_time_points = ctx.n_time_points
+    graph = ctx.graph
+    tr = ctx.loader
+    channel_positions = tr.channel_positions
+    
+    # Load checkpoint
+    latest_ckpt = ctx.latest_checkpoint()
+    if latest_ckpt is None:
+        raise FileNotFoundError(f"No checkpoints found in {cfg.paths.checkpoint_dir}")
+    print(f"Loading checkpoint: {latest_ckpt}")
+    ctx.load_checkpoint(latest_ckpt, load_optim=False)
+    core.eval()
+
+    with torch.no_grad():
+        b_vis = min(cfg.training.batch_size, 4)
+        batch_np, batch_cond = tr.get_batch(b_vis)
+        batch_cond_t = torch.from_numpy(batch_cond.astype(np.float32)).to(ctx.device)
+        cond_vis = cond_proj(batch_cond_t)
+        samples = sample_core(
+            core=core,
+            schedule=schedule,
+            A_sparse=A_sparse,
+            cond_proj=cond_vis,
+            time_dim=cfg.conditioning.time_dim,
+            shape=(b_vis, 1, n_nodes),
+            parametrization=cfg.diffusion.parametrization,
+            pos=pos,
+            pbar=True,
+        )
+        samples_denorm = data_stats.denormalize(samples.cpu().numpy())
+        samples_denorm = np.clip(samples_denorm, 0, None)
+
+    for i in range(samples_denorm.shape[0]):
+        rec_int = samples_denorm[i, 0]
+        true_int = batch_np[i, :, 0]
+        rec_xy = rec_int.reshape(n_channels, n_time_points, order='F').sum(axis=1)
+        true_xy = true_int.reshape(n_channels, n_time_points, order='F').sum(axis=1)
+        rec_z = rec_int.reshape(n_channels, n_time_points, order='F')
+        true_z = true_int.reshape(n_channels, n_time_points, order='F')
+        adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
+        Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        visualize_event(Gxy, true_xy, None, ax=axes[0])
+        axes[0].set_title("Ground truth")
+        visualize_event(Gxy, rec_xy, None, ax=axes[1])
+        axes[1].set_title("DDPM sample")
+        plt.tight_layout()
+        fig.savefig(f"{cfg.paths.plot_dir}/event_{i}_xy.png")
+        plt.close(fig)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+        visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), true_z, None, ax=axes[0])
+        axes[0].set_title("Ground truth")
+        visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), rec_z, None, ax=axes[1])
+        axes[1].set_title("DDPM sample")
+        plt.tight_layout()
+        fig.savefig(f"{cfg.paths.plot_dir}/event_{i}_z.png")
+        plt.close(fig)
+
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection="3d")
+        visualize_event_3d(graph, true_int, ax=ax, colorbar=True)
+        fig.savefig(f"{cfg.paths.plot_dir}/event_{i}_true_3d.png", dpi=300)
+        plt.close(fig)
+
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection="3d")
+        visualize_event_3d(graph, rec_int, ax=ax, colorbar=True)
+        fig.savefig(f"{cfg.paths.plot_dir}/event_{i}_rec_3d.png", dpi=300)
+        plt.close(fig)
+
+    return samples_denorm
+
 if __name__ == "__main__":
     train(default_config)
+    # generate_samples(default_config)

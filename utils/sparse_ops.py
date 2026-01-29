@@ -10,6 +10,50 @@ def to_coalesced_coo(adj: torch.Tensor) -> torch.Tensor:
     return adj
 
 
+def to_binary(adj: torch.Tensor) -> torch.Tensor:
+    """Convert adjacency to binary (all edge values = 1), no self-loops added."""
+    adj = to_coalesced_coo(adj)
+    indices = adj.indices()
+    N = adj.size(0)
+    
+    # Remove any existing self-loops for clean GIN aggregation
+    row, col = indices[0], indices[1]
+    non_diag = row != col
+    indices = indices[:, non_diag]
+    
+    values = torch.ones(indices.size(1), device=adj.device, dtype=adj.dtype)
+    
+    adj_binary = torch.sparse_coo_tensor(
+        indices, values, size=(N, N), device=adj.device, dtype=adj.dtype
+    ).coalesce()
+    return adj_binary
+
+
+def add_self_loops_binary(adj: torch.Tensor) -> torch.Tensor:
+    """Add self-loops to adjacency and ensure all values are 1 (binary)."""
+    adj = to_coalesced_coo(adj)
+    indices = adj.indices()
+    N = adj.size(0)
+    
+    row, col = indices[0], indices[1]
+    is_diag = (row == col)
+    mask_diag_present = torch.zeros(N, dtype=torch.bool, device=indices.device)
+    if is_diag.any():
+        mask_diag_present[row[is_diag]] = True
+    
+    missing = (~mask_diag_present).nonzero(as_tuple=False).flatten()
+    if missing.numel() > 0:
+        add_idx = torch.stack([missing, missing], dim=0)
+        indices = torch.cat([indices, add_idx], dim=1)
+    
+    values = torch.ones(indices.size(1), device=adj.device, dtype=adj.dtype)
+    
+    adj_binary = torch.sparse_coo_tensor(
+        indices, values, size=(N, N), device=adj.device, dtype=adj.dtype
+    ).coalesce()
+    return adj_binary
+
+
 def gcn_norm(adj: torch.Tensor, add_self_loops: bool = True) -> torch.Tensor:
     adj = to_coalesced_coo(adj)
     indices = adj.indices()

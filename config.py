@@ -12,9 +12,9 @@ class ModelConfig:
     in_dim: int = 1
     out_dim: int = 1
     hidden_dim: int = 64
-    depth: int = 4              # Reduced from 4 to prevent vanishing gradients
+    depth: int = 3
     blocks_per_stage: int = 2
-    pool_ratio: float = 0.5     # Less aggressive pooling
+    pool_ratio: float = 0.7
     dropout: float = 0.0
     pos_dim: int = 3
     pos_dropout: float = 0.0
@@ -52,7 +52,7 @@ class TrainingConfig:
     epochs: int = 10_000
     batch_size: int = 8
     steps_per_epoch: int = 64   # Optimizer steps per epoch
-    lr: float = 3e-4            # Increased from 1e-4 to compensate for small gradients
+    lr: float = 2e-3            # Increased from 1e-4 to compensate for small gradients
     weight_decay: float = 0
     ema_decay: float = 0.999
     grad_clip: float = 1.0

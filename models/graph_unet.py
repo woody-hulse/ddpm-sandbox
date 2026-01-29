@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.sparse_ops import gcn_norm, to_coalesced_coo, subgraph_coo
+from utils.sparse_ops import to_coalesced_coo, subgraph_coo, to_binary
 
 
 class SparseGraphConv(nn.Module):
@@ -31,7 +31,7 @@ class FiLMFromCond(nn.Module):
             nn.SiLU(),
             nn.Linear(width, out_dim),
         )
-        nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.01)
+        nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.1)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, cond: torch.Tensor, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -40,13 +40,13 @@ class FiLMFromCond(nn.Module):
         film = self.mlp(cond)  # (B, num_layers * 2 * hidden_dim)
         film = film.view(batch_size, self.num_layers, 2, self.hidden_dim)
         gamma, beta = film[:, :, 0, :], film[:, :, 1, :]  # (B, num_layers, hidden_dim)
-        gamma = 1.0 + 0.1 * torch.tanh(gamma)  # Bounded to [0.9, 1.1]
-        beta = 0.1 * torch.tanh(beta)  # Bounded to [-0.1, 0.1]
+        gamma = 1.0 + 0.5 * torch.tanh(gamma)  # Bounded to [0.5, 1.5]
+        beta = torch.tanh(beta)  # Bounded to [-1, 1]
         return gamma, beta
 
 
 class GraphResBlock(nn.Module):
-    def __init__(self, hidden_dim: int, cond_dim: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, cond_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
         self.lin1 = nn.Linear(hidden_dim, hidden_dim)
@@ -54,29 +54,33 @@ class GraphResBlock(nn.Module):
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         
+        # GIN learnable epsilon for self-weight
+        self.eps = nn.Parameter(torch.tensor(eps_init))
+        
         # Conditioning projection for scale and shift
         self.cond_proj = nn.Linear(cond_dim, hidden_dim * 2)
         
-        # Initialize for stable training
-        nn.init.xavier_uniform_(self.lin1.weight, gain=0.5)
+        # Initialize for stable but expressive training
+        nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
         nn.init.zeros_(self.lin1.bias)
-        nn.init.xavier_uniform_(self.lin2.weight, gain=0.1)  # Small for residual
+        nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
         nn.init.zeros_(self.lin2.bias)
-        nn.init.xavier_uniform_(self.cond_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.cond_proj.weight, gain=0.5)
         nn.init.zeros_(self.cond_proj.bias)
 
-    def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, cond: torch.Tensor,
+    def forward(self, x: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor,
                 gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         # Normalize input for stability
         h = self.norm(x)
         
-        # Message passing: aggregate neighbors
-        h = torch.sparse.mm(adj_hat, h)
+        # GIN-style message passing: (1 + eps) * self + sum(neighbors)
+        neighbor_sum = torch.sparse.mm(adj, h)
+        h = (1 + self.eps) * h + neighbor_sum
         
         # Conditioning with bounded scale
         cond_out = self.cond_proj(cond)
         cond_scale, cond_shift = cond_out.chunk(2, dim=-1)
-        cond_scale = torch.sigmoid(cond_scale) * 0.5 + 0.75  # Range [0.75, 1.25]
+        cond_scale = torch.sigmoid(cond_scale) + 0.5  # Range [0.5, 1.5]
         
         # Transform
         h = self.lin1(h)
@@ -84,12 +88,11 @@ class GraphResBlock(nn.Module):
         h = self.act(h)
         h = self.lin2(h)
         
-        # FiLM with bounded gamma
-        gamma = torch.clamp(gamma, 0.5, 2.0)  # Prevent extreme scaling
+        # FiLM modulation
         h = h * gamma + beta
         h = self.dropout(h)
         
-        return x + 0.1 * h  # Scaled residual for stability
+        return x + h  # Full residual
 
 
 class TopKPool(nn.Module):
@@ -262,23 +265,24 @@ class GraphDDPMUNet(nn.Module):
         nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
         nn.init.zeros_(self.out_proj.bias)
 
-    def _maybe_norm_top(self, adj: torch.Tensor) -> torch.Tensor:
+    def _maybe_to_binary(self, adj: torch.Tensor) -> torch.Tensor:
+        """Convert adjacency to binary for GIN-style message passing."""
         adj = to_coalesced_coo(adj)
         key = (adj.device, adj.size(), adj._nnz())
         if self.cache_norm_top and self._cached_key == key and self._cached_adj is not None:
             return self._cached_adj
-        adj_hat = gcn_norm(adj, add_self_loops=True)
+        adj_binary = to_binary(adj)
         if self.cache_norm_top:
             self._cached_key = key
-            self._cached_adj = adj_hat
-        return adj_hat
+            self._cached_adj = adj_binary
+        return adj_binary
 
     def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
         key = (adj.device, adj.size(), adj._nnz(), batch_size)
         if key in self._cached_block_adj:
             return self._cached_block_adj[key]
-        adj_normed = self._maybe_norm_top(adj)
-        block_adj = build_block_diagonal_adj(adj_normed, batch_size)
+        adj_binary = self._maybe_to_binary(adj)
+        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
         self._cached_block_adj[key] = block_adj
         return block_adj
 
@@ -333,7 +337,7 @@ class GraphDDPMUNet(nn.Module):
             h_skip = h_cur
             h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
             K = h_pool.size(0)
-            adj_next = gcn_norm(subgraph_coo(adj_cur, keep_idx, K), add_self_loops=True)
+            adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
             skips.append((h_skip, keep_idx, h_cur.size(0), nodes_per_graph))
             adjs.append(adj_cur)
             h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
