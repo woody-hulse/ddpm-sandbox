@@ -260,8 +260,8 @@ def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: boo
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection="3d")
 
-    s = np.clip(event * 10.0, 0.1, 100)
-    mask = event >= 1.0
+    s = np.clip(event * 20.0, 0.1, 100)
+    mask = event >= 0.5
     
     if mask.sum() > 0:
         scatter = ax.scatter(

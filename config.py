@@ -11,7 +11,7 @@ class ModelConfig:
     """Graph U-Net architecture parameters."""
     in_dim: int = 1
     out_dim: int = 1
-    hidden_dim: int = 64
+    hidden_dim: int = 32
     depth: int = 3
     blocks_per_stage: int = 2
     pool_ratio: float = 0.7
@@ -36,6 +36,19 @@ class ConditioningConfig:
     cond_in_dim: int = 5        # Input condition dimension
     cond_proj_dim: int = 64     # Projected condition dimension  
     time_dim: int = 64          # Time embedding dimension
+
+
+@dataclass
+class EncoderConfig:
+    """DiffAE Graph Encoder parameters."""
+    latent_dim: int = 4           # Latent representation dimension
+    hidden_dim: int = 32            # Encoder hidden dimension
+    depth: int = 4                  # Number of pooling stages
+    blocks_per_stage: int = 2       # Residual blocks per stage
+    pool_ratio: float = 0.5         # Pooling ratio per stage
+    dropout: float = 0.0            # Dropout rate
+    use_stochastic: bool = False    # Use stochastic encoder (VAE-style)
+    kl_weight: float = 0.001        # KL divergence weight if stochastic
 
 
 @dataclass 
@@ -65,8 +78,8 @@ class TrainingConfig:
 @dataclass
 class PathConfig:
     """File paths."""
-    tritium_h5: str = "data/tritium_ss_42.h5"
-    channel_positions: str = "data/pmt_xy_42.h5"
+    tritium_h5: str = "data/tritium_ss_single_node.h5"
+    channel_positions: str = "data/pmt_xy_single_node.h5"
     checkpoint_dir: str = "checkpoints"
     plot_dir: str = "plots"
 
@@ -77,6 +90,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     paths: PathConfig = field(default_factory=PathConfig)
@@ -108,7 +122,7 @@ def get_config(**overrides) -> Config:
     return cfg
 
 
-def print_config(cfg: Config) -> None:
+def print_config(cfg: Config, include_encoder: bool = False) -> None:
     """Print configuration summary."""
     print("=" * 50)
     print("Configuration")
@@ -124,6 +138,15 @@ def print_config(cfg: Config) -> None:
     print(f"  timesteps: {cfg.diffusion.timesteps}")
     print(f"  parametrization: {cfg.diffusion.parametrization}")
     print(f"  p2_gamma: {cfg.diffusion.p2_gamma}")
+    
+    if include_encoder:
+        print(f"\nEncoder (DiffAE):")
+        print(f"  latent_dim: {cfg.encoder.latent_dim}")
+        print(f"  hidden_dim: {cfg.encoder.hidden_dim}")
+        print(f"  depth: {cfg.encoder.depth}")
+        print(f"  blocks_per_stage: {cfg.encoder.blocks_per_stage}")
+        print(f"  pool_ratio: {cfg.encoder.pool_ratio}")
+        print(f"  stochastic: {cfg.encoder.use_stochastic}")
     
     print(f"\nTraining:")
     print(f"  lr: {cfg.training.lr}")
