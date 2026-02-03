@@ -73,15 +73,20 @@ class TrainingConfig:
     # Checkpointing
     checkpoint_every: int = 100
     visualize_every: int = 100
+    
+    # Encoded dataset export
+    encode_dataset_every: int = 1000  # Save encoded latents every N steps (0 to disable)
 
 
 @dataclass
 class PathConfig:
-    """File paths."""
+    """File paths (base paths; latent-tagged subdirs use encoder.latent_dim)."""
     tritium_h5: str = "data/tritium_ss_single_node.h5"
     channel_positions: str = "data/pmt_xy_single_node.h5"
     checkpoint_dir: str = "checkpoints"
     plot_dir: str = "plots"
+    diffae_subdir: str = "diffae_z{latent_dim}"
+    ae_subdir: str = "ae_z{latent_dim}"
 
 
 @dataclass

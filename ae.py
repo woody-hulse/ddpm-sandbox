@@ -1,8 +1,8 @@
 """
-DiffAE: Diffusion Autoencoder with Graph Encoder.
+Graph VAE: Variational Autoencoder with Graph Encoder/Decoder.
 
 Uses a graph encoder to map events to latent representations,
-which condition the diffusion process for reconstruction.
+and a graph decoder for direct reconstruction.
 """
 import os
 import sys
@@ -24,30 +24,18 @@ from data import Graph, visualize_event, visualize_event_z, SparseGraph
 from lz_data_loader import TritiumSSDataLoader
 from config import Config, default_config, print_config
 
-from models.graph_unet import (
-    GraphDDPMUNet, GraphResBlock, TopKPool, FiLMFromCond,
-    build_block_diagonal_adj, _unpool_like
+from diffae import (
+    GraphEncoder, GraphEncoderStage, GraphEncoderBlock,
+    DiffAEDataStats, visualize_event_3d
 )
-from diffusion.schedule import build_cosine_schedule, sinusoidal_embedding
+from models.graph_unet import (
+    TopKPool, build_block_diagonal_adj, _unpool_like
+)
 from utils.sparse_ops import to_coalesced_coo, subgraph_coo, to_binary
 from utils.visualization import build_xy_adjacency_radius
 
 
-class GraphEncoderStage(nn.Module):
-    def __init__(self, hidden_dim: int, blocks_per_stage: int = 2, dropout: float = 0.0):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            GraphEncoderBlock(hidden_dim, dropout=dropout)
-            for _ in range(blocks_per_stage)
-        ])
-
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        for blk in self.blocks:
-            x = blk(x, adj)
-        return x
-
-
-class GraphEncoderBlock(nn.Module):
+class GraphDecoderBlock(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
@@ -73,10 +61,175 @@ class GraphEncoderBlock(nn.Module):
         return x + h
 
 
-class GraphEncoder(nn.Module):
+class GraphDecoderStage(nn.Module):
+    def __init__(self, hidden_dim: int, blocks_per_stage: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            GraphDecoderBlock(hidden_dim, dropout=dropout)
+            for _ in range(blocks_per_stage)
+        ])
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        for blk in self.blocks:
+            x = blk(x, adj)
+        return x
+
+
+class GraphDecoder(nn.Module):
     """
-    Graph encoder that maps input events to latent representations.
-    Uses hierarchical pooling to aggregate information into a global latent.
+    Graph decoder that maps latent representations back to node features.
+    Uses hierarchical unpooling to reconstruct the full graph.
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        n_nodes: int,
+        depth: int = 3,
+        blocks_per_stage: int = 2,
+        pool_ratio: float = 0.5,
+        dropout: float = 0.0,
+        pos_dim: int = 3,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.n_nodes = n_nodes
+        self.depth = depth
+        self.pool_ratio = pool_ratio
+
+        # Compute sizes at each level
+        self.level_sizes = [n_nodes]
+        current_size = n_nodes
+        for _ in range(depth):
+            current_size = max(1, int(math.ceil(current_size * pool_ratio)))
+            self.level_sizes.append(current_size)
+        self.level_sizes = self.level_sizes[::-1]  # smallest to largest
+
+        # Project latent to initial hidden state
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * self.level_sizes[0]),
+        )
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Upsampling layers
+        self.upsample_layers = nn.ModuleList([
+            nn.Linear(hidden_dim, hidden_dim)
+            for _ in range(depth)
+        ])
+
+        # Decoder stages (after each upsampling)
+        self.stages = nn.ModuleList([
+            GraphDecoderStage(hidden_dim, blocks_per_stage, dropout)
+            for _ in range(depth)
+        ])
+
+        self.final_stage = GraphDecoderStage(hidden_dim, blocks_per_stage, dropout)
+
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, out_dim)
+
+        self._cached_block_adj = {}
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.latent_proj:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for m in self.pos_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for layer in self.upsample_layers:
+            nn.init.xavier_uniform_(layer.weight, gain=1.0)
+            nn.init.zeros_(layer.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+        key = (adj.device, adj.size(), adj._nnz(), batch_size)
+        if key in self._cached_block_adj:
+            return self._cached_block_adj[key]
+        adj_binary = to_binary(adj)
+        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        self._cached_block_adj[key] = block_adj
+        return block_adj
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        encoder_pool_indices: List[Tuple[torch.Tensor, int, int]],
+        batch_size: int = 1
+    ) -> torch.Tensor:
+        """
+        Decode latent representations to node features.
+        
+        Args:
+            z: Latent representation (B, latent_dim)
+            adj: Single graph adjacency (N, N)
+            pos: Node positions (N, pos_dim)
+            encoder_pool_indices: List of (keep_idx, N_prev, npg_prev) from encoder
+            batch_size: Number of graphs in batch
+            
+        Returns:
+            Reconstructed node features (B*N, out_dim)
+        """
+        B = batch_size
+        initial_size = self.level_sizes[0]
+
+        # Project latent to initial nodes
+        h = self.latent_proj(z)  # (B, hidden_dim * initial_size)
+        h = h.view(B * initial_size, self.hidden_dim)
+
+        # Build adjacency for smallest graph
+        adj0 = self._get_block_adj(adj, B).to(device=z.device, dtype=z.dtype)
+
+        # Process through decoder stages with upsampling
+        for d in range(self.depth):
+            keep_idx, N_prev, npg_prev = encoder_pool_indices[self.depth - 1 - d]
+            
+            # Upsample
+            h_up = _unpool_like(h, keep_idx, N_prev)
+            h = self.upsample_layers[d](h_up)
+            
+            # Get adjacency at this level
+            adj_level = subgraph_coo(adj0, torch.arange(N_prev, device=z.device), N_prev)
+            adj_level = to_binary(adj_level)
+            
+            # Process with graph convolutions
+            h = self.stages[d](h, adj_level)
+
+        # Add position embeddings at final resolution
+        pos_tiled = pos.repeat(B, 1)
+        pos_emb = self.pos_mlp(pos_tiled.to(z.dtype))
+        h = h + pos_emb
+
+        # Final processing
+        h = self.final_stage(h, adj0)
+        h = F.silu(self.out_norm(h))
+        out = self.out_proj(h)
+
+        return out
+
+
+class GraphVAEEncoder(nn.Module):
+    """
+    VAE Encoder wrapper that also returns pooling indices for the decoder.
+    Wraps the GraphEncoder but tracks pooling operations.
     """
     def __init__(
         self,
@@ -88,7 +241,7 @@ class GraphEncoder(nn.Module):
         pool_ratio: float = 0.5,
         dropout: float = 0.0,
         pos_dim: int = 3,
-        use_stochastic: bool = False,
+        use_stochastic: bool = True,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -117,11 +270,8 @@ class GraphEncoder(nn.Module):
 
         self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
 
-        if use_stochastic:
-            self.to_mu = nn.Linear(hidden_dim, latent_dim)
-            self.to_logvar = nn.Linear(hidden_dim, latent_dim)
-        else:
-            self.to_latent = nn.Linear(hidden_dim, latent_dim)
+        self.to_mu = nn.Linear(hidden_dim, latent_dim)
+        self.to_logvar = nn.Linear(hidden_dim, latent_dim)
 
         self._cached_block_adj = {}
         self.reset_parameters()
@@ -134,14 +284,10 @@ class GraphEncoder(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        if self.use_stochastic:
-            nn.init.xavier_uniform_(self.to_mu.weight, gain=0.5)
-            nn.init.zeros_(self.to_mu.bias)
-            nn.init.xavier_uniform_(self.to_logvar.weight, gain=0.1)
-            nn.init.zeros_(self.to_logvar.bias)
-        else:
-            nn.init.xavier_uniform_(self.to_latent.weight, gain=1.0)
-            nn.init.zeros_(self.to_latent.bias)
+        nn.init.xavier_uniform_(self.to_mu.weight, gain=0.5)
+        nn.init.zeros_(self.to_mu.bias)
+        nn.init.xavier_uniform_(self.to_logvar.weight, gain=0.1)
+        nn.init.zeros_(self.to_logvar.bias)
 
     def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
         key = (adj.device, adj.size(), adj._nnz(), batch_size)
@@ -158,20 +304,15 @@ class GraphEncoder(nn.Module):
         adj: torch.Tensor, 
         pos: torch.Tensor,
         batch_size: int = 1
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
         """
         Encode input events to latent representations.
         
-        Args:
-            x: Node features (B*N, in_dim)
-            adj: Single graph adjacency (N, N)
-            pos: Node positions (N, pos_dim)
-            batch_size: Number of graphs in batch
-            
         Returns:
             z: Latent representation (B, latent_dim)
-            mu: Mean if stochastic (B, latent_dim) or None
-            logvar: Log variance if stochastic (B, latent_dim) or None
+            mu: Mean (B, latent_dim)
+            logvar: Log variance (B, latent_dim)
+            pool_indices: List of (keep_idx, N_prev, npg_prev) for decoder
         """
         N_single = adj.size(0)
         total_nodes = x.size(0)
@@ -187,9 +328,13 @@ class GraphEncoder(nn.Module):
         nodes_per_graph = N_single
         h_cur, adj_cur = h, adj0
 
+        pool_indices = []
         for d in range(self.depth):
             h_cur = self.stages[d](h_cur, adj_cur)
             h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
+            
+            pool_indices.append((keep_idx, h_cur.size(0), nodes_per_graph))
+            
             K = h_pool.size(0)
             adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
             h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
@@ -197,48 +342,137 @@ class GraphEncoder(nn.Module):
         h_cur = self.final_stage(h_cur, adj_cur)
 
         h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
-        h_agg = h_graph.mean(dim=1)  # Global mean pooling (B, hidden_dim)
+        h_agg = h_graph.mean(dim=1)
 
-        if self.use_stochastic:
-            mu = self.to_mu(h_agg)
-            logvar = self.to_logvar(h_agg)
-            logvar = torch.clamp(logvar, min=-10, max=2)
+        mu = self.to_mu(h_agg)
+        logvar = self.to_logvar(h_agg)
+        logvar = torch.clamp(logvar, min=-10, max=2)
+        
+        if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             z = mu + eps * std
-            return z, mu, logvar
         else:
-            z = self.to_latent(h_agg)
-            return z, None, None
+            z = mu
+            
+        return z, mu, logvar, pool_indices
 
 
-class DiffAEDataStats:
-    """Compute and store data statistics for normalization."""
-    def __init__(self, mean: float = 0.0, std: float = 1.0):
-        self.mean = mean
-        self.std = std
-    
-    @classmethod
-    def from_loader(cls, loader, n_samples: int = 1000, batch_size: int = 32) -> 'DiffAEDataStats':
-        all_data = []
-        samples_collected = 0
-        while samples_collected < n_samples:
-            batch_np, _ = loader.get_batch(min(batch_size, n_samples - samples_collected))
-            all_data.append(batch_np.flatten())
-            samples_collected += batch_np.shape[0]
-        all_data = np.concatenate(all_data)
-        return cls(mean=float(np.mean(all_data)), std=float(np.std(all_data)))
-    
-    def normalize(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.mean) / (self.std + 1e-8)
-    
-    def denormalize(self, x: np.ndarray) -> np.ndarray:
-        return x * self.std + self.mean
+class SimpleGraphDecoder(nn.Module):
+    """
+    Simple MLP-based decoder that broadcasts latent to all nodes,
+    then refines with graph message passing.
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        n_nodes: int,
+        depth: int = 3,
+        blocks_per_stage: int = 2,
+        dropout: float = 0.0,
+        pos_dim: int = 3,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.n_nodes = n_nodes
+        self.depth = depth
+
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.stages = nn.ModuleList([
+            GraphDecoderStage(hidden_dim, blocks_per_stage, dropout)
+            for _ in range(depth)
+        ])
+
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, out_dim)
+
+        self._cached_block_adj = {}
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.latent_proj:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for m in self.pos_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+        key = (adj.device, adj.size(), adj._nnz(), batch_size)
+        if key in self._cached_block_adj:
+            return self._cached_block_adj[key]
+        adj_binary = to_binary(adj)
+        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        self._cached_block_adj[key] = block_adj
+        return block_adj
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1
+    ) -> torch.Tensor:
+        """
+        Decode latent representations to node features.
+        
+        Args:
+            z: Latent representation (B, latent_dim)
+            adj: Single graph adjacency (N, N)
+            pos: Node positions (N, pos_dim)
+            batch_size: Number of graphs in batch
+            
+        Returns:
+            Reconstructed node features (B*N, out_dim)
+        """
+        N = self.n_nodes
+        B = batch_size
+        
+        adj0 = self._get_block_adj(adj, B).to(device=z.device, dtype=z.dtype)
+
+        # Project latent and broadcast to all nodes
+        z_proj = self.latent_proj(z)  # (B, hidden_dim)
+        h = z_proj.unsqueeze(1).expand(B, N, -1).reshape(B * N, self.hidden_dim)
+
+        # Add position embeddings
+        pos_tiled = pos.repeat(B, 1)
+        pos_emb = self.pos_mlp(pos_tiled.to(z.dtype))
+        h = h + pos_emb
+
+        # Graph message passing stages
+        for stage in self.stages:
+            h = stage(h, adj0)
+
+        h = F.silu(self.out_norm(h))
+        out = self.out_proj(h)
+
+        return out
 
 
 @dataclass
-class DiffAEContext:
-    """Holds all model components for DiffAE training/inference."""
+class VAEContext:
+    """Holds all model components for VAE training/inference."""
     cfg: Config
     device: torch.device
     loader: TritiumSSDataLoader
@@ -249,10 +483,8 @@ class DiffAEContext:
     n_time_points: int
     n_nodes: int
     data_stats: DiffAEDataStats
-    schedule: dict
     encoder: nn.Module
     decoder: nn.Module
-    latent_proj: nn.Module
     checkpoint_dir: str = ""
     plot_dir: str = ""
     ema_encoder: Optional[nn.Module] = None
@@ -260,7 +492,7 @@ class DiffAEContext:
     optim: Optional[torch.optim.Optimizer] = None
 
     @classmethod
-    def build(cls, cfg: Config, for_training: bool = True, verbose: bool = True) -> 'DiffAEContext':
+    def build(cls, cfg: Config, for_training: bool = True, verbose: bool = True) -> 'VAEContext':
         device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         if verbose:
             print(f"Using device: {device}")
@@ -285,9 +517,7 @@ class DiffAEContext:
         if verbose:
             print(f"Data mean: {data_stats.mean:.4f}, std: {data_stats.std:.4f}")
 
-        schedule = build_cosine_schedule(cfg.diffusion.timesteps, device)
-
-        encoder = GraphEncoder(
+        encoder = GraphVAEEncoder(
             in_dim=cfg.model.in_dim,
             hidden_dim=cfg.encoder.hidden_dim,
             latent_dim=cfg.encoder.latent_dim,
@@ -296,42 +526,31 @@ class DiffAEContext:
             pool_ratio=cfg.encoder.pool_ratio,
             dropout=cfg.encoder.dropout,
             pos_dim=cfg.model.pos_dim,
-            use_stochastic=cfg.encoder.use_stochastic,
+            use_stochastic=True,
         ).to(device)
 
-        latent_proj = nn.Sequential(
-            nn.Linear(cfg.encoder.latent_dim, cfg.conditioning.cond_proj_dim * 2),
-            nn.SiLU(),
-            nn.Linear(cfg.conditioning.cond_proj_dim * 2, cfg.conditioning.cond_proj_dim)
-        ).to(device)
-
-        decoder = GraphDDPMUNet(
-            in_dim=cfg.model.in_dim,
-            cond_dim=cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim,
-            hidden_dim=cfg.model.hidden_dim,
-            depth=cfg.model.depth,
-            blocks_per_stage=cfg.model.blocks_per_stage,
-            pool_ratio=cfg.model.pool_ratio,
+        decoder = SimpleGraphDecoder(
+            latent_dim=cfg.encoder.latent_dim,
+            hidden_dim=cfg.encoder.hidden_dim,
             out_dim=cfg.model.out_dim,
-            dropout=cfg.model.dropout,
+            n_nodes=n_nodes,
+            depth=cfg.encoder.depth,
+            blocks_per_stage=cfg.encoder.blocks_per_stage,
+            dropout=cfg.encoder.dropout,
             pos_dim=cfg.model.pos_dim,
         ).to(device)
 
         ema_encoder = None
         ema_decoder = None
         optim = None
-        subdir = cfg.paths.diffae_subdir.format(latent_dim=cfg.encoder.latent_dim)
+        subdir = cfg.paths.ae_subdir.format(latent_dim=cfg.encoder.latent_dim)
         checkpoint_dir = os.path.join(cfg.paths.checkpoint_dir, subdir)
         plot_dir = os.path.join(cfg.paths.plot_dir, subdir)
 
         if for_training:
             ema_encoder = deepcopy(encoder).to(device)
             ema_decoder = deepcopy(decoder).to(device)
-            all_params = (
-                list(encoder.parameters()) + 
-                list(decoder.parameters()) + 
-                list(latent_proj.parameters())
-            )
+            all_params = list(encoder.parameters()) + list(decoder.parameters())
             optim = torch.optim.AdamW(
                 all_params,
                 lr=cfg.training.lr,
@@ -343,11 +562,9 @@ class DiffAEContext:
         if verbose:
             n_enc = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
             n_dec = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
-            n_proj = sum(p.numel() for p in latent_proj.parameters() if p.requires_grad)
             print(f"Encoder parameters: {n_enc:,}")
             print(f"Decoder parameters: {n_dec:,}")
-            print(f"Latent projection parameters: {n_proj:,}")
-            print(f"Total trainable parameters: {n_enc + n_dec + n_proj:,}")
+            print(f"Total trainable parameters: {n_enc + n_dec:,}")
 
         return cls(
             cfg=cfg,
@@ -360,10 +577,8 @@ class DiffAEContext:
             n_time_points=n_time_points,
             n_nodes=n_nodes,
             data_stats=data_stats,
-            schedule=schedule,
             encoder=encoder,
             decoder=decoder,
-            latent_proj=latent_proj,
             checkpoint_dir=checkpoint_dir,
             plot_dir=plot_dir,
             ema_encoder=ema_encoder,
@@ -372,21 +587,20 @@ class DiffAEContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = sorted(glob.glob(os.path.join(self.checkpoint_dir, "diffae_epoch_*.pt")))
+        files = sorted(glob.glob(os.path.join(self.checkpoint_dir, "vae_epoch_*.pt")))
         return files[-1] if files else None
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
             "encoder": self.encoder.state_dict(),
             "decoder": self.decoder.state_dict(),
-            "latent_proj": self.latent_proj.state_dict(),
             "ema_encoder": self.ema_encoder.state_dict() if self.ema_encoder else self.encoder.state_dict(),
             "ema_decoder": self.ema_decoder.state_dict() if self.ema_decoder else self.decoder.state_dict(),
             "optim": self.optim.state_dict() if self.optim else None,
             "epoch": epoch,
             "data_stats": {"mean": self.data_stats.mean, "std": self.data_stats.std},
         }
-        path = os.path.join(self.checkpoint_dir, f"diffae_epoch_{epoch:04d}.pt")
+        path = os.path.join(self.checkpoint_dir, f"vae_epoch_{epoch:04d}.pt")
         torch.save(state, path)
         return path
 
@@ -394,7 +608,6 @@ class DiffAEContext:
         chk = torch.load(path, map_location=self.device)
         self.encoder.load_state_dict(chk["encoder"])
         self.decoder.load_state_dict(chk["decoder"])
-        self.latent_proj.load_state_dict(chk["latent_proj"])
         if self.ema_encoder is not None and "ema_encoder" in chk:
             self.ema_encoder.load_state_dict(chk["ema_encoder"])
         if self.ema_decoder is not None and "ema_decoder" in chk:
@@ -418,9 +631,9 @@ class DiffAEContext:
         
         all_ckpts = []
         for subdir in os.listdir(parent_dir):
-            if subdir.startswith("diffae_z"):
+            if subdir.startswith("ae_z"):
                 subdir_path = os.path.join(parent_dir, subdir)
-                ckpt_files = sorted(glob.glob(os.path.join(subdir_path, "diffae_epoch_*.pt")))
+                ckpt_files = sorted(glob.glob(os.path.join(subdir_path, "vae_epoch_*.pt")))
                 if ckpt_files:
                     all_ckpts.append(ckpt_files[-1])
         
@@ -440,9 +653,10 @@ class DiffAEContext:
         """
         chk = torch.load(path, map_location=self.device)
         
-        encoder_latent_keys = {'to_latent.weight', 'to_latent.bias', 
-                               'to_mu.weight', 'to_mu.bias', 
+        encoder_latent_keys = {'to_mu.weight', 'to_mu.bias', 
                                'to_logvar.weight', 'to_logvar.bias'}
+        
+        decoder_latent_keys = {'latent_proj.0.weight', 'latent_proj.0.bias'}
         
         def load_partial(model: nn.Module, state_dict: dict, skip_keys: set, name: str) -> List[str]:
             """Load state dict, skipping keys with mismatched sizes."""
@@ -466,18 +680,15 @@ class DiffAEContext:
                 print(f"  {name}: loaded {len(loaded_keys)}/{len(state_dict)} keys, skipped: {skipped_keys}")
             return skipped_keys
         
-        latent_proj_keys = {'0.weight', '0.bias'}
-        
         all_skipped = []
         
         all_skipped.extend(load_partial(self.encoder, chk["encoder"], encoder_latent_keys, "encoder"))
-        all_skipped.extend(load_partial(self.decoder, chk["decoder"], set(), "decoder"))
-        all_skipped.extend(load_partial(self.latent_proj, chk["latent_proj"], latent_proj_keys, "latent_proj"))
+        all_skipped.extend(load_partial(self.decoder, chk["decoder"], decoder_latent_keys, "decoder"))
         
         if self.ema_encoder is not None and "ema_encoder" in chk:
             load_partial(self.ema_encoder, chk["ema_encoder"], encoder_latent_keys, "ema_encoder")
         if self.ema_decoder is not None and "ema_decoder" in chk:
-            load_partial(self.ema_decoder, chk["ema_decoder"], set(), "ema_decoder")
+            load_partial(self.ema_decoder, chk["ema_decoder"], decoder_latent_keys, "ema_decoder")
         
         if "data_stats" in chk:
             self.data_stats.mean = chk["data_stats"]["mean"]
@@ -490,25 +701,13 @@ class DiffAEContext:
 
 @torch.no_grad()
 def save_encoded_dataset(
-    ctx: DiffAEContext,
+    ctx: VAEContext,
     output_path: str,
     encoder: Optional[nn.Module] = None,
     batch_size: int = 32,
     verbose: bool = True,
 ) -> str:
-    """
-    Encode all events in the dataset and save latent vectors to h5.
-    
-    Args:
-        ctx: DiffAE context with loader, graph, etc.
-        output_path: Path to save the encoded dataset h5 file.
-        encoder: Encoder to use (defaults to ctx.ema_encoder or ctx.encoder).
-        batch_size: Batch size for encoding.
-        verbose: Print progress information.
-        
-    Returns:
-        Path to the saved h5 file.
-    """
+    """Encode all events in the dataset and save latent vectors to h5."""
     if encoder is None:
         encoder = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
     encoder.eval()
@@ -537,7 +736,7 @@ def save_encoded_dataset(
         indices = np.arange(start_idx, end_idx, dtype=np.int64)
         
         with h5py.File(ctx.loader.h5_file_path, 'r') as f:
-            wf = f['waveforms'][indices]  # (B, C, T)
+            wf = f['waveforms'][indices]
             if has_xc:
                 xc = f['xc'][indices].astype(np.float32)
                 all_xc.append(xc)
@@ -554,10 +753,10 @@ def save_encoded_dataset(
         x = torch.from_numpy(wf_norm).to(ctx.device)
         x_flat = x.view(actual_batch_size * ctx.n_nodes, 1)
         
-        z, _, _ = encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=actual_batch_size)
+        z, _, _, _ = encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=actual_batch_size)
         all_latents.append(z.cpu().numpy())
     
-    latents = np.concatenate(all_latents, axis=0)  # (N, latent_dim)
+    latents = np.concatenate(all_latents, axis=0)
     
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
     
@@ -582,199 +781,69 @@ def save_encoded_dataset(
 
 
 @torch.no_grad()
-def sample_diffae(
+def reconstruct_vae(
     encoder: nn.Module,
     decoder: nn.Module,
-    latent_proj: nn.Module,
-    schedule: dict,
     A_sparse: torch.Tensor,
     pos: torch.Tensor,
-    time_dim: int,
     x_ref: torch.Tensor,
-    parametrization: str = 'v',
-    pbar: bool = False
 ) -> torch.Tensor:
     """
-    Sample from DiffAE by encoding reference events then decoding via diffusion.
+    Reconstruct events using VAE encoder-decoder.
     
     Args:
-        encoder: Graph encoder
-        decoder: Diffusion U-Net decoder
-        latent_proj: Latent to conditioning projection
-        schedule: Diffusion schedule
+        encoder: VAE encoder
+        decoder: VAE decoder
         A_sparse: Graph adjacency
         pos: Node positions
-        time_dim: Time embedding dimension
-        x_ref: Reference events to encode (B, N, 1)
-        parametrization: 'v' or 'eps'
-        pbar: Show progress bar
+        x_ref: Reference events to reconstruct (B, N, 1)
     
     Returns:
         Reconstructed samples (B, 1, N)
     """
     B, N, C = x_ref.shape
-    device = x_ref.device
     
     x_ref_flat = x_ref.view(B * N, C)
-    z, _, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
-    cond_proj = latent_proj(z)
-
-    x = torch.randn((B, N, C), device=device)
-    T = schedule['betas'].shape[0]
+    z, _, _, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
     
-    for i in tqdm(reversed(range(T)), desc="Sampling", disable=not pbar, total=T, ncols=150):
-        betas_t = schedule['betas'][i]
-        sqrt_one_minus_ab_t = schedule['sqrt_one_minus_alphas_cumprod'][i]
-        alpha_bar_t = schedule['alphas_cumprod'][i]
-        alpha_bar_prev_t = schedule['alphas_cumprod_prev'][i]
-        
-        t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
-        t_emb_batch = t_emb.expand(B, -1)
-        cond_full = torch.cat([cond_proj, t_emb_batch], dim=-1)
-        
-        x_flat = x.view(B * N, C)
-        pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
-        pred = pred_flat.view(B, N, C)
-
-        if parametrization == 'eps':
-            eps_theta = pred
-            x0_pred = (x - sqrt_one_minus_ab_t * eps_theta) / torch.clamp(torch.sqrt(alpha_bar_t), min=1e-8)
-        elif parametrization == 'v':
-            a = torch.clamp(torch.sqrt(alpha_bar_t), min=1e-8)
-            b_coef = torch.clamp(torch.sqrt(1.0 - alpha_bar_t), min=1e-8)
-            x0_pred = a * x - b_coef * pred
-        else:
-            raise ValueError("parametrization must be 'eps' or 'v'")
-
-        coef1 = betas_t * torch.sqrt(torch.clamp(alpha_bar_prev_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
-        coef2 = torch.clamp(1.0 - alpha_bar_prev_t, min=0.0) * torch.sqrt(torch.clamp(1.0 - betas_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
-        mean = coef1 * x0_pred + coef2 * x
-        
-        if i > 0:
-            posterior_var = schedule['posterior_variance'][i]
-            noise = torch.randn_like(x)
-            x = mean + torch.sqrt(posterior_var) * noise
-        else:
-            x = mean
+    rec_flat = decoder(z, A_sparse, pos, batch_size=B)
+    rec = rec_flat.view(B, N, C).permute(0, 2, 1)  # (B, C, N)
     
-    out = x.permute(0, 2, 1)  # (B, C, N)
-
-    kernel = torch.tensor([0.25, 0.5, 0.25], device=device, dtype=torch.float32).view(1, 1, 3)
-    B, C, N = out.shape
-    out = F.conv1d(
-        out.reshape(B * C, 1, N), weight=kernel, padding=1, stride=1, groups=1
-    ).reshape(B, C, N)
-
-    return out
+    return rec
 
 
 @torch.no_grad()
 def sample_from_latent(
     decoder: nn.Module,
-    latent_proj: nn.Module,
-    schedule: dict,
     A_sparse: torch.Tensor,
     pos: torch.Tensor,
-    time_dim: int,
     z: torch.Tensor,
     n_nodes: int,
-    parametrization: str = 'v',
-    pbar: bool = False
 ) -> torch.Tensor:
-    """
-    Sample from a given latent representation (for interpolation, etc.).
-    """
+    """Sample from a given latent representation."""
     B = z.shape[0]
-    device = z.device
-    C = 1
     
-    cond_proj = latent_proj(z)
-
-    x = torch.randn((B, n_nodes, C), device=device)
-    T = schedule['betas'].shape[0]
+    rec_flat = decoder(z, A_sparse, pos, batch_size=B)
+    rec = rec_flat.view(B, n_nodes, 1).permute(0, 2, 1)  # (B, 1, N)
     
-    for i in tqdm(reversed(range(T)), desc="Sampling", disable=not pbar, total=T, ncols=150):
-        betas_t = schedule['betas'][i]
-        sqrt_one_minus_ab_t = schedule['sqrt_one_minus_alphas_cumprod'][i]
-        alpha_bar_t = schedule['alphas_cumprod'][i]
-        alpha_bar_prev_t = schedule['alphas_cumprod_prev'][i]
-        
-        t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
-        t_emb_batch = t_emb.expand(B, -1)
-        cond_full = torch.cat([cond_proj, t_emb_batch], dim=-1)
-        
-        x_flat = x.view(B * n_nodes, C)
-        pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
-        pred = pred_flat.view(B, n_nodes, C)
-
-        if parametrization == 'eps':
-            eps_theta = pred
-            x0_pred = (x - sqrt_one_minus_ab_t * eps_theta) / torch.clamp(torch.sqrt(alpha_bar_t), min=1e-8)
-        elif parametrization == 'v':
-            a = torch.clamp(torch.sqrt(alpha_bar_t), min=1e-8)
-            b_coef = torch.clamp(torch.sqrt(1.0 - alpha_bar_t), min=1e-8)
-            x0_pred = a * x - b_coef * pred
-        else:
-            raise ValueError("parametrization must be 'eps' or 'v'")
-
-        coef1 = betas_t * torch.sqrt(torch.clamp(alpha_bar_prev_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
-        coef2 = torch.clamp(1.0 - alpha_bar_prev_t, min=0.0) * torch.sqrt(torch.clamp(1.0 - betas_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
-        mean = coef1 * x0_pred + coef2 * x
-        
-        if i > 0:
-            posterior_var = schedule['posterior_variance'][i]
-            noise = torch.randn_like(x)
-            x = mean + torch.sqrt(posterior_var) * noise
-        else:
-            x = mean
-    
-    out = x.permute(0, 2, 1)
-    return out
+    return rec
 
 
-def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: bool = False):
-    """Visualize event with z axis as time."""
-    x = G.positions_xyz[:, 0].cpu().numpy()
-    y = G.positions_xyz[:, 1].cpu().numpy()
-    z_pos = G.positions_xyz[:, 2].cpu().numpy()
-
-    if ax is None:
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection="3d")
-
-    s = np.clip(event * 20.0, 0.1, 100)
-    mask = event >= 0.5
-    
-    if mask.sum() > 0:
-        scatter = ax.scatter(
-            x[mask], y[mask], z_pos[mask], 
-            c=event[mask], s=s[mask], 
-            cmap='viridis', alpha=0.5
-        )
-        if colorbar:
-            plt.colorbar(scatter, ax=ax, shrink=0.5, aspect=10)
-    
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('t')
-    ax.set_box_aspect([1, 1, 3])
-    return ax
-
-
-def train_diffae(cfg: Config = default_config):
-    """Main DiffAE training function."""
+def train_vae(cfg: Config = default_config):
+    """Main VAE training function."""
+    print("=" * 50)
+    print("Graph VAE Training")
+    print("=" * 50)
     print_config(cfg, include_encoder=True)
     
-    ctx = DiffAEContext.build(cfg, for_training=True, verbose=True)
+    ctx = VAEContext.build(cfg, for_training=True, verbose=True)
     
     device_t = ctx.device
     encoder = ctx.encoder
     decoder = ctx.decoder
-    latent_proj = ctx.latent_proj
     ema_encoder = ctx.ema_encoder
     ema_decoder = ctx.ema_decoder
     optim = ctx.optim
-    schedule = ctx.schedule
     data_stats = ctx.data_stats
     A_sparse = ctx.A_sparse
     pos = ctx.pos
@@ -815,13 +884,14 @@ def train_diffae(cfg: Config = default_config):
     B = cfg.training.batch_size
     
     global_step = start_epoch * cfg.training.steps_per_epoch
-    encoded_output_path = os.path.join(ctx.checkpoint_dir, "encoded_latents.h5")
+    encoded_output_path = os.path.join(ctx.checkpoint_dir, "vae_encoded_latents.h5")
+    kl_weight = cfg.encoder.kl_weight
 
     for epoch in range(start_epoch, cfg.training.epochs):
         encoder.train()
         decoder.train()
-        latent_proj.train()
         epoch_loss = 0.0
+        epoch_rec = 0.0
         epoch_kl = 0.0
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
@@ -832,43 +902,21 @@ def train_diffae(cfg: Config = default_config):
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
             x0_flat = x0.view(B * n_nodes, 1)
             
-            z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B)
-            cond_base = latent_proj(z)  # (B, cond_proj_dim)
+            # Encode
+            z, mu, logvar, _ = encoder(x0_flat, A_sparse, pos, batch_size=B)
             
-            t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=device_t, dtype=torch.long)
-            t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-            cond_full = torch.cat([cond_base, t_emb], dim=-1)
-
-            sqrt_ab = schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
-            sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
-            snr_t = schedule['snr'][t].view(B)
-
-            noise = torch.randn_like(x0)
-            x_t = sqrt_ab * x0 + sqrt_om * noise
-            x_t_flat = x_t.view(B * n_nodes, 1)
-
-            pred_flat = decoder(x_t_flat, A_sparse, cond_full, pos, batch_size=B)
-            pred = pred_flat.view(B, n_nodes, 1)
-
-            if cfg.diffusion.parametrization == "eps":
-                target = noise
-            elif cfg.diffusion.parametrization == "v":
-                target = sqrt_ab * noise - sqrt_om * x0
-            else:
-                raise ValueError("parametrization must be 'eps' or 'v'")
-
-            mse_per_sample = F.mse_loss(pred, target, reduction='none').mean(dim=(1, 2))
+            # Decode
+            rec_flat = decoder(z, A_sparse, pos, batch_size=B)
+            rec = rec_flat.view(B, n_nodes, 1)
             
-            if cfg.diffusion.p2_gamma > 0.0:
-                weight = torch.pow(cfg.diffusion.p2_k + snr_t, -cfg.diffusion.p2_gamma)
-                mse_per_sample = mse_per_sample * weight
-
-            loss = mse_per_sample.mean()
+            # Reconstruction loss
+            rec_loss = F.mse_loss(rec, x0, reduction='mean')
             
-            if cfg.encoder.use_stochastic and mu is not None and logvar is not None:
-                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = loss + cfg.encoder.kl_weight * kl_loss
-                epoch_kl += kl_loss.item()
+            # KL divergence
+            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            
+            # Total loss (ELBO)
+            loss = rec_loss + kl_weight * kl_loss
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"  WARNING: NaN/Inf loss at step {step}! Skipping...")
@@ -876,12 +924,14 @@ def train_diffae(cfg: Config = default_config):
                 continue
             
             epoch_loss += float(loss.item())
+            epoch_rec += float(rec_loss.item())
+            epoch_kl += float(kl_loss.item())
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(decoder.parameters()) + list(latent_proj.parameters()),
+                list(encoder.parameters()) + list(decoder.parameters()),
                 max_norm=cfg.training.grad_clip
             )
             optim.step()
@@ -899,10 +949,7 @@ def train_diffae(cfg: Config = default_config):
                 save_encoded_dataset(ctx, encoded_output_path, encoder=ema_encoder, batch_size=B * 4)
                 encoder.train()
 
-            if cfg.encoder.use_stochastic:
-                pbar.set_postfix(loss=epoch_loss / (step + 1), kl=epoch_kl / (step + 1))
-            else:
-                pbar.set_postfix(loss=epoch_loss / (step + 1))
+            pbar.set_postfix(loss=epoch_loss / (step + 1), rec=epoch_rec / (step + 1), kl=epoch_kl / (step + 1))
 
         if (epoch + 1) % cfg.training.checkpoint_every == 0:
             ctx.save_checkpoint(epoch)
@@ -916,16 +963,12 @@ def train_diffae(cfg: Config = default_config):
                 batch_np_norm = data_stats.normalize(batch_np)
                 x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(device_t)
                 
-                samples = sample_diffae(
+                samples = reconstruct_vae(
                     encoder=ema_encoder,
                     decoder=ema_decoder,
-                    latent_proj=latent_proj,
-                    schedule=schedule,
                     A_sparse=A_sparse,
                     pos=pos,
-                    time_dim=cfg.conditioning.time_dim,
                     x_ref=x_ref,
-                    parametrization=cfg.diffusion.parametrization,
                 )
                 samples_denorm = data_stats.denormalize(samples.cpu().numpy())
                 samples_denorm = np.clip(samples_denorm, 0, None)
@@ -955,7 +998,7 @@ def train_diffae(cfg: Config = default_config):
                 visualize_event(Gxy, true_xy, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event(Gxy, rec_xy, None, ax=axes[1])
-                axes[1].set_title("DiffAE reconstruction")
+                axes[1].set_title("VAE reconstruction")
                 plt.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_xy.png")
                 plt.close(fig)
@@ -964,7 +1007,7 @@ def train_diffae(cfg: Config = default_config):
                 visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), true_z, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), rec_z, None, ax=axes[1])
-                axes[1].set_title("DiffAE reconstruction")
+                axes[1].set_title("VAE reconstruction")
                 plt.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_z.png")
                 plt.close(fig)
@@ -972,7 +1015,7 @@ def train_diffae(cfg: Config = default_config):
 
 def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
     """Generate interpolations between two events in latent space."""
-    ctx = DiffAEContext.build(cfg, for_training=False, verbose=True)
+    ctx = VAEContext.build(cfg, for_training=False, verbose=True)
     
     latest_ckpt = ctx.latest_checkpoint()
     if latest_ckpt is None:
@@ -989,7 +1032,7 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
         x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(ctx.device)
         
         x_ref_flat = x_ref.view(2 * ctx.n_nodes, 1)
-        z, _, _ = ctx.encoder(x_ref_flat, ctx.A_sparse, ctx.pos, batch_size=2)
+        z, _, _, _ = ctx.encoder(x_ref_flat, ctx.A_sparse, ctx.pos, batch_size=2)
         z1, z2 = z[0], z[1]
 
         alphas = torch.linspace(0, 1, n_steps, device=ctx.device)
@@ -997,15 +1040,10 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
 
         samples = sample_from_latent(
             decoder=ctx.decoder,
-            latent_proj=ctx.latent_proj,
-            schedule=ctx.schedule,
             A_sparse=ctx.A_sparse,
             pos=ctx.pos,
-            time_dim=cfg.conditioning.time_dim,
             z=z_interp,
             n_nodes=ctx.n_nodes,
-            parametrization=cfg.diffusion.parametrization,
-            pbar=True,
         )
         
         samples_denorm = ctx.data_stats.denormalize(samples.cpu().numpy())
@@ -1043,4 +1081,4 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
 
 
 if __name__ == "__main__":
-    train_diffae(default_config)
+    train_vae(default_config)
