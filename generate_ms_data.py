@@ -94,6 +94,7 @@ def generate_ms_dataset(
     n_ms_events: int,
     delta_range: Tuple[int, int] = (-20, 20),
     seed: Optional[int] = None,
+    single_node: bool = False,
 ) -> dict:
     """
     Generate a dataset of multi-scatter events.
@@ -104,6 +105,7 @@ def generate_ms_dataset(
         n_ms_events: Number of MS events to generate
         delta_range: Range of time shifts in bins (min, max)
         seed: Random seed
+        single_node: If True, sum over channels so output shape is (n_events, 1, T)
     
     Returns:
         Dictionary with MS data arrays
@@ -114,7 +116,8 @@ def generate_ms_dataset(
     n_ss = len(ss_waveforms)
     n_channels, n_time = ss_waveforms.shape[1], ss_waveforms.shape[2]
     
-    ms_waveforms = np.zeros((n_ms_events, n_channels, n_time), dtype=ss_waveforms.dtype)
+    out_channels = 1 if single_node else n_channels
+    ms_waveforms = np.zeros((n_ms_events, out_channels, n_time), dtype=ss_waveforms.dtype)
     ms_delta_mu = np.zeros(n_ms_events, dtype=np.float32)
     ms_delta_bins = np.zeros(n_ms_events, dtype=np.int32)
     
@@ -141,6 +144,9 @@ def generate_ms_dataset(
         ms_wf, delta_mu_ns = generate_ms_event(
             wf1, wf2, ss_dt[idx1], ss_dt[idx2], delta_bins
         )
+        
+        if single_node:
+            ms_wf = ms_wf.sum(axis=0, keepdims=True).astype(ms_waveforms.dtype)
         
         ms_waveforms[i] = ms_wf
         ms_delta_mu[i] = delta_mu_ns
@@ -169,7 +175,7 @@ def generate_ms_dataset(
     }
 
 
-def save_ms_dataset(data: dict, output_path: str):
+def save_ms_dataset(data: dict, output_path: str, single_node: bool = False):
     """Save MS dataset to h5 file."""
     with h5py.File(output_path, 'w') as f:
         for key, value in data.items():
@@ -177,9 +183,12 @@ def save_ms_dataset(data: dict, output_path: str):
         
         f.attrs['ns_per_bin'] = NS_PER_BIN
         f.attrs['description'] = 'Multi-scatter events generated from single-scatter data'
+        if single_node:
+            f.attrs['single_node'] = True
     
     print(f"Saved MS dataset to {output_path}")
     print(f"  Events: {len(data['waveforms'])}")
+    print(f"  Waveform shape: {data['waveforms'].shape}")
     print(f"  Delta mu range: [{data['delta_mu'].min():.1f}, {data['delta_mu'].max():.1f}] ns")
 
 
@@ -197,6 +206,8 @@ def main():
                         help='Maximum time shift in bins')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--single-node', action='store_true',
+                        help='Sum over channels so each event has shape (1, T); one node per time bin')
     args = parser.parse_args()
     
     print(f"Loading SS data from {args.input}...")
@@ -205,6 +216,8 @@ def main():
     print(f"  Waveform shape: {ss_waveforms.shape}")
     
     print(f"\nGenerating {args.n_events} MS events...")
+    if args.single_node:
+        print("  Mode: single-node (sum over channels -> shape (1, T) per event)")
     print(f"  Delta range: [{args.delta_min}, {args.delta_max}] bins")
     print(f"  Delta range: [{args.delta_min * NS_PER_BIN:.0f}, {args.delta_max * NS_PER_BIN:.0f}] ns")
     
@@ -213,10 +226,11 @@ def main():
         n_ms_events=args.n_events,
         delta_range=(args.delta_min, args.delta_max),
         seed=args.seed,
+        single_node=args.single_node,
     )
     
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-    save_ms_dataset(ms_data, args.output)
+    save_ms_dataset(ms_data, args.output, single_node=args.single_node)
 
 
 if __name__ == '__main__':
