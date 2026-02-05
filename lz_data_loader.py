@@ -620,3 +620,109 @@ class TritiumSSDataLoader:
     def batcher(self, batch_size: int):
         while True:
             yield self.get_batch(batch_size)
+
+
+def shift_waveform_2d(waveform: np.ndarray, shift_bins: int) -> np.ndarray:
+    """Shift waveform along time axis with zero-padding.
+    
+    Args:
+        waveform: Array of shape (C, T)
+        shift_bins: Number of bins to shift (positive = shift right/later)
+    """
+    C, T = waveform.shape
+    shifted = np.zeros_like(waveform)
+    if shift_bins == 0:
+        return waveform.copy()
+    elif shift_bins > 0:
+        if shift_bins < T:
+            shifted[:, shift_bins:] = waveform[:, :T - shift_bins]
+    else:
+        abs_shift = abs(shift_bins)
+        if abs_shift < T:
+            shifted[:, :T - abs_shift] = waveform[:, abs_shift:]
+    return shifted
+
+
+class OnlineMSBatcher:
+    """Generates multi-scatter batches online by co-adding pairs of single-scatter events.
+    
+    This wraps TritiumSSDataLoader and provides batches of MS events where each
+    event is the sum of two SS events with a random time shift.
+    """
+    def __init__(
+        self,
+        h5_file_path: str,
+        channel_positions_path: str,
+        delta_min: int = -30,
+        delta_max: int = 30,
+        ns_per_bin: float = 10.0,
+        seed: Optional[int] = None,
+    ):
+        self.ss_loader = TritiumSSDataLoader(h5_file_path, channel_positions_path)
+        self.delta_min = delta_min
+        self.delta_max = delta_max
+        self.ns_per_bin = ns_per_bin
+        self._rng = np.random.default_rng(seed)
+        
+        self.h5_file_path = h5_file_path
+        self.channel_positions_path = channel_positions_path
+        self.n_samples = self.ss_loader.n_samples
+        self.n_channels = self.ss_loader.n_channels
+        self.n_time_points = self.ss_loader.n_time_points
+        self.channel_positions = self.ss_loader.channel_positions
+
+    def load_adjacency_sparse(self, z_sep: float = 10.0, radius: float = 20.0, weighted: bool = False, z_hops: int = 4):
+        return self.ss_loader.load_adjacency_sparse(z_sep=z_sep, radius=radius, weighted=weighted, z_hops=z_hops)
+
+    def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Get a batch of MS events generated on-the-fly.
+        
+        Returns:
+            wf_col: (B, N, 1) waveforms in layer-major order
+            cond: (B, 6) conditions [xc1, yc1, xc2, yc2, delta_mu, delta_bins]
+        """
+        idx1 = self._rng.integers(0, self.n_samples, size=batch_size)
+        idx2 = self._rng.integers(0, self.n_samples, size=batch_size)
+        mask = idx1 == idx2
+        while mask.any():
+            idx2[mask] = self._rng.integers(0, self.n_samples, size=mask.sum())
+            mask = idx1 == idx2
+        
+        delta_bins = self._rng.integers(self.delta_min, self.delta_max + 1, size=batch_size)
+        
+        all_indices = np.unique(np.concatenate([idx1, idx2]))
+        
+        with h5py.File(self.h5_file_path, 'r') as f:
+            wf_all = f['waveforms'][all_indices]
+            xc_all = f['xc'][all_indices].astype(np.float32)
+            yc_all = f['yc'][all_indices].astype(np.float32)
+        
+        idx_map = {idx: i for i, idx in enumerate(all_indices)}
+        
+        ms_waveforms = np.zeros((batch_size, self.n_channels, self.n_time_points), dtype=np.float32)
+        xc1 = np.zeros(batch_size, dtype=np.float32)
+        yc1 = np.zeros(batch_size, dtype=np.float32)
+        xc2 = np.zeros(batch_size, dtype=np.float32)
+        yc2 = np.zeros(batch_size, dtype=np.float32)
+        
+        for b in range(batch_size):
+            i1, i2 = idx_map[idx1[b]], idx_map[idx2[b]]
+            wf1 = wf_all[i1]
+            wf2 = wf_all[i2]
+            wf2_shifted = shift_waveform_2d(wf2, int(delta_bins[b]))
+            ms_waveforms[b] = wf1 + wf2_shifted
+            xc1[b] = xc_all[i1]
+            yc1[b] = yc_all[i1]
+            xc2[b] = xc_all[i2]
+            yc2[b] = yc_all[i2]
+        
+        wf_col = np.transpose(ms_waveforms, (0, 2, 1)).reshape(batch_size, -1, 1).astype(np.float32)
+        
+        delta_mu = delta_bins.astype(np.float32) * self.ns_per_bin
+        cond = np.stack([xc1, yc1, xc2, yc2, delta_mu, delta_bins.astype(np.float32)], axis=1)
+        
+        return wf_col, cond
+
+    def batcher(self, batch_size: int):
+        while True:
+            yield self.get_batch(batch_size)

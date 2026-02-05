@@ -212,16 +212,7 @@ def sample_core(
         else:
             x = mean
     
-    out = x.permute(0, 2, 1)  # (B, C, N)
-
-    # Perform 1d Gaussian convolution over time axis
-    kernel = torch.tensor([0.25, 0.5, 0.25], device=device, dtype=torch.float32).view(1, 1, 3)
-    B, C, N = out.shape
-    out = F.conv1d(
-        out.reshape(B * C, 1, N), weight=kernel, padding=1, stride=1, groups=1
-    ).reshape(B, C, N)
-
-    return out
+    return x.permute(0, 2, 1) # (B, C, N)
 
 
 class DataStats:

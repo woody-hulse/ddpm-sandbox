@@ -21,7 +21,7 @@ from matplotlib import pyplot as plt
 from tqdm import tqdm
 
 from data import Graph, visualize_event, visualize_event_z, SparseGraph
-from lz_data_loader import TritiumSSDataLoader
+from lz_data_loader import TritiumSSDataLoader, OnlineMSBatcher
 from config import Config, default_config, print_config
 
 from models.graph_unet import (
@@ -236,12 +236,17 @@ class DiffAEDataStats:
         return x * self.std + self.mean
 
 
+from typing import Union
+
+DataLoaderType = Union[TritiumSSDataLoader, OnlineMSBatcher]
+
+
 @dataclass
 class DiffAEContext:
     """Holds all model components for DiffAE training/inference."""
     cfg: Config
     device: torch.device
-    loader: TritiumSSDataLoader
+    loader: DataLoaderType
     graph: SparseGraph
     A_sparse: torch.Tensor
     pos: torch.Tensor
@@ -258,14 +263,28 @@ class DiffAEContext:
     ema_encoder: Optional[nn.Module] = None
     ema_decoder: Optional[nn.Module] = None
     optim: Optional[torch.optim.Optimizer] = None
+    use_ms_data: bool = False
 
     @classmethod
-    def build(cls, cfg: Config, for_training: bool = True, verbose: bool = True) -> 'DiffAEContext':
+    def build(cls, cfg: Config, for_training: bool = True, verbose: bool = True, use_ms_data: bool = True) -> 'DiffAEContext':
         device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         if verbose:
             print(f"Using device: {device}")
 
-        loader = TritiumSSDataLoader(cfg.paths.tritium_h5, cfg.paths.channel_positions)
+        if use_ms_data:
+            loader = OnlineMSBatcher(
+                cfg.paths.tritium_h5,
+                cfg.paths.channel_positions,
+                delta_min=cfg.ms_data.delta_min,
+                delta_max=cfg.ms_data.delta_max,
+                ns_per_bin=cfg.ms_data.ns_per_bin,
+                seed=cfg.ms_data.seed,
+            )
+            if verbose:
+                print(f"Using online MS data: delta=[{cfg.ms_data.delta_min}, {cfg.ms_data.delta_max}] bins")
+        else:
+            loader = TritiumSSDataLoader(cfg.paths.tritium_h5, cfg.paths.channel_positions)
+        
         graph = loader.load_adjacency_sparse(
             z_sep=cfg.graph.z_sep,
             radius=cfg.graph.radius,
@@ -369,6 +388,7 @@ class DiffAEContext:
             ema_encoder=ema_encoder,
             ema_decoder=ema_decoder,
             optim=optim,
+            use_ms_data=use_ms_data,
         )
 
     def latest_checkpoint(self) -> Optional[str]:
@@ -494,16 +514,22 @@ def save_encoded_dataset(
     output_path: str,
     encoder: Optional[nn.Module] = None,
     batch_size: int = 32,
+    n_samples: int = 10000,
     verbose: bool = True,
 ) -> str:
     """
-    Encode all events in the dataset and save latent vectors to h5.
+    Encode MS events and save latent vectors with delta_mu to h5.
+    
+    This is designed for the aux task: it encodes MS events and saves the
+    latents along with delta_mu targets so that aux training only needs to
+    load pre-computed embeddings (no encoder calls during MLP training).
     
     Args:
         ctx: DiffAE context with loader, graph, etc.
         output_path: Path to save the encoded dataset h5 file.
         encoder: Encoder to use (defaults to ctx.ema_encoder or ctx.encoder).
         batch_size: Batch size for encoding.
+        n_samples: Number of MS samples to encode (only for OnlineMSBatcher).
         verbose: Print progress information.
         
     Returns:
@@ -513,70 +539,75 @@ def save_encoded_dataset(
         encoder = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
     encoder.eval()
     
-    n_samples = ctx.loader.n_samples
     latent_dim = ctx.cfg.encoder.latent_dim
     
     all_latents = []
-    all_xc = []
-    all_yc = []
-    all_dt = []
-    
-    with h5py.File(ctx.loader.h5_file_path, 'r') as f:
-        has_xc = 'xc' in f
-        has_yc = 'yc' in f
-        has_dt = 'dt' in f
+    all_delta_mu = []
+    all_delta_bins = []
+    all_xc1 = []
+    all_yc1 = []
+    all_xc2 = []
+    all_yc2 = []
     
     n_batches = (n_samples + batch_size - 1) // batch_size
-    pbar = tqdm(range(n_batches), desc="Encoding dataset", disable=not verbose, ncols=120)
+    pbar = tqdm(range(n_batches), desc="Encoding MS dataset", disable=not verbose, ncols=120)
     
+    samples_encoded = 0
     for batch_idx in pbar:
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, n_samples)
-        actual_batch_size = end_idx - start_idx
+        remaining = n_samples - samples_encoded
+        actual_batch_size = min(batch_size, remaining)
+        if actual_batch_size <= 0:
+            break
         
-        indices = np.arange(start_idx, end_idx, dtype=np.int64)
+        wf_col, cond = ctx.loader.get_batch(actual_batch_size)
         
-        with h5py.File(ctx.loader.h5_file_path, 'r') as f:
-            wf = f['waveforms'][indices]  # (B, C, T)
-            if has_xc:
-                xc = f['xc'][indices].astype(np.float32)
-                all_xc.append(xc)
-            if has_yc:
-                yc = f['yc'][indices].astype(np.float32)
-                all_yc.append(yc)
-            if has_dt:
-                dt = f['dt'][indices].astype(np.float32)
-                all_dt.append(dt)
+        if ctx.use_ms_data:
+            xc1 = cond[:, 0]
+            yc1 = cond[:, 1]
+            xc2 = cond[:, 2]
+            yc2 = cond[:, 3]
+            delta_mu = cond[:, 4]
+            delta_bins = cond[:, 5]
+            all_xc1.append(xc1)
+            all_yc1.append(yc1)
+            all_xc2.append(xc2)
+            all_yc2.append(yc2)
+            all_delta_mu.append(delta_mu)
+            all_delta_bins.append(delta_bins)
         
-        wf_col = np.transpose(wf, (0, 2, 1)).reshape(actual_batch_size, -1, 1).astype(np.float32)
         wf_norm = ctx.data_stats.normalize(wf_col)
-        
         x = torch.from_numpy(wf_norm).to(ctx.device)
         x_flat = x.view(actual_batch_size * ctx.n_nodes, 1)
         
         z, _, _ = encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=actual_batch_size)
         all_latents.append(z.cpu().numpy())
+        samples_encoded += actual_batch_size
     
-    latents = np.concatenate(all_latents, axis=0)  # (N, latent_dim)
+    latents = np.concatenate(all_latents, axis=0)
     
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
     
     with h5py.File(output_path, 'w') as f:
         f.create_dataset('latents', data=latents, dtype=np.float32)
-        if all_xc:
-            f.create_dataset('xc', data=np.concatenate(all_xc), dtype=np.float32)
-        if all_yc:
-            f.create_dataset('yc', data=np.concatenate(all_yc), dtype=np.float32)
-        if all_dt:
-            f.create_dataset('dt', data=np.concatenate(all_dt), dtype=np.float32)
+        
+        if all_delta_mu:
+            f.create_dataset('delta_mu', data=np.concatenate(all_delta_mu), dtype=np.float32)
+            f.create_dataset('delta_bins', data=np.concatenate(all_delta_bins), dtype=np.float32)
+            f.create_dataset('xc1', data=np.concatenate(all_xc1), dtype=np.float32)
+            f.create_dataset('yc1', data=np.concatenate(all_yc1), dtype=np.float32)
+            f.create_dataset('xc2', data=np.concatenate(all_xc2), dtype=np.float32)
+            f.create_dataset('yc2', data=np.concatenate(all_yc2), dtype=np.float32)
         
         f.attrs['latent_dim'] = latent_dim
-        f.attrs['n_samples'] = n_samples
+        f.attrs['n_samples'] = samples_encoded
         f.attrs['data_mean'] = ctx.data_stats.mean
         f.attrs['data_std'] = ctx.data_stats.std
+        f.attrs['is_ms_data'] = ctx.use_ms_data
     
     if verbose:
-        print(f"Saved encoded dataset to {output_path}: {n_samples} samples, latent_dim={latent_dim}")
+        print(f"Saved encoded MS dataset to {output_path}: {samples_encoded} samples, latent_dim={latent_dim}")
+    
+    return output_path
     
     return output_path
 
@@ -815,7 +846,7 @@ def train_diffae(cfg: Config = default_config):
     B = cfg.training.batch_size
     
     global_step = start_epoch * cfg.training.steps_per_epoch
-    encoded_output_path = os.path.join(ctx.checkpoint_dir, "encoded_latents.h5")
+    encoded_output_path = os.path.join(ctx.checkpoint_dir, "encoded_ms_latents.h5")
 
     for epoch in range(start_epoch, cfg.training.epochs):
         encoder.train()
@@ -893,11 +924,6 @@ def train_diffae(cfg: Config = default_config):
                     p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
 
             global_step += 1
-            
-            if cfg.training.encode_dataset_every > 0 and global_step % cfg.training.encode_dataset_every == 0:
-                ema_encoder.eval()
-                save_encoded_dataset(ctx, encoded_output_path, encoder=ema_encoder, batch_size=B * 4)
-                encoder.train()
 
             if cfg.encoder.use_stochastic:
                 pbar.set_postfix(loss=epoch_loss / (step + 1), kl=epoch_kl / (step + 1))
@@ -906,6 +932,11 @@ def train_diffae(cfg: Config = default_config):
 
         if (epoch + 1) % cfg.training.checkpoint_every == 0:
             ctx.save_checkpoint(epoch)
+
+        if cfg.training.encode_dataset_every > 0 and (epoch + 1) % cfg.training.encode_dataset_every == 0:
+            ema_encoder.eval()
+            save_encoded_dataset(ctx, encoded_output_path, encoder=ema_encoder, batch_size=B * 4, n_samples=cfg.training.encode_n_samples)
+            encoder.train()
 
         if cfg.visualize and (epoch % cfg.training.visualize_every == 0 or epoch == cfg.training.epochs - 1):
             ema_encoder.eval()
