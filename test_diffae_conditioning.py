@@ -1,7 +1,13 @@
 """
 Sanity checks for DiffAE conditioning.
 Tests whether the latent representation is actually affecting the output.
+
+Usage:
+    python test_diffae_conditioning.py [latent_dim]
+    
+    e.g., python test_diffae_conditioning.py 32
 """
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +16,19 @@ from dataclasses import dataclass
 
 from diffae import DiffAEContext, GraphEncoder
 from diffusion.schedule import sinusoidal_embedding
-from config import default_config
+from config import default_config, get_config
+
+_LATENT_DIM = [8]  # Use list to allow modification in nested scope
+
+
+def get_test_config():
+    """Get config with potentially overridden latent_dim."""
+    return get_config(latent_dim=_LATENT_DIM[0])
+
+
+def set_latent_dim(dim: int):
+    """Set the latent dimension for tests."""
+    _LATENT_DIM[0] = dim
 
 
 def test_encoder_sensitivity():
@@ -19,7 +37,7 @@ def test_encoder_sensitivity():
     print("TEST 1: Encoder sensitivity to input")
     print("=" * 60)
     
-    cfg = default_config
+    cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
     
     latest_ckpt = ctx.latest_checkpoint()
@@ -82,7 +100,7 @@ def test_decoder_conditioning_sensitivity():
     print("TEST 2: Decoder sensitivity to conditioning")
     print("=" * 60)
     
-    cfg = default_config
+    cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
     
     latest_ckpt = ctx.latest_checkpoint()
@@ -141,7 +159,7 @@ def test_gradient_flow():
     print("TEST 3: Gradient flow through encoder")
     print("=" * 60)
     
-    cfg = default_config
+    cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=True, verbose=False)
     
     ctx.encoder.train()
@@ -217,7 +235,7 @@ def test_latent_proj_output():
     print("TEST 4: Latent projection analysis")
     print("=" * 60)
     
-    cfg = default_config
+    cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
     
     latest_ckpt = ctx.latest_checkpoint()
@@ -268,7 +286,7 @@ def test_reconstruction_correlation():
     
     from diffae import sample_diffae
     
-    cfg = default_config
+    cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
     
     latest_ckpt = ctx.latest_checkpoint()
@@ -326,7 +344,7 @@ def test_conditioning_ablation():
     print("TEST 6: Conditioning ablation (real vs random latent)")
     print("=" * 60)
     
-    cfg = default_config
+    cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
     
     latest_ckpt = ctx.latest_checkpoint()
@@ -389,6 +407,139 @@ def test_conditioning_ablation():
             print(f"\n[OK] Real latent improves reconstruction by {improvement:.1f}%")
 
 
+def test_film_modulation():
+    """Test 7: Check FiLM modulation values."""
+    print("\n" + "=" * 60)
+    print("TEST 7: FiLM modulation analysis")
+    print("=" * 60)
+    
+    cfg = get_test_config()
+    ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
+    
+    latest_ckpt = ctx.latest_checkpoint()
+    if latest_ckpt:
+        ctx.load_checkpoint(latest_ckpt, load_optim=False)
+    
+    ctx.decoder.eval()
+    ctx.latent_proj.eval()
+    
+    with torch.no_grad():
+        B = 4
+        
+        z_random = torch.randn(B, cfg.encoder.latent_dim, device=ctx.device)
+        t = torch.full((B,), 50, device=ctx.device, dtype=torch.long)
+        t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
+        cond = torch.cat([ctx.latent_proj(z_random), t_emb], dim=-1)
+        
+        gammas, betas = ctx.decoder.film(cond, batch_size=B)
+        
+        print(f"\nFiLM modulation statistics:")
+        print(f"  Gammas shape: {gammas.shape}")
+        print(f"  Gammas mean: {gammas.mean().item():.4f} (should be ~1.0)")
+        print(f"  Gammas std: {gammas.std().item():.4f} (should be > 0 if learning)")
+        print(f"  Gammas range: [{gammas.min().item():.4f}, {gammas.max().item():.4f}]")
+        
+        print(f"\n  Betas shape: {betas.shape}")
+        print(f"  Betas mean: {betas.mean().item():.4f} (should be ~0.0)")
+        print(f"  Betas std: {betas.std().item():.4f} (should be > 0 if learning)")
+        print(f"  Betas range: [{betas.min().item():.4f}, {betas.max().item():.4f}]")
+        
+        gammas_vary_with_batch = gammas.std(dim=0).mean().item()
+        betas_vary_with_batch = betas.std(dim=0).mean().item()
+        print(f"\n  Gammas variation across batch: {gammas_vary_with_batch:.6f}")
+        print(f"  Betas variation across batch: {betas_vary_with_batch:.6f}")
+        
+        if gammas_vary_with_batch < 1e-4 and betas_vary_with_batch < 1e-4:
+            print("\n*** WARNING: FiLM values are nearly constant across different conditioning! ***")
+            print("*** The FiLM network isn't using the conditioning effectively! ***")
+        
+        cond_mlp_out = ctx.decoder.cond_mlp(cond)
+        print(f"\nDecoder cond_mlp output:")
+        print(f"  Shape: {cond_mlp_out.shape}")
+        print(f"  Mean: {cond_mlp_out.mean().item():.4f}")
+        print(f"  Std: {cond_mlp_out.std().item():.4f}")
+        print(f"  Variation across batch: {cond_mlp_out.std(dim=0).mean().item():.6f}")
+
+
+def test_ema_consistency():
+    """Test 8: Check if there's an EMA mismatch with latent_proj."""
+    print("\n" + "=" * 60)
+    print("TEST 8: EMA consistency check")
+    print("=" * 60)
+    
+    cfg = get_test_config()
+    ctx = DiffAEContext.build(cfg, for_training=True, verbose=False)
+    
+    print("\nChecking if latent_proj has EMA tracking...")
+    print(f"  ctx.ema_encoder exists: {ctx.ema_encoder is not None}")
+    print(f"  ctx.ema_decoder exists: {ctx.ema_decoder is not None}")
+    
+    has_ema_latent_proj = hasattr(ctx, 'ema_latent_proj') and ctx.ema_latent_proj is not None
+    print(f"  ema_latent_proj exists: {has_ema_latent_proj}")
+    
+    if not has_ema_latent_proj:
+        print("\n*** NOTE: latent_proj does NOT have EMA tracking! ***")
+        print("*** During visualization, ema_encoder and ema_decoder are used ***")
+        print("*** but the regular latent_proj is used. This could cause mismatch! ***")
+
+
+def test_input_vs_conditioning_scale():
+    """Test 9: Compare scale of input features vs conditioning."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Input vs conditioning scale comparison")
+    print("=" * 60)
+    
+    cfg = get_test_config()
+    ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
+    
+    latest_ckpt = ctx.latest_checkpoint()
+    if latest_ckpt:
+        ctx.load_checkpoint(latest_ckpt, load_optim=False)
+    
+    with torch.no_grad():
+        B = 4
+        batch_np, _ = ctx.loader.get_batch(B)
+        x0 = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
+        x0_flat = x0.view(B * ctx.n_nodes, 1)
+        
+        z, _, _ = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
+        cond_proj = ctx.latent_proj(z)
+        t = torch.full((B,), 100, device=ctx.device, dtype=torch.long)
+        t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
+        cond_full = torch.cat([cond_proj, t_emb], dim=-1)
+        
+        h_input = ctx.decoder.in_proj(x0_flat)
+        
+        pos_tiled = ctx.pos.repeat(B, 1)
+        h_pos = ctx.decoder.pos_mlp(pos_tiled.to(x0.dtype))
+        
+        cond_emb = ctx.decoder.cond_mlp(cond_full)
+        cond_emb_expanded = cond_emb.repeat_interleave(ctx.n_nodes, dim=0)
+        
+        print(f"\nScale comparison (hidden_dim={cfg.model.hidden_dim}):")
+        print(f"  Input projection (h_input):")
+        print(f"    Std: {h_input.std().item():.4f}")
+        print(f"  Position embedding (h_pos):")
+        print(f"    Std: {h_pos.std().item():.4f}")
+        print(f"  Conditioning embedding (cond_emb):")
+        print(f"    Std: {cond_emb_expanded.std().item():.4f}")
+        
+        combined = h_input + h_pos + cond_emb_expanded
+        
+        input_contribution = h_input.std() / combined.std()
+        pos_contribution = h_pos.std() / combined.std()
+        cond_contribution = cond_emb_expanded.std() / combined.std()
+        
+        print(f"\n  Relative contributions to initial hidden state:")
+        print(f"    Input: {input_contribution.item():.2%}")
+        print(f"    Position: {pos_contribution.item():.2%}")
+        print(f"    Conditioning: {cond_contribution.item():.2%}")
+        
+        if cond_contribution.item() < 0.05:
+            print("\n*** WARNING: Conditioning contribution is very small! ***")
+            print("*** The conditioning might be drowned out by input/position! ***")
+
+
 def run_all_tests():
     """Run all diagnostic tests."""
     print("\n" + "=" * 60)
@@ -400,6 +551,9 @@ def run_all_tests():
     test_gradient_flow()
     test_latent_proj_output()
     test_conditioning_ablation()
+    test_film_modulation()
+    test_ema_consistency()
+    test_input_vs_conditioning_scale()
     
     print("\n" + "=" * 60)
     print("OPTIONAL: Full reconstruction test (slow)")
@@ -414,4 +568,16 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        try:
+            dim = int(sys.argv[1])
+            set_latent_dim(dim)
+            print(f"Using latent_dim = {dim}")
+        except ValueError:
+            print(f"Invalid latent_dim argument: {sys.argv[1]}")
+            print("Usage: python test_diffae_conditioning.py [latent_dim]")
+            sys.exit(1)
+    else:
+        print(f"Using default latent_dim = {_LATENT_DIM[0]}")
+    
     run_all_tests()

@@ -41,18 +41,24 @@ class ModelConfig:
 
 @dataclass
 class EncoderConfig:
-    """Graph encoder parameters for DiffAE and Graph VAE.
-    
+    """Graph encoder parameters for DiffAE and Graph AE.
+
     The encoder maps input graphs to latent representations.
+    use_stochastic and kl_weight apply only to DiffAE's encoder.
+    decoder_type applies only to Graph AE: "graph" or "mlp".
     """
-    latent_dim: int = 8            # Latent representation dimension
+    latent_dim: int = 64            # Latent representation dimension
     hidden_dim: int = 32            # Hidden dimension in encoder layers
     depth: int = 4                  # Number of pooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.5         # Pooling ratio per stage
     dropout: float = 0.0            # Dropout rate
-    use_stochastic: bool = False    # VAE-style stochastic encoding
-    kl_weight: float = 0.001        # KL divergence weight (if stochastic)
+    use_stochastic: bool = False    # DiffAE encoder: stochastic (VAE-style) encoding
+    kl_weight: float = 0.001        # DiffAE: KL weight when use_stochastic
+    encoder_type: str = "mlp"     # Encoder: "graph" or "mlp"
+    decoder_type: str = "mlp"     # AE decoder: "graph" (SimpleGraphDecoder) or "mlp"
+    mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
+    mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
 
 
 @dataclass
@@ -111,8 +117,8 @@ class MSDataConfig:
     
     The time shift (delta) is measured in bins, where each bin = ns_per_bin nanoseconds.
     """
-    delta_min: int = -30            # Minimum time shift (bins), negative = SS2 before SS1
-    delta_max: int = 30             # Maximum time shift (bins), positive = SS2 after SS1
+    delta_min: int = -50            # Minimum time shift (bins), negative = SS2 before SS1
+    delta_max: int = 50             # Maximum time shift (bins), positive = SS2 after SS1
     ns_per_bin: float = 10.0        # Nanoseconds per time bin (for delta_mu calculation)
     seed: Optional[int] = None      # Random seed (None = different each run)
 
@@ -138,7 +144,7 @@ class TrainingConfig:
     
     # Checkpointing
     checkpoint_every: int = 100     # Save checkpoint every N epochs
-    visualize_every: int = 100      # Generate visualizations every N epochs
+    visualize_every: int = 50      # Generate visualizations every N epochs
     
     # Encoded dataset export (for aux task)
     encode_dataset_every: int = 500    # Export encoded latents every N epochs (0 = disable)
@@ -152,8 +158,8 @@ class AuxTaskConfig:
     The aux task trains MLPs to predict delta_mu from encoded latents,
     evaluating how well the encoder preserves timing information.
     """
-    epochs: int = 100               # MLP training epochs
-    batch_size: int = 64            # Batch size for aux training
+    epochs: int = 20               # MLP training epochs
+    batch_size: int = 512            # Batch size for aux training
     lr: float = 1e-3                # Learning rate
     hidden_dims: tuple = (128, 64)  # MLP hidden layer dimensions
     dropout: float = 0.1            # Dropout rate
@@ -181,7 +187,7 @@ class PathConfig:
     # Subdirectory templates (use .format(latent_dim=N))
     diffae_subdir: str = "diffae_z{latent_dim}"
     ae_subdir: str = "ae_z{latent_dim}"
-    graph_vae_subdir: str = "graph_vae_z{latent_dim}"
+    graph_ae_subdir: str = "graph_ae_z{latent_dim}"
 
 
 # =============================================================================
@@ -273,6 +279,8 @@ def print_config(cfg: Config, include_encoder: bool = False, include_ms: bool = 
         print(f"  latent_dim: {cfg.encoder.latent_dim}")
         print(f"  hidden_dim: {cfg.encoder.hidden_dim}")
         print(f"  depth: {cfg.encoder.depth}")
+        print(f"  encoder_type: {cfg.encoder.encoder_type}")
+        print(f"  decoder_type: {cfg.encoder.decoder_type}")
         print(f"  stochastic: {cfg.encoder.use_stochastic}")
     
     if include_ms:

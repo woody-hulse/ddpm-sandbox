@@ -29,7 +29,7 @@ from lz_data_loader import TritiumSSDataLoader, create_3d_adjacency_matrix_spars
 from data import SparseGraph
 from diffae import GraphEncoder, DiffAEContext, DiffAEDataStats, sample_diffae
 from diffusion.schedule import build_cosine_schedule
-from ae import GraphVAEEncoder
+from ae import GraphAEEncoder
 from models.graph_unet import TopKPool, build_block_diagonal_adj, GraphDDPMUNet
 from utils.sparse_ops import to_binary, subgraph_coo
 
@@ -269,6 +269,9 @@ class OnlineMSDataset(Dataset):
         self.n_time = self.ss_waveforms.shape[2]
         self.input_dim = self.n_channels * self.n_time
         
+        self.wf_mean = float(self.ss_waveforms.mean())
+        self.wf_std = float(self.ss_waveforms.std()) + 1e-8
+        
         self._rng = np.random.default_rng(self.seed)
         self._regenerate_indices()
 
@@ -306,7 +309,8 @@ class OnlineMSDataset(Dataset):
         wf2_shifted = shift_waveform(wf2, delta_bins)
         ms_wf = wf1 + wf2_shifted
         
-        wf_flat = ms_wf.T.reshape(-1, 1)
+        ms_wf_norm = (ms_wf - self.wf_mean) / self.wf_std
+        wf_flat = ms_wf_norm.T.reshape(-1, 1)
         
         if self.transform:
             wf_flat = self.transform(wf_flat)
@@ -408,6 +412,7 @@ def train_aux_mlp_on_latents(
     t0 = time.perf_counter()
     
     for epoch in range(epochs):
+        val_times.append(time.perf_counter() - t0)
         mlp.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -442,9 +447,8 @@ def train_aux_mlp_on_latents(
                 n_val += 1
         
         val_losses.append(val_loss / n_val)
-        val_times.append(time.perf_counter() - t0)
         
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 1 == 0:
             print(f"  Epoch {epoch+1}/{epochs}: train_loss={train_losses[-1]:.4f}, val_loss={val_losses[-1]:.4f}")
     
     return train_losses, val_losses, val_times
@@ -570,7 +574,7 @@ def train_aux_model(
                 if encoder_type == 'diffae':
                     z, _, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
                 elif encoder_type == 'ae':
-                    z, _, _, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
+                    z, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
                 else:  # regular_ae
                     z = encoder.encode(wf_flat, A_sparse, pos, batch_size=B)
             
@@ -601,7 +605,7 @@ def train_aux_model(
                 if encoder_type == 'diffae':
                     z, _, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
                 elif encoder_type == 'ae':
-                    z, _, _, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
+                    z, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
                 else:  # regular_ae
                     z = encoder.encode(wf_flat, A_sparse, pos, batch_size=B)
                 
@@ -645,7 +649,7 @@ def evaluate_aux_model(
             if encoder_type == 'diffae':
                 z, _, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
             elif encoder_type == 'ae':
-                z, _, _, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
+                z, _ = encoder(wf_flat, A_sparse, pos, batch_size=B)
             else:  # regular_ae
                 z = encoder.encode(wf_flat, A_sparse, pos, batch_size=B)
             
@@ -680,7 +684,8 @@ def train_baseline_mlp(
     val_times = []
     t0 = time.perf_counter()
     
-    for epoch in range(epochs):
+    for epoch in range(200):# range(epochs):
+        val_times.append(time.perf_counter() - t0)
         mlp.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -715,7 +720,6 @@ def train_baseline_mlp(
                 n_val += 1
         
         val_losses.append(val_loss / n_val)
-        val_times.append(time.perf_counter() - t0)
         
         if (epoch + 1) % 10 == 0:
             print(f"  Epoch {epoch+1}/{epochs}: train_loss={train_losses[-1]:.4f}, val_loss={val_losses[-1]:.4f}")
@@ -752,8 +756,8 @@ def evaluate_baseline_mlp(
     return mae, rmse, all_preds, all_targets
 
 
-def train_aux_model_graph_vae(
-    vae: nn.Module,
+def train_aux_model_graph_ae(
+    ae: nn.Module,
     mlp: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -764,11 +768,11 @@ def train_aux_model_graph_vae(
     lr: float = 1e-3,
     target_key: str = 'delta_mu',
 ) -> Tuple[list, list, List[float]]:
-    """Train auxiliary MLP on graph VAE encoded representations."""
+    """Train auxiliary MLP on graph AE encoded representations."""
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
-    vae.eval()
+    ae.eval()
     train_losses = []
     val_losses = []
     val_times = []
@@ -786,7 +790,7 @@ def train_aux_model_graph_vae(
             wf_flat = wf.view(B * wf.shape[1], 1)
             
             with torch.no_grad():
-                z, _, _ = vae.encode(wf_flat, A_sparse, pos, batch_size=B)
+                z, _, _ = ae.encode(wf_flat, A_sparse, pos, batch_size=B)
             
             pred = mlp(z).squeeze(-1)
             loss = F.mse_loss(pred, target)
@@ -811,7 +815,7 @@ def train_aux_model_graph_vae(
                 target = targets[target_key].to(device).float()
                 B = wf.shape[0]
                 wf_flat = wf.view(B * wf.shape[1], 1)
-                z, _, _ = vae.encode(wf_flat, A_sparse, pos, batch_size=B)
+                z, _, _ = ae.encode(wf_flat, A_sparse, pos, batch_size=B)
                 pred = mlp(z).squeeze(-1)
                 val_loss += F.mse_loss(pred, target).item()
                 n_val += 1
@@ -825,8 +829,8 @@ def train_aux_model_graph_vae(
     return train_losses, val_losses, val_times
 
 
-def evaluate_aux_model_graph_vae(
-    vae: nn.Module,
+def evaluate_aux_model_graph_ae(
+    ae: nn.Module,
     mlp: nn.Module,
     test_loader: DataLoader,
     A_sparse: torch.Tensor,
@@ -834,8 +838,8 @@ def evaluate_aux_model_graph_vae(
     device: torch.device,
     target_key: str = 'delta_mu',
 ) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    """Evaluate auxiliary MLP on graph VAE encoded representations."""
-    vae.eval()
+    """Evaluate auxiliary MLP on graph AE encoded representations."""
+    ae.eval()
     mlp.eval()
     
     all_preds = []
@@ -847,7 +851,7 @@ def evaluate_aux_model_graph_vae(
             target = targets[target_key].numpy()
             B = wf.shape[0]
             wf_flat = wf.view(B * wf.shape[1], 1)
-            z, _, _ = vae.encode(wf_flat, A_sparse, pos, batch_size=B)
+            z, _, _ = ae.encode(wf_flat, A_sparse, pos, batch_size=B)
             pred = mlp(z).squeeze(-1).cpu().numpy()
             all_preds.append(pred)
             all_targets.append(target)
@@ -916,24 +920,68 @@ def plot_results(results: Dict[str, AuxTrainingResult], output_dir: str):
     plt.savefig(f'{output_dir}/aux_test_performance.png', dpi=150)
     plt.close()
 
-    fig3, ax3 = plt.subplots(figsize=(6, 5))
-    for name, res in results.items():
-        ax3.scatter(res.targets, res.predictions, alpha=0.3, s=5, color=color_map[name], label=name)
+    n_models = len(names)
+    fig3, axes = plt.subplots(2, n_models, figsize=(4 * n_models, 7), squeeze=False)
+    
     all_vals = np.concatenate([r.targets for r in results.values()] +
                                [r.predictions for r in results.values()])
     lims = [all_vals.min() - 10, all_vals.max() + 10]
-    ax3.plot(lims, lims, 'k--', alpha=0.5)
-    ax3.set_xlim(lims)
-    ax3.set_ylim(lims)
-    ax3.set_xlabel('True Δμ (ns)')
-    ax3.set_ylabel('Predicted Δμ (ns)')
-    ax3.set_title('Predictions vs Ground Truth')
-    ax3.legend()
+    
+    for i, (name, res) in enumerate(results.items()):
+        ax_scatter = axes[0, i]
+        ax_scatter.hexbin(res.targets, res.predictions, gridsize=30, cmap='Blues', mincnt=1)
+        ax_scatter.plot(lims, lims, 'r--', alpha=0.7, linewidth=1.5)
+        ax_scatter.set_xlim(lims)
+        ax_scatter.set_ylim(lims)
+        ax_scatter.set_xlabel('True Δμ (ns)')
+        ax_scatter.set_ylabel('Predicted Δμ (ns)')
+        ax_scatter.set_title(f'{name}\nMAE={res.test_mae:.1f} ns')
+        ax_scatter.set_aspect('equal', adjustable='box')
+        
+        ax_resid = axes[1, i]
+        residuals = res.predictions - res.targets
+        ax_resid.hist(residuals, bins=50, color=color_map[name], alpha=0.7, edgecolor='white')
+        ax_resid.axvline(0, color='red', linestyle='--', linewidth=1.5)
+        ax_resid.axvline(np.mean(residuals), color='black', linestyle='-', linewidth=1.5, label=f'μ={np.mean(residuals):.1f}')
+        ax_resid.set_xlabel('Residual (Pred - True) (ns)')
+        ax_resid.set_ylabel('Count')
+        ax_resid.set_title(f'σ={np.std(residuals):.1f} ns')
+        ax_resid.legend(fontsize=8)
+    
     plt.tight_layout()
     plt.savefig(f'{output_dir}/aux_predictions_vs_truth.png', dpi=150)
     plt.close()
+    
+    fig4, ax4 = plt.subplots(figsize=(8, 5))
+    positions = np.arange(len(names))
+    all_residuals = []
+    for name, res in results.items():
+        all_residuals.append(np.abs(res.predictions - res.targets))
+    
+    bp = ax4.boxplot(all_residuals, positions=positions, widths=0.6, patch_artist=True)
+    for patch, name in zip(bp['boxes'], names):
+        patch.set_facecolor(color_map[name])
+        patch.set_alpha(0.7)
+    ax4.set_xticks(positions)
+    ax4.set_xticklabels(names)
+    ax4.set_ylabel('Absolute Error (ns)')
+    ax4.set_title('Error Distribution Comparison')
+    ax4.grid(axis='y', alpha=0.3)
+    
+    for i, (name, res) in enumerate(results.items()):
+        ax4.annotate(f'MAE={res.test_mae:.1f}', (i, res.test_mae), 
+                     textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/aux_error_distribution.png', dpi=150)
+    plt.close()
 
-    print(f"\nResults saved to {output_dir}/ (aux_validation_loss_epoch.png, aux_validation_loss_time.png, aux_test_performance.png, aux_predictions_vs_truth.png)")
+    print(f"\nResults saved to {output_dir}/")
+    print("  - aux_validation_loss_epoch.png")
+    print("  - aux_validation_loss_time.png")
+    print("  - aux_test_performance.png")
+    print("  - aux_predictions_vs_truth.png (hexbin + residual histograms)")
+    print("  - aux_error_distribution.png (box plots)")
     print("\n" + "="*50)
     print("Summary")
     print("="*50)
@@ -988,7 +1036,7 @@ def plot_reconstruction_overlays(
     n_time: int,
     output_dir: str,
     num_examples: int = 6,
-    vae: Optional[nn.Module] = None,
+    ae: Optional[nn.Module] = None,
     diffae_encoder: Optional[nn.Module] = None,
     diffae_decoder: Optional[nn.Module] = None,
     diffae_latent_proj: Optional[nn.Module] = None,
@@ -999,14 +1047,14 @@ def plot_reconstruction_overlays(
     diffae_time_dim: int = 64,
     cfg: Optional[Config] = None,
 ):
-    """Plot original summed waveform, VAE reconstruction, and DiffAE reconstruction (1x3 per example)."""
+    """Plot original summed waveform, AE reconstruction, and DiffAE reconstruction (1x3 per example)."""
     os.makedirs(output_dir, exist_ok=True)
-    has_vae = vae is not None and A_sparse is not None and pos is not None
+    has_ae = ae is not None and A_sparse is not None and pos is not None
     has_diffae = all([
         diffae_encoder, diffae_decoder, diffae_latent_proj,
         diffae_schedule, diffae_data_stats, A_sparse is not None, pos is not None,
     ])
-    if not has_vae and not has_diffae:
+    if not has_ae and not has_diffae:
         return
     if cfg is None:
         cfg = default_config
@@ -1018,15 +1066,15 @@ def plot_reconstruction_overlays(
         for wf, _ in data_loader:
             wf = wf.to(device)
             orig_np = wf.cpu().numpy()
-            vae_recon_np = None
+            ae_recon_np = None
             diffae_recon_np = None
-            if has_vae:
-                vae.eval()
+            if has_ae:
+                ae.eval()
                 B = wf.shape[0]
                 wf_flat = wf.view(B * wf.shape[1], 1)
-                recon, _, _, _ = vae(wf_flat, A_sparse, pos, batch_size=B)
-                recon_denorm = vae.denormalize(recon)
-                vae_recon_np = recon_denorm.view(wf.shape).cpu().numpy()
+                recon, _, _, _ = ae(wf_flat, A_sparse, pos, batch_size=B)
+                recon_denorm = ae.denormalize(recon)
+                ae_recon_np = recon_denorm.view(wf.shape).cpu().numpy()
             if has_diffae:
                 diffae_encoder.eval()
                 diffae_decoder.eval()
@@ -1038,7 +1086,7 @@ def plot_reconstruction_overlays(
             for b in range(wf.shape[0]):
                 collected.append((
                     orig_np[b],
-                    vae_recon_np[b] if vae_recon_np is not None else None,
+                    ae_recon_np[b] if ae_recon_np is not None else None,
                     diffae_recon_np[b] if diffae_recon_np is not None else None,
                 ))
                 if len(collected) >= num_examples:
@@ -1055,7 +1103,7 @@ def plot_reconstruction_overlays(
         return arr
 
     time_ns = np.arange(n_time) * 10
-    for idx, (orig, vae_rec, diffae_rec) in enumerate(collected):
+    for idx, (orig, ae_rec, diffae_rec) in enumerate(collected):
         fig, axes = plt.subplots(1, 3, figsize=(12, 3))
         orig_2d = flat_to_2d(orig)
         summed_orig = orig_2d.sum(axis=0)
@@ -1065,10 +1113,10 @@ def plot_reconstruction_overlays(
         axes[0].set_ylabel('Summed amplitude')
         axes[0].set_title('Original')
 
-        if vae_rec is not None:
-            vae_2d = flat_to_2d(vae_rec)
-            summed_vae = vae_2d.sum(axis=0)
-            axes[1].plot(time_ns, summed_vae, color='C1', alpha=0.8)
+        if ae_rec is not None:
+            ae_2d = flat_to_2d(ae_rec)
+            summed_ae = ae_2d.sum(axis=0)
+            axes[1].plot(time_ns, summed_ae, color='C1', alpha=0.8)
         else:
             axes[1].text(0.5, 0.5, 'N/A', ha='center', va='center', transform=axes[1].transAxes)
         axes[1].set_xlabel('Time (ns)')
@@ -1192,13 +1240,13 @@ def load_ae_encoder(
     if not os.path.isdir(ae_ckpt_dir):
         return None
     
-    ckpt_files = sorted([f for f in os.listdir(ae_ckpt_dir) if f.startswith('vae_epoch_')])
+    ckpt_files = sorted([f for f in os.listdir(ae_ckpt_dir) if f.startswith('ae_epoch_')])
     if not ckpt_files:
         return None
     
     ckpt_path = os.path.join(ae_ckpt_dir, ckpt_files[-1])
     
-    encoder = GraphVAEEncoder(
+    encoder = GraphAEEncoder(
         in_dim=cfg.model.in_dim,
         hidden_dim=cfg.encoder.hidden_dim,
         latent_dim=latent_dim,
@@ -1207,7 +1255,6 @@ def load_ae_encoder(
         pool_ratio=cfg.encoder.pool_ratio,
         dropout=cfg.encoder.dropout,
         pos_dim=cfg.model.pos_dim,
-        use_stochastic=True,
     ).to(device)
     
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -1521,7 +1568,7 @@ def find_encoded_latents(cfg: Config, model_type: str, latent_dim: int) -> Optio
         filename = "encoded_ms_latents.h5"
     elif model_type == 'ae':
         subdir = cfg.paths.ae_subdir.format(latent_dim=latent_dim)
-        filename = "vae_encoded_ms_latents.h5"
+        filename = "ae_encoded_ms_latents.h5"
     else:
         return None
     
@@ -1547,6 +1594,9 @@ Examples:
 
   # Compare DiffAE and AE latents
   python aux.py --diffae-latents path/to/diffae.h5 --ae-latents path/to/ae.h5
+
+  # Include raw waveform baseline for comparison
+  python aux.py --latent-dim 64 --baseline
         """
     )
     aux_cfg = default_config.aux_task
@@ -1568,6 +1618,10 @@ Examples:
                         help='Number of trials for error bars')
     parser.add_argument('--metric', type=str, default='mae', choices=['mae', 'rmse'],
                         help='Metric to report')
+    parser.add_argument('--baseline', action='store_true',
+                        help='Also train baseline MLP on raw waveforms for comparison')
+    parser.add_argument('--n-baseline-events', type=int, default=50000,
+                        help='Number of MS events to generate for baseline (default: 50000)')
     
     args = parser.parse_args()
     
@@ -1588,7 +1642,7 @@ Examples:
     if diffae_path is None and ae_path is None:
         print("ERROR: No encoded latent files found!")
         print(f"  Looked for DiffAE: {cfg.paths.checkpoint_dir}/{cfg.paths.diffae_subdir.format(latent_dim=latent_dim)}/encoded_ms_latents.h5")
-        print(f"  Looked for AE: {cfg.paths.checkpoint_dir}/{cfg.paths.ae_subdir.format(latent_dim=latent_dim)}/vae_encoded_ms_latents.h5")
+        print(f"  Looked for AE: {cfg.paths.checkpoint_dir}/{cfg.paths.ae_subdir.format(latent_dim=latent_dim)}/ae_encoded_ms_latents.h5")
         print("\nTo generate encoded latents, run:")
         print("  python diffae.py   # for DiffAE")
         print("  python ae.py       # for Graph AE")
@@ -1597,6 +1651,83 @@ Examples:
     
     results = {}
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    if args.baseline:
+        print("\n" + "="*60)
+        print("Training baseline MLP on raw waveforms")
+        print("="*60)
+        
+        baseline_dataset = OnlineMSDataset(
+            ss_h5_path=cfg.paths.tritium_h5,
+            n_events=args.n_baseline_events,
+            ms_config=cfg.ms_data,
+            seed=42,
+        )
+        print(f"  Generated {len(baseline_dataset)} MS events")
+        print(f"  Waveform shape: (C={baseline_dataset.n_channels}, T={baseline_dataset.n_time})")
+        print(f"  Input dim: {baseline_dataset.input_dim}")
+        print(f"  Normalization: mean={baseline_dataset.wf_mean:.4f}, std={baseline_dataset.wf_std:.4f}")
+        
+        n_total = len(baseline_dataset)
+        n_train = int(0.7 * n_total)
+        n_val = int(0.15 * n_total)
+        n_test = n_total - n_train - n_val
+        
+        train_set, val_set, test_set = random_split(
+            baseline_dataset, [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(42)
+        )
+        
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        
+        print(f"  Train: {n_train}, Val: {n_val}, Test: {n_test}")
+        
+        baseline_maes = []
+        baseline_rmses = []
+        
+        for trial in range(args.n_trials):
+            if args.n_trials > 1:
+                print(f"\n  Trial {trial+1}/{args.n_trials}")
+            
+            mlp = MLP(
+                in_dim=baseline_dataset.input_dim,
+                hidden_dims=[128, 64],
+                out_dim=1,
+                dropout=0.1,
+            ).to(device)
+            
+            train_losses, val_losses, val_times = train_baseline_mlp(
+                mlp, train_loader, val_loader, device,
+                epochs=args.aux_epochs, lr=args.lr, target_key='delta_mu'
+            )
+            
+            mae, rmse, preds, targets = evaluate_baseline_mlp(
+                mlp, test_loader, device, target_key='delta_mu'
+            )
+            
+            baseline_maes.append(mae)
+            baseline_rmses.append(rmse)
+            print(f"    MAE: {mae:.2f} ns, RMSE: {rmse:.2f} ns")
+        
+        mean_mae = np.mean(baseline_maes)
+        std_mae = np.std(baseline_maes) if len(baseline_maes) > 1 else 0.0
+        mean_rmse = np.mean(baseline_rmses)
+        std_rmse = np.std(baseline_rmses) if len(baseline_rmses) > 1 else 0.0
+        
+        results['Baseline'] = AuxTrainingResult(
+            model_name='Baseline',
+            train_losses=train_losses,
+            val_losses=val_losses,
+            test_mae=mean_mae,
+            test_rmse=mean_rmse,
+            predictions=preds,
+            targets=targets,
+            val_times=val_times,
+        )
+        
+        print(f"\n  Baseline Final: MAE={mean_mae:.2f}±{std_mae:.2f} ns, RMSE={mean_rmse:.2f}±{std_rmse:.2f} ns")
     
     for model_name, latents_path in [('DiffAE', diffae_path), ('AE', ae_path)]:
         if latents_path is None:

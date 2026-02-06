@@ -1,5 +1,5 @@
 """
-Graph VAE: Variational Autoencoder with Graph Encoder/Decoder.
+Graph AE: Autoencoder with Graph Encoder/Decoder.
 
 Uses a graph encoder to map events to latent representations,
 and a graph decoder for direct reconstruction.
@@ -218,7 +218,8 @@ class GraphDecoder(nn.Module):
 
         # Add position embeddings at final resolution
         pos_tiled = pos.repeat(B, 1)
-        pos_emb = self.pos_mlp(pos_tiled.to(z.dtype))
+        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
+        pos_emb = self.pos_mlp(pos_normalized.to(z.dtype))
         h = h + pos_emb
 
         # Final processing
@@ -229,10 +230,61 @@ class GraphDecoder(nn.Module):
         return out
 
 
-class GraphVAEEncoder(nn.Module):
+class MLPEncoder(nn.Module):
     """
-    VAE Encoder wrapper that also returns pooling indices for the decoder.
-    Wraps the GraphEncoder but tracks pooling operations.
+    MLP encoder: flattens input and maps to latent. No graph structure used.
+    Same interface as GraphAEEncoder for drop-in use.
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        latent_dim: int,
+        n_nodes: int,
+        num_layers: int = 3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.n_nodes = n_nodes
+
+        layers = []
+        input_size = n_nodes * in_dim
+        in_d = input_size
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(in_d, hidden_dim))
+            layers.append(nn.SiLU())
+            layers.append(nn.Dropout(dropout))
+            in_d = hidden_dim
+        layers.append(nn.Linear(in_d, latent_dim))
+        self.mlp = nn.Sequential(*layers)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
+        B = batch_size
+        x_flat = x.view(B, -1)
+        z = self.mlp(x_flat)
+        return z, []
+
+
+class GraphAEEncoder(nn.Module):
+    """
+    Graph encoder that returns latent z and pooling indices for the decoder.
     """
     def __init__(
         self,
@@ -244,7 +296,6 @@ class GraphVAEEncoder(nn.Module):
         pool_ratio: float = 0.5,
         dropout: float = 0.0,
         pos_dim: int = 3,
-        use_stochastic: bool = True,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -252,7 +303,6 @@ class GraphVAEEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.depth = depth
         self.pool_ratio = pool_ratio
-        self.use_stochastic = use_stochastic
 
         self.in_proj = nn.Linear(in_dim, hidden_dim)
         
@@ -273,8 +323,7 @@ class GraphVAEEncoder(nn.Module):
 
         self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
 
-        self.to_mu = nn.Linear(hidden_dim, latent_dim)
-        self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.to_latent = nn.Linear(hidden_dim * 2, latent_dim)
 
         self._cached_block_adj = {}
         self.reset_parameters()
@@ -287,10 +336,8 @@ class GraphVAEEncoder(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.xavier_uniform_(self.to_mu.weight, gain=0.5)
-        nn.init.zeros_(self.to_mu.bias)
-        nn.init.xavier_uniform_(self.to_logvar.weight, gain=0.1)
-        nn.init.zeros_(self.to_logvar.bias)
+        nn.init.xavier_uniform_(self.to_latent.weight, gain=0.5)
+        nn.init.zeros_(self.to_latent.bias)
 
     def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
         key = (adj.device, adj.size(), adj._nnz(), batch_size)
@@ -307,14 +354,12 @@ class GraphVAEEncoder(nn.Module):
         adj: torch.Tensor, 
         pos: torch.Tensor,
         batch_size: int = 1
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
         """
         Encode input events to latent representations.
-        
+
         Returns:
             z: Latent representation (B, latent_dim)
-            mu: Mean (B, latent_dim)
-            logvar: Log variance (B, latent_dim)
             pool_indices: List of (keep_idx, N_prev, npg_prev) for decoder
         """
         N_single = adj.size(0)
@@ -325,7 +370,8 @@ class GraphVAEEncoder(nn.Module):
 
         h = self.in_proj(x)
         pos_tiled = pos.repeat(batch_size, 1)
-        pos_emb = self.pos_mlp(pos_tiled.to(x.dtype))
+        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
+        pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
         h = h + pos_emb
 
         nodes_per_graph = N_single
@@ -345,20 +391,11 @@ class GraphVAEEncoder(nn.Module):
         h_cur = self.final_stage(h_cur, adj_cur)
 
         h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
-        h_agg = h_graph.mean(dim=1)
-
-        mu = self.to_mu(h_agg)
-        logvar = self.to_logvar(h_agg)
-        logvar = torch.clamp(logvar, min=-10, max=2)
-        
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-        else:
-            z = mu
-            
-        return z, mu, logvar, pool_indices
+        h_mean = h_graph.mean(dim=1)
+        h_std = h_graph.std(dim=1) + 1e-6
+        h_agg = torch.cat([h_mean, h_std], dim=-1)
+        z = self.to_latent(h_agg)
+        return z, pool_indices
 
 
 class SimpleGraphDecoder(nn.Module):
@@ -460,7 +497,8 @@ class SimpleGraphDecoder(nn.Module):
 
         # Add position embeddings
         pos_tiled = pos.repeat(B, 1)
-        pos_emb = self.pos_mlp(pos_tiled.to(z.dtype))
+        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
+        pos_emb = self.pos_mlp(pos_normalized.to(z.dtype))
         h = h + pos_emb
 
         # Graph message passing stages
@@ -473,9 +511,60 @@ class SimpleGraphDecoder(nn.Module):
         return out
 
 
+class MLPDecoder(nn.Module):
+    """
+    MLP decoder: latent z -> MLP -> (B*N, out_dim). No graph or position.
+    Same interface as SimpleGraphDecoder for drop-in use.
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        n_nodes: int,
+        num_layers: int = 3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.n_nodes = n_nodes
+
+        layers = []
+        in_d = latent_dim
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(in_d, hidden_dim))
+            layers.append(nn.SiLU())
+            layers.append(nn.Dropout(dropout))
+            in_d = hidden_dim
+        layers.append(nn.Linear(in_d, n_nodes * out_dim))
+        self.mlp = nn.Sequential(*layers)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1,
+    ) -> torch.Tensor:
+        B = batch_size
+        N, C = self.n_nodes, self.out_dim
+        out = self.mlp(z)
+        return out.view(B * N, C)
+
+
 @dataclass
-class VAEContext:
-    """Holds all model components for VAE training/inference."""
+class AEContext:
+    """Holds all model components for AE training/inference."""
     cfg: Config
     device: torch.device
     loader: DataLoaderType
@@ -496,7 +585,7 @@ class VAEContext:
     use_ms_data: bool = False
 
     @classmethod
-    def build(cls, cfg: Config, for_training: bool = True, verbose: bool = True, use_ms_data: bool = True) -> 'VAEContext':
+    def build(cls, cfg: Config, for_training: bool = True, verbose: bool = True, use_ms_data: bool = True) -> 'AEContext':
         device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         if verbose:
             print(f"Using device: {device}")
@@ -534,28 +623,49 @@ class VAEContext:
         if verbose:
             print(f"Data mean: {data_stats.mean:.4f}, std: {data_stats.std:.4f}")
 
-        encoder = GraphVAEEncoder(
-            in_dim=cfg.model.in_dim,
-            hidden_dim=cfg.encoder.hidden_dim,
-            latent_dim=cfg.encoder.latent_dim,
-            depth=cfg.encoder.depth,
-            blocks_per_stage=cfg.encoder.blocks_per_stage,
-            pool_ratio=cfg.encoder.pool_ratio,
-            dropout=cfg.encoder.dropout,
-            pos_dim=cfg.model.pos_dim,
-            use_stochastic=True,
-        ).to(device)
+        encoder_type = (getattr(cfg.encoder, "encoder_type", "graph") or "graph").lower()
+        if encoder_type == "mlp":
+            encoder = MLPEncoder(
+                in_dim=cfg.model.in_dim,
+                hidden_dim=cfg.encoder.hidden_dim,
+                latent_dim=cfg.encoder.latent_dim,
+                n_nodes=n_nodes,
+                num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
+                dropout=cfg.encoder.dropout,
+            ).to(device)
+        else:
+            encoder = GraphAEEncoder(
+                in_dim=cfg.model.in_dim,
+                hidden_dim=cfg.encoder.hidden_dim,
+                latent_dim=cfg.encoder.latent_dim,
+                depth=cfg.encoder.depth,
+                blocks_per_stage=cfg.encoder.blocks_per_stage,
+                pool_ratio=cfg.encoder.pool_ratio,
+                dropout=cfg.encoder.dropout,
+                pos_dim=cfg.model.pos_dim,
+            ).to(device)
 
-        decoder = SimpleGraphDecoder(
-            latent_dim=cfg.encoder.latent_dim,
-            hidden_dim=cfg.encoder.hidden_dim,
-            out_dim=cfg.model.out_dim,
-            n_nodes=n_nodes,
-            depth=cfg.encoder.depth,
-            blocks_per_stage=cfg.encoder.blocks_per_stage,
-            dropout=cfg.encoder.dropout,
-            pos_dim=cfg.model.pos_dim,
-        ).to(device)
+        decoder_type = (getattr(cfg.encoder, "decoder_type", "graph") or "graph").lower()
+        if decoder_type == "mlp":
+            decoder = MLPDecoder(
+                latent_dim=cfg.encoder.latent_dim,
+                hidden_dim=cfg.encoder.hidden_dim,
+                out_dim=cfg.model.out_dim,
+                n_nodes=n_nodes,
+                num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
+                dropout=cfg.encoder.dropout,
+            ).to(device)
+        else:
+            decoder = SimpleGraphDecoder(
+                latent_dim=cfg.encoder.latent_dim,
+                hidden_dim=cfg.encoder.hidden_dim,
+                out_dim=cfg.model.out_dim,
+                n_nodes=n_nodes,
+                depth=cfg.encoder.depth,
+                blocks_per_stage=cfg.encoder.blocks_per_stage,
+                dropout=cfg.encoder.dropout,
+                pos_dim=cfg.model.pos_dim,
+            ).to(device)
 
         ema_encoder = None
         ema_decoder = None
@@ -605,7 +715,7 @@ class VAEContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = sorted(glob.glob(os.path.join(self.checkpoint_dir, "vae_epoch_*.pt")))
+        files = sorted(glob.glob(os.path.join(self.checkpoint_dir, "ae_epoch_*.pt")))
         return files[-1] if files else None
 
     def save_checkpoint(self, epoch: int) -> str:
@@ -618,7 +728,7 @@ class VAEContext:
             "epoch": epoch,
             "data_stats": {"mean": self.data_stats.mean, "std": self.data_stats.std},
         }
-        path = os.path.join(self.checkpoint_dir, f"vae_epoch_{epoch:04d}.pt")
+        path = os.path.join(self.checkpoint_dir, f"ae_epoch_{epoch:04d}.pt")
         torch.save(state, path)
         return path
 
@@ -651,7 +761,7 @@ class VAEContext:
         for subdir in os.listdir(parent_dir):
             if subdir.startswith("ae_z"):
                 subdir_path = os.path.join(parent_dir, subdir)
-                ckpt_files = sorted(glob.glob(os.path.join(subdir_path, "vae_epoch_*.pt")))
+                ckpt_files = sorted(glob.glob(os.path.join(subdir_path, "ae_epoch_*.pt")))
                 if ckpt_files:
                     all_ckpts.append(ckpt_files[-1])
         
@@ -671,8 +781,7 @@ class VAEContext:
         """
         chk = torch.load(path, map_location=self.device)
         
-        encoder_latent_keys = {'to_mu.weight', 'to_mu.bias', 
-                               'to_logvar.weight', 'to_logvar.bias'}
+        encoder_latent_keys = {'to_latent.weight', 'to_latent.bias', 'to_mu.weight', 'to_mu.bias', 'to_logvar.weight', 'to_logvar.bias'}
         
         decoder_latent_keys = {'latent_proj.0.weight', 'latent_proj.0.bias'}
         
@@ -719,7 +828,7 @@ class VAEContext:
 
 @torch.no_grad()
 def save_encoded_dataset(
-    ctx: VAEContext,
+    ctx: AEContext,
     output_path: str,
     encoder: Optional[nn.Module] = None,
     batch_size: int = 32,
@@ -776,7 +885,7 @@ def save_encoded_dataset(
         x = torch.from_numpy(wf_norm).to(ctx.device)
         x_flat = x.view(actual_batch_size * ctx.n_nodes, 1)
         
-        z, _, _, _ = encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=actual_batch_size)
+        z, _ = encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=actual_batch_size)
         all_latents.append(z.cpu().numpy())
         samples_encoded += actual_batch_size
     
@@ -805,12 +914,10 @@ def save_encoded_dataset(
         print(f"Saved encoded MS dataset to {output_path}: {samples_encoded} samples, latent_dim={latent_dim}")
     
     return output_path
-    
-    return output_path
 
 
 @torch.no_grad()
-def reconstruct_vae(
+def reconstruct_ae(
     encoder: nn.Module,
     decoder: nn.Module,
     A_sparse: torch.Tensor,
@@ -818,22 +925,22 @@ def reconstruct_vae(
     x_ref: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Reconstruct events using VAE encoder-decoder.
-    
+    Reconstruct events using AE encoder-decoder.
+
     Args:
-        encoder: VAE encoder
-        decoder: VAE decoder
+        encoder: AE encoder
+        decoder: AE decoder
         A_sparse: Graph adjacency
         pos: Node positions
         x_ref: Reference events to reconstruct (B, N, 1)
-    
+
     Returns:
         Reconstructed samples (B, 1, N)
     """
     B, N, C = x_ref.shape
     
     x_ref_flat = x_ref.view(B * N, C)
-    z, _, _, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
+    z, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
     
     rec_flat = decoder(z, A_sparse, pos, batch_size=B)
     rec = rec_flat.view(B, N, C).permute(0, 2, 1)  # (B, C, N)
@@ -858,14 +965,14 @@ def sample_from_latent(
     return rec
 
 
-def train_vae(cfg: Config = default_config):
-    """Main VAE training function."""
+def train_ae(cfg: Config = default_config):
+    """Main AE training function."""
     print("=" * 50)
-    print("Graph VAE Training")
+    print("Graph AE Training")
     print("=" * 50)
     print_config(cfg, include_encoder=True)
     
-    ctx = VAEContext.build(cfg, for_training=True, verbose=True)
+    ctx = AEContext.build(cfg, for_training=True, verbose=True)
     
     device_t = ctx.device
     encoder = ctx.encoder
@@ -913,15 +1020,12 @@ def train_vae(cfg: Config = default_config):
     B = cfg.training.batch_size
     
     global_step = start_epoch * cfg.training.steps_per_epoch
-    encoded_output_path = os.path.join(ctx.checkpoint_dir, "vae_encoded_ms_latents.h5")
-    kl_weight = cfg.encoder.kl_weight
+    encoded_output_path = os.path.join(ctx.checkpoint_dir, "ae_encoded_ms_latents.h5")
 
     for epoch in range(start_epoch, cfg.training.epochs):
         encoder.train()
         decoder.train()
         epoch_loss = 0.0
-        epoch_rec = 0.0
-        epoch_kl = 0.0
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
@@ -931,21 +1035,10 @@ def train_vae(cfg: Config = default_config):
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
             x0_flat = x0.view(B * n_nodes, 1)
             
-            # Encode
-            z, mu, logvar, _ = encoder(x0_flat, A_sparse, pos, batch_size=B)
-            
-            # Decode
+            z, _ = encoder(x0_flat, A_sparse, pos, batch_size=B)
             rec_flat = decoder(z, A_sparse, pos, batch_size=B)
             rec = rec_flat.view(B, n_nodes, 1)
-            
-            # Reconstruction loss
-            rec_loss = F.mse_loss(rec, x0, reduction='mean')
-            
-            # KL divergence
-            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            
-            # Total loss (ELBO)
-            loss = rec_loss + kl_weight * kl_loss
+            loss = F.mse_loss(rec, x0, reduction='mean')
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"  WARNING: NaN/Inf loss at step {step}! Skipping...")
@@ -953,8 +1046,6 @@ def train_vae(cfg: Config = default_config):
                 continue
             
             epoch_loss += float(loss.item())
-            epoch_rec += float(rec_loss.item())
-            epoch_kl += float(kl_loss.item())
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -973,7 +1064,7 @@ def train_vae(cfg: Config = default_config):
 
             global_step += 1
 
-            pbar.set_postfix(loss=epoch_loss / (step + 1), rec=epoch_rec / (step + 1), kl=epoch_kl / (step + 1))
+            pbar.set_postfix(loss=epoch_loss / (step + 1))
 
         if (epoch + 1) % cfg.training.checkpoint_every == 0:
             ctx.save_checkpoint(epoch)
@@ -992,7 +1083,7 @@ def train_vae(cfg: Config = default_config):
                 batch_np_norm = data_stats.normalize(batch_np)
                 x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(device_t)
                 
-                samples = reconstruct_vae(
+                samples = reconstruct_ae(
                     encoder=ema_encoder,
                     decoder=ema_decoder,
                     A_sparse=A_sparse,
@@ -1027,7 +1118,7 @@ def train_vae(cfg: Config = default_config):
                 visualize_event(Gxy, true_xy, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event(Gxy, rec_xy, None, ax=axes[1])
-                axes[1].set_title("VAE reconstruction")
+                axes[1].set_title("AE reconstruction")
                 plt.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_xy.png")
                 plt.close(fig)
@@ -1036,7 +1127,7 @@ def train_vae(cfg: Config = default_config):
                 visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), true_z, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), rec_z, None, ax=axes[1])
-                axes[1].set_title("VAE reconstruction")
+                axes[1].set_title("AE reconstruction")
                 plt.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_z.png")
                 plt.close(fig)
@@ -1044,7 +1135,7 @@ def train_vae(cfg: Config = default_config):
 
 def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
     """Generate interpolations between two events in latent space."""
-    ctx = VAEContext.build(cfg, for_training=False, verbose=True)
+    ctx = AEContext.build(cfg, for_training=False, verbose=True)
     
     latest_ckpt = ctx.latest_checkpoint()
     if latest_ckpt is None:
@@ -1061,7 +1152,7 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
         x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(ctx.device)
         
         x_ref_flat = x_ref.view(2 * ctx.n_nodes, 1)
-        z, _, _, _ = ctx.encoder(x_ref_flat, ctx.A_sparse, ctx.pos, batch_size=2)
+        z, _ = ctx.encoder(x_ref_flat, ctx.A_sparse, ctx.pos, batch_size=2)
         z1, z2 = z[0], z[1]
 
         alphas = torch.linspace(0, 1, n_steps, device=ctx.device)
@@ -1110,4 +1201,4 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
 
 
 if __name__ == "__main__":
-    train_vae(default_config)
+    train_ae(default_config)
