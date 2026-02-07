@@ -47,7 +47,7 @@ class EncoderConfig:
     use_stochastic and kl_weight apply only to DiffAE's encoder.
     decoder_type applies only to Graph AE: "graph" or "mlp".
     """
-    latent_dim: int = 64            # Latent representation dimension
+    latent_dim: int = 4            # Latent representation dimension
     hidden_dim: int = 32            # Hidden dimension in encoder layers
     depth: int = 4                  # Number of pooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
@@ -59,6 +59,8 @@ class EncoderConfig:
     decoder_type: str = "mlp"     # AE decoder: "graph" (SimpleGraphDecoder) or "mlp"
     mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
     mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
+    use_regressive_head: bool = True   # DiffAE: add a second decoder head with regressive (MSE) loss
+    regressive_head_weight: float = 1.0 # DiffAE: weight for the regressive head loss
 
 
 @dataclass
@@ -144,7 +146,7 @@ class TrainingConfig:
     
     # Checkpointing
     checkpoint_every: int = 100     # Save checkpoint every N epochs
-    visualize_every: int = 50      # Generate visualizations every N epochs
+    visualize_every: int = 100      # Generate visualizations every N epochs
     
     # Encoded dataset export (for aux task)
     encode_dataset_every: int = 500    # Export encoded latents every N epochs (0 = disable)
@@ -216,7 +218,7 @@ class Config:
     
     # Runtime flags
     device: Optional[str] = None    # Device override (None = auto-detect)
-    resume: bool = True             # Resume from checkpoint if available
+    resume: bool = False             # Resume from checkpoint if available
     visualize: bool = True          # Generate visualizations during training
 
 

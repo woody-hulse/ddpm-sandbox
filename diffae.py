@@ -346,6 +346,8 @@ class DiffAEContext:
     ema_encoder: Optional[nn.Module] = None
     ema_decoder: Optional[nn.Module] = None
     ema_latent_proj: Optional[nn.Module] = None
+    regressive_decoder: Optional[nn.Module] = None
+    ema_regressive_decoder: Optional[nn.Module] = None
     optim: Optional[torch.optim.Optimizer] = None
     use_ms_data: bool = False
 
@@ -438,9 +440,35 @@ class DiffAEContext:
             pos_dim=cfg.model.pos_dim,
         ).to(device)
 
+        regressive_decoder = None
+        if cfg.encoder.use_regressive_head:
+            from ae import SimpleGraphDecoder, MLPDecoder
+            decoder_type = (getattr(cfg.encoder, "decoder_type", "mlp") or "mlp").lower()
+            if decoder_type == "mlp":
+                regressive_decoder = MLPDecoder(
+                    latent_dim=cfg.encoder.latent_dim,
+                    hidden_dim=cfg.encoder.hidden_dim,
+                    out_dim=cfg.model.out_dim,
+                    n_nodes=n_nodes,
+                    num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
+                    dropout=cfg.encoder.dropout,
+                ).to(device)
+            else:
+                regressive_decoder = SimpleGraphDecoder(
+                    latent_dim=cfg.encoder.latent_dim,
+                    hidden_dim=cfg.encoder.hidden_dim,
+                    out_dim=cfg.model.out_dim,
+                    n_nodes=n_nodes,
+                    depth=cfg.encoder.depth,
+                    blocks_per_stage=cfg.encoder.blocks_per_stage,
+                    dropout=cfg.encoder.dropout,
+                    pos_dim=cfg.model.pos_dim,
+                ).to(device)
+
         ema_encoder = None
         ema_decoder = None
         ema_latent_proj = None
+        ema_regressive_decoder = None
         optim = None
         subdir = cfg.paths.diffae_subdir.format(latent_dim=cfg.encoder.latent_dim)
         checkpoint_dir = os.path.join(cfg.paths.checkpoint_dir, subdir)
@@ -455,6 +483,9 @@ class DiffAEContext:
                 list(decoder.parameters()) + 
                 list(latent_proj.parameters())
             )
+            if regressive_decoder is not None:
+                ema_regressive_decoder = deepcopy(regressive_decoder).to(device)
+                all_params += list(regressive_decoder.parameters())
             optim = torch.optim.AdamW(
                 all_params,
                 lr=cfg.training.lr,
@@ -467,10 +498,13 @@ class DiffAEContext:
             n_enc = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
             n_dec = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
             n_proj = sum(p.numel() for p in latent_proj.parameters() if p.requires_grad)
+            n_reg = sum(p.numel() for p in regressive_decoder.parameters() if p.requires_grad) if regressive_decoder else 0
             print(f"Encoder parameters: {n_enc:,}")
             print(f"Decoder parameters: {n_dec:,}")
             print(f"Latent projection parameters: {n_proj:,}")
-            print(f"Total trainable parameters: {n_enc + n_dec + n_proj:,}")
+            if regressive_decoder:
+                print(f"Regressive decoder parameters: {n_reg:,}")
+            print(f"Total trainable parameters: {n_enc + n_dec + n_proj + n_reg:,}")
 
         return cls(
             cfg=cfg,
@@ -492,6 +526,8 @@ class DiffAEContext:
             ema_encoder=ema_encoder,
             ema_decoder=ema_decoder,
             ema_latent_proj=ema_latent_proj,
+            regressive_decoder=regressive_decoder,
+            ema_regressive_decoder=ema_regressive_decoder,
             optim=optim,
             use_ms_data=use_ms_data,
         )
@@ -512,6 +548,10 @@ class DiffAEContext:
             "epoch": epoch,
             "data_stats": {"mean": self.data_stats.mean, "std": self.data_stats.std},
         }
+        if self.regressive_decoder is not None:
+            state["regressive_decoder"] = self.regressive_decoder.state_dict()
+        if self.ema_regressive_decoder is not None:
+            state["ema_regressive_decoder"] = self.ema_regressive_decoder.state_dict()
         path = os.path.join(self.checkpoint_dir, f"diffae_epoch_{epoch:04d}.pt")
         torch.save(state, path)
         return path
@@ -529,6 +569,10 @@ class DiffAEContext:
             self.ema_latent_proj.load_state_dict(chk["ema_latent_proj"])
         elif self.ema_latent_proj is not None:
             self.ema_latent_proj.load_state_dict(chk["latent_proj"])
+        if self.regressive_decoder is not None and "regressive_decoder" in chk:
+            self.regressive_decoder.load_state_dict(chk["regressive_decoder"])
+        if self.ema_regressive_decoder is not None and "ema_regressive_decoder" in chk:
+            self.ema_regressive_decoder.load_state_dict(chk["ema_regressive_decoder"])
         if load_optim and self.optim is not None and chk.get("optim"):
             self.optim.load_state_dict(chk["optim"])
         if "data_stats" in chk:
@@ -906,8 +950,10 @@ def train_diffae(cfg: Config = default_config):
     encoder = ctx.encoder
     decoder = ctx.decoder
     latent_proj = ctx.latent_proj
+    regressive_decoder = ctx.regressive_decoder
     ema_encoder = ctx.ema_encoder
     ema_decoder = ctx.ema_decoder
+    ema_regressive_decoder = ctx.ema_regressive_decoder
     optim = ctx.optim
     schedule = ctx.schedule
     data_stats = ctx.data_stats
@@ -919,6 +965,7 @@ def train_diffae(cfg: Config = default_config):
     graph = ctx.graph
     tr = ctx.loader
     channel_positions = tr.channel_positions
+    use_regressive = cfg.encoder.use_regressive_head and regressive_decoder is not None
 
     start_epoch = 0
     if cfg.resume:
@@ -956,8 +1003,11 @@ def train_diffae(cfg: Config = default_config):
         encoder.train()
         decoder.train()
         latent_proj.train()
+        if use_regressive:
+            regressive_decoder.train()
         epoch_loss = 0.0
         epoch_kl = 0.0
+        epoch_reg_loss = 0.0
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
@@ -1014,7 +1064,14 @@ def train_diffae(cfg: Config = default_config):
                 mse_per_sample = mse_per_sample * weight
 
             loss = mse_per_sample.mean()
-            
+
+            if use_regressive:
+                reg_flat = regressive_decoder(z, A_sparse, pos, batch_size=B)
+                reg_pred = reg_flat.view(B, n_nodes, 1)
+                reg_loss = F.mse_loss(reg_pred, x0, reduction='mean')
+                loss = loss + cfg.encoder.regressive_head_weight * reg_loss
+                epoch_reg_loss += reg_loss.item()
+
             if cfg.encoder.use_stochastic and mu is not None and logvar is not None:
                 kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                 loss = loss + cfg.encoder.kl_weight * kl_loss
@@ -1030,10 +1087,10 @@ def train_diffae(cfg: Config = default_config):
             optim.zero_grad(set_to_none=True)
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(decoder.parameters()) + list(latent_proj.parameters()),
-                max_norm=cfg.training.grad_clip
-            )
+            clip_params = list(encoder.parameters()) + list(decoder.parameters()) + list(latent_proj.parameters())
+            if use_regressive:
+                clip_params += list(regressive_decoder.parameters())
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=cfg.training.grad_clip)
             optim.step()
 
             with torch.no_grad():
@@ -1043,13 +1100,18 @@ def train_diffae(cfg: Config = default_config):
                     p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
                 for p_ema, p in zip(ctx.ema_latent_proj.parameters(), latent_proj.parameters()):
                     p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
+                if use_regressive:
+                    for p_ema, p in zip(ema_regressive_decoder.parameters(), regressive_decoder.parameters()):
+                        p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
 
             global_step += 1
 
+            postfix = {"loss": epoch_loss / (step + 1)}
             if cfg.encoder.use_stochastic:
-                pbar.set_postfix(loss=epoch_loss / (step + 1), kl=epoch_kl / (step + 1))
-            else:
-                pbar.set_postfix(loss=epoch_loss / (step + 1))
+                postfix["kl"] = epoch_kl / (step + 1)
+            if use_regressive:
+                postfix["reg"] = epoch_reg_loss / (step + 1)
+            pbar.set_postfix(**postfix)
 
         if (epoch + 1) % cfg.training.checkpoint_every == 0:
             ctx.save_checkpoint(epoch)
