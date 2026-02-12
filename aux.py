@@ -865,23 +865,30 @@ def evaluate_aux_model_graph_ae(
     return mae, rmse, all_preds, all_targets
 
 
+MODEL_PALETTE = ['#6C9BC4', '#E8907E', '#7DBCB0', '#9B8DC4', '#D4A96A', '#C47D7D']
+PLOT_DPI = 300
+
+
+def _color_map(names):
+    return {n: MODEL_PALETTE[i % len(MODEL_PALETTE)] for i, n in enumerate(names)}
+
+
 def plot_results(results: Dict[str, AuxTrainingResult], output_dir: str):
-    """Plot comparison of different models (separate figures, coordinated colors)."""
+    """Plot comparison of different models."""
     os.makedirs(output_dir, exist_ok=True)
     names = list(results.keys())
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(names), 10)))[:len(names)]
-    color_map = {n: colors[i] for i, n in enumerate(names)}
+    cmap = _color_map(names)
 
     fig1, ax1 = plt.subplots(figsize=(6, 4))
     for name, res in results.items():
-        ax1.plot(res.val_losses, color=color_map[name], label=name)
+        ax1.plot(res.val_losses, color=cmap[name], label=name)
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Validation MSE Loss')
     ax1.set_title('Validation Loss')
     ax1.legend()
     ax1.set_yscale('log')
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/aux_validation_loss_epoch.png', dpi=150)
+    plt.savefig(f'{output_dir}/aux_validation_loss_epoch.png', dpi=PLOT_DPI)
     plt.close()
 
     has_times = any(getattr(r, 'val_times', None) is not None and len(getattr(r, 'val_times', [])) == len(r.val_losses) for r in results.values())
@@ -890,43 +897,50 @@ def plot_results(results: Dict[str, AuxTrainingResult], output_dir: str):
         for name, res in results.items():
             times = getattr(res, 'val_times', None)
             if times is not None and len(times) == len(res.val_losses):
-                ax1b.plot(times, res.val_losses, color=color_map[name], label=name)
+                ax1b.plot(times, res.val_losses, color=cmap[name], label=name)
         ax1b.set_xlabel('Time (s)')
         ax1b.set_ylabel('Validation MSE Loss')
         ax1b.set_title('Validation Loss vs Time')
         ax1b.legend()
         ax1b.set_yscale('log')
         plt.tight_layout()
-        plt.savefig(f'{output_dir}/aux_validation_loss_time.png', dpi=150)
+        plt.savefig(f'{output_dir}/aux_validation_loss_time.png', dpi=PLOT_DPI)
         plt.close()
 
     fig2, ax2 = plt.subplots(figsize=(6, 4))
     x = np.arange(len(names))
     width = 0.35
     for i, n in enumerate(names):
-        c = color_map[n]
+        c = cmap[n]
         ax2.bar(x[i] - width/2, results[n].test_mae, width, color=c, alpha=0.9)
-        ax2.bar(x[i] + width/2, results[n].test_rmse, width, color=c, alpha=0.5)
+        ax2.bar(x[i] + width/2, results[n].test_rmse, width, color=c, alpha=0.45)
     ax2.set_xticks(x)
     ax2.set_xticklabels(names, rotation=15)
     ax2.set_ylabel('Error (ns)')
     ax2.set_title('Test Set Performance')
     ax2.legend(
-        [Patch(facecolor='gray', alpha=0.9), Patch(facecolor='gray', alpha=0.5)],
+        [Patch(facecolor='gray', alpha=0.9), Patch(facecolor='gray', alpha=0.45)],
         ['MAE', 'RMSE'],
         framealpha=0.9,
     )
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/aux_test_performance.png', dpi=150)
+    plt.savefig(f'{output_dir}/aux_test_performance.png', dpi=PLOT_DPI)
     plt.close()
 
     n_models = len(names)
     fig3, axes = plt.subplots(2, n_models, figsize=(4 * n_models, 7), squeeze=False)
-    
+
     all_vals = np.concatenate([r.targets for r in results.values()] +
                                [r.predictions for r in results.values()])
     lims = [all_vals.min() - 10, all_vals.max() + 10]
-    
+
+    all_residuals_list = []
+    for name, res in results.items():
+        all_residuals_list.append(res.predictions - res.targets)
+    resid_concat = np.concatenate(all_residuals_list)
+    resid_xlim = max(abs(resid_concat.min()), abs(resid_concat.max())) * 1.05
+    resid_bins = np.linspace(-resid_xlim, resid_xlim, 51)
+
     for i, (name, res) in enumerate(results.items()):
         ax_scatter = axes[0, i]
         ax_scatter.hexbin(res.targets, res.predictions, gridsize=30, cmap='Blues', mincnt=1)
@@ -937,43 +951,51 @@ def plot_results(results: Dict[str, AuxTrainingResult], output_dir: str):
         ax_scatter.set_ylabel('Predicted Δμ (ns)')
         ax_scatter.set_title(f'{name}\nMAE={res.test_mae:.1f} ns')
         ax_scatter.set_aspect('equal', adjustable='box')
-        
+
         ax_resid = axes[1, i]
         residuals = res.predictions - res.targets
-        ax_resid.hist(residuals, bins=50, color=color_map[name], alpha=0.7, edgecolor='white')
-        ax_resid.axvline(0, color='red', linestyle='--', linewidth=1.5)
+        ax_resid.hist(residuals, bins=resid_bins, color=cmap[name], alpha=0.7, edgecolor='white', linewidth=0.5)
+        ax_resid.axvline(0, color='r', linestyle='--', linewidth=1.5)
         ax_resid.axvline(np.mean(residuals), color='black', linestyle='-', linewidth=1.5, label=f'μ={np.mean(residuals):.1f}')
         ax_resid.set_xlabel('Residual (Pred - True) (ns)')
         ax_resid.set_ylabel('Count')
         ax_resid.set_title(f'σ={np.std(residuals):.1f} ns')
+        ax_resid.set_xlim(-resid_xlim, resid_xlim)
         ax_resid.legend(fontsize=8)
-    
+
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/aux_predictions_vs_truth.png', dpi=150)
+    plt.savefig(f'{output_dir}/aux_predictions_vs_truth.png', dpi=PLOT_DPI)
     plt.close()
-    
+
     fig4, ax4 = plt.subplots(figsize=(8, 5))
     positions = np.arange(len(names))
     all_residuals = []
     for name, res in results.items():
         all_residuals.append(np.abs(res.predictions - res.targets))
-    
-    bp = ax4.boxplot(all_residuals, positions=positions, widths=0.6, patch_artist=True)
-    for patch, name in zip(bp['boxes'], names):
-        patch.set_facecolor(color_map[name])
-        patch.set_alpha(0.7)
+
+    vp = ax4.violinplot(all_residuals, positions=positions, widths=0.7, showmeans=True, showmedians=True)
+    for j, body in enumerate(vp['bodies']):
+        body.set_facecolor(cmap[names[j]])
+        body.set_edgecolor(cmap[names[j]])
+        body.set_alpha(0.6)
+    for partname in ('cmeans', 'cmedians', 'cmins', 'cmaxes', 'cbars'):
+        if partname in vp:
+            vp[partname].set_edgecolor('#333333')
+            vp[partname].set_linewidth(1.0)
+
     ax4.set_xticks(positions)
     ax4.set_xticklabels(names)
     ax4.set_ylabel('Absolute Error (ns)')
     ax4.set_title('Error Distribution Comparison')
     ax4.grid(axis='y', alpha=0.3)
-    
+
     for i, (name, res) in enumerate(results.items()):
-        ax4.annotate(f'MAE={res.test_mae:.1f}', (i, res.test_mae), 
-                     textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9)
-    
+        violin_max = float(all_residuals[i].max())
+        ax4.annotate(f'MAE={res.test_mae:.1f}', (i, violin_max),
+                     textcoords="offset points", xytext=(0, 8), ha='center', fontsize=9)
+
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/aux_error_distribution.png', dpi=150)
+    plt.savefig(f'{output_dir}/aux_error_distribution.png', dpi=PLOT_DPI)
     plt.close()
 
     print(f"\nResults saved to {output_dir}/")
@@ -981,7 +1003,7 @@ def plot_results(results: Dict[str, AuxTrainingResult], output_dir: str):
     print("  - aux_validation_loss_time.png")
     print("  - aux_test_performance.png")
     print("  - aux_predictions_vs_truth.png (hexbin + residual histograms)")
-    print("  - aux_error_distribution.png (box plots)")
+    print("  - aux_error_distribution.png (violin plots)")
     print("\n" + "="*50)
     print("Summary")
     print("="*50)
@@ -1539,7 +1561,7 @@ def plot_latent_size_comparison(
     
     plt.tight_layout()
     plot_path = os.path.join(output_dir, f'latent_size_comparison_{metric}.png')
-    plt.savefig(plot_path, dpi=150)
+    plt.savefig(plot_path, dpi=PLOT_DPI)
     plt.close()
     
     print(f"\nPlot saved to {plot_path}")

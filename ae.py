@@ -234,6 +234,8 @@ class MLPEncoder(nn.Module):
     """
     MLP encoder: flattens input and maps to latent. No graph structure used.
     Same interface as GraphAEEncoder for drop-in use.
+
+    Architecture: n_nodes*in_dim → 1024 → 512 → latent_dim
     """
     def __init__(
         self,
@@ -250,14 +252,16 @@ class MLPEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.n_nodes = n_nodes
 
-        layers = []
         input_size = n_nodes * in_dim
+        hidden_sizes = [1024, 512]
+
+        layers = []
         in_d = input_size
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(in_d, hidden_dim))
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_d, h))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            in_d = hidden_dim
+            in_d = h
         layers.append(nn.Linear(in_d, latent_dim))
         self.mlp = nn.Sequential(*layers)
         self.reset_parameters()
@@ -515,6 +519,8 @@ class MLPDecoder(nn.Module):
     """
     MLP decoder: latent z -> MLP -> (B*N, out_dim). No graph or position.
     Same interface as SimpleGraphDecoder for drop-in use.
+
+    Architecture: latent_dim → 512 → 1024 → n_nodes*out_dim
     """
     def __init__(
         self,
@@ -531,13 +537,15 @@ class MLPDecoder(nn.Module):
         self.out_dim = out_dim
         self.n_nodes = n_nodes
 
+        hidden_sizes = [512, 1024]
+
         layers = []
         in_d = latent_dim
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(in_d, hidden_dim))
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_d, h))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            in_d = hidden_dim
+            in_d = h
         layers.append(nn.Linear(in_d, n_nodes * out_dim))
         self.mlp = nn.Sequential(*layers)
         self.reset_parameters()

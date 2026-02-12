@@ -77,6 +77,8 @@ class MLPEncoder(nn.Module):
     """
     MLP encoder: flattens input and maps to latent. No graph structure used.
     Same interface as GraphEncoder for drop-in use.
+
+    Architecture: n_nodes*in_dim → 1024 → 512 → latent_dim
     """
     def __init__(
         self,
@@ -95,21 +97,24 @@ class MLPEncoder(nn.Module):
         self.n_nodes = n_nodes
         self.use_stochastic = use_stochastic
 
-        layers = []
         input_size = n_nodes * in_dim
+        hidden_sizes = [1024, 512]
+
+        layers = []
         in_d = input_size
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(in_d, hidden_dim))
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_d, h))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            in_d = hidden_dim
+            in_d = h
         self.backbone = nn.Sequential(*layers)
 
+        backbone_out = hidden_sizes[-1]
         if use_stochastic:
-            self.to_mu = nn.Linear(hidden_dim, latent_dim)
-            self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+            self.to_mu = nn.Linear(backbone_out, latent_dim)
+            self.to_logvar = nn.Linear(backbone_out, latent_dim)
         else:
-            self.to_latent = nn.Linear(hidden_dim, latent_dim)
+            self.to_latent = nn.Linear(backbone_out, latent_dim)
 
         self.reset_parameters()
 

@@ -119,6 +119,14 @@ RQ_UNITS = {
 }
 
 
+MODEL_PALETTE = ['#6C9BC4', '#E8907E', '#7DBCB0', '#9B8DC4', '#D4A96A', '#C47D7D']
+PLOT_DPI = 300
+
+
+def _color_map(names):
+    return {n: MODEL_PALETTE[i % len(MODEL_PALETTE)] for i, n in enumerate(names)}
+
+
 def plot_rq_comparison(
     rq_true: Dict[str, np.ndarray],
     rq_models: Dict[str, Dict[str, np.ndarray]],
@@ -132,8 +140,7 @@ def plot_rq_comparison(
 
     model_names = list(rq_models.keys())
     n_models = len(model_names)
-    colors = plt.cm.tab10(np.linspace(0, 1, max(n_models, 10)))[:n_models]
-    color_map = {name: colors[i] for i, name in enumerate(model_names)}
+    cmap = _color_map(model_names)
 
     rq_names = list(rq_true.keys())
 
@@ -154,6 +161,15 @@ def plot_rq_comparison(
             continue
         margin = 0.05 * (np.nanmax(all_concat[valid]) - np.nanmin(all_concat[valid]) + 1e-8)
         lims = [np.nanmin(all_concat[valid]) - margin, np.nanmax(all_concat[valid]) + margin]
+
+        all_residuals_rq = []
+        for mname in model_names:
+            pred_vals = rq_models[mname][rq_name]
+            mask = np.isfinite(true_vals) & np.isfinite(pred_vals)
+            all_residuals_rq.append(pred_vals[mask] - true_vals[mask])
+        resid_concat = np.concatenate(all_residuals_rq) if all_residuals_rq else np.array([0.0])
+        resid_xlim = max(abs(resid_concat.min()), abs(resid_concat.max())) * 1.05 if len(resid_concat) > 0 else 1.0
+        resid_bins = np.linspace(-resid_xlim, resid_xlim, 51)
 
         for i, mname in enumerate(model_names):
             pred_vals = rq_models[mname][rq_name]
@@ -181,8 +197,8 @@ def plot_rq_comparison(
             ax_hex.set_aspect('equal', adjustable='box')
 
             ax_res = axes[1, i]
-            ax_res.hist(residuals, bins=50, color=color_map[mname], alpha=0.7, edgecolor='white')
-            ax_res.axvline(0, color='red', linestyle='--', linewidth=1.5)
+            ax_res.hist(residuals, bins=resid_bins, color=cmap[mname], alpha=0.7, edgecolor='white', linewidth=0.5)
+            ax_res.axvline(0, color='r', linestyle='--', linewidth=1.5)
             mu_r = float(np.mean(residuals))
             sigma_r = float(np.std(residuals))
             ax_res.axvline(mu_r, color='black', linestyle='-', linewidth=1.5,
@@ -190,15 +206,16 @@ def plot_rq_comparison(
             ax_res.set_xlabel(f'Residual ({unit})')
             ax_res.set_ylabel('Count')
             ax_res.set_title(f'σ={sigma_r:.2f}')
+            ax_res.set_xlim(-resid_xlim, resid_xlim)
             ax_res.legend(fontsize=8)
 
         fig.suptitle(display_name, fontsize=14, fontweight='bold', y=1.01)
         plt.tight_layout()
-        fig.savefig(os.path.join(output_dir, f'rq_{rq_name}.png'), dpi=150, bbox_inches='tight')
+        fig.savefig(os.path.join(output_dir, f'rq_{rq_name}.png'), dpi=PLOT_DPI, bbox_inches='tight')
         plt.close(fig)
 
-    fig_box, axes_box = plt.subplots(2, 4, figsize=(18, 8))
-    axes_flat = axes_box.flatten()
+    fig_vio, axes_vio = plt.subplots(2, 4, figsize=(18, 8))
+    axes_flat = axes_vio.flatten()
 
     for idx, rq_name in enumerate(rq_names):
         if idx >= len(axes_flat):
@@ -209,18 +226,37 @@ def plot_rq_comparison(
 
         data_list = []
         labels = []
+        mae_vals = []
         for mname in model_names:
             pred = rq_models[mname][rq_name]
             residuals = pred - rq_true[rq_name]
-            valid = np.isfinite(residuals)
-            data_list.append(np.abs(residuals[valid]))
+            valid_mask = np.isfinite(residuals)
+            abs_err = np.abs(residuals[valid_mask])
+            data_list.append(abs_err)
             labels.append(mname)
+            mae_vals.append(float(np.mean(abs_err)) if len(abs_err) > 0 else 0.0)
 
         if any(len(d) > 0 for d in data_list):
-            bp = ax.boxplot(data_list, labels=labels, patch_artist=True, widths=0.6)
-            for patch, mname in zip(bp['boxes'], model_names):
-                patch.set_facecolor(color_map[mname])
-                patch.set_alpha(0.7)
+            positions = np.arange(len(data_list))
+            vp = ax.violinplot(data_list, positions=positions, widths=0.7,
+                               showmeans=True, showmedians=True)
+            for j, body in enumerate(vp['bodies']):
+                body.set_facecolor(cmap[model_names[j]])
+                body.set_edgecolor(cmap[model_names[j]])
+                body.set_alpha(0.6)
+            for partname in ('cmeans', 'cmedians', 'cmins', 'cmaxes', 'cbars'):
+                if partname in vp:
+                    vp[partname].set_edgecolor('#333333')
+                    vp[partname].set_linewidth(1.0)
+            ax.set_xticks(positions)
+            ax.set_xticklabels(labels)
+
+            for j, d in enumerate(data_list):
+                if len(d) > 0:
+                    violin_max = float(d.max())
+                    ax.annotate(f'MAE={mae_vals[j]:.2f}', (j, violin_max),
+                                textcoords="offset points", xytext=(0, 8),
+                                ha='center', fontsize=7)
 
         ax.set_title(display_name, fontsize=10, fontweight='bold')
         ax.set_ylabel(f'|Error| ({unit})')
@@ -231,8 +267,8 @@ def plot_rq_comparison(
 
     plt.suptitle('Absolute Error Distribution per RQ', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    fig_box.savefig(os.path.join(output_dir, 'rq_error_summary.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig_box)
+    fig_vio.savefig(os.path.join(output_dir, 'rq_error_summary.png'), dpi=PLOT_DPI, bbox_inches='tight')
+    plt.close(fig_vio)
 
     print(f"\nPlots saved to {output_dir}/")
     for rq_name in rq_names:
@@ -283,15 +319,15 @@ def plot_example_reconstructions(
         y_max = z_raw.max() * 1.15
         ax.set_ylim(0, max(y_max, 1))
 
+        model_cmap = _color_map(list(models.keys()))
         for col_offset, (mname, rec_data) in enumerate(models.items(), start=1):
             z_rec = wf_to_z_profile(rec_data[idx], n_channels, n_time)
+            mc = model_cmap[mname]
 
             ax = axes[row, col_offset]
             ax.plot(time_axis, z_raw, color='black', linewidth=1, alpha=0.4, label='Raw')
-            ax.plot(time_axis, z_rec, color='C0' if mname == 'AE' else 'C1',
-                    linewidth=1.5, label=mname)
-            ax.fill_between(time_axis, z_rec, alpha=0.15,
-                            color='C0' if mname == 'AE' else 'C1')
+            ax.plot(time_axis, z_rec, color=mc, linewidth=1.5, label=mname)
+            ax.fill_between(time_axis, z_rec, alpha=0.2, color=mc)
             if row == 0:
                 ax.set_title(mname, fontweight='bold')
             if row == len(indices) - 1:
@@ -301,7 +337,7 @@ def plot_example_reconstructions(
 
     plt.suptitle('Example Z-Profile Reconstructions', fontsize=14, fontweight='bold', y=1.01)
     plt.tight_layout()
-    fig.savefig(os.path.join(output_dir, 'example_z_profiles.png'), dpi=150, bbox_inches='tight')
+    fig.savefig(os.path.join(output_dir, 'example_z_profiles.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig)
 
     fig2, axes2 = plt.subplots(len(indices), n_cols, figsize=(4 * n_cols, 2.2 * len(indices)),
@@ -331,7 +367,7 @@ def plot_example_reconstructions(
     plt.suptitle('Example 2D Waveform Reconstructions (channel × time)', fontsize=14,
                  fontweight='bold', y=1.01)
     plt.tight_layout()
-    fig2.savefig(os.path.join(output_dir, 'example_heatmaps.png'), dpi=150, bbox_inches='tight')
+    fig2.savefig(os.path.join(output_dir, 'example_heatmaps.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig2)
 
     print(f"  - example_z_profiles.png ({len(indices)} examples)")
@@ -352,6 +388,7 @@ def main():
     args = parser.parse_args()
 
     cfg = default_config
+    cfg.conditioning.cond_proj_dim = max(cfg.conditioning.cond_proj_dim, cfg.encoder.latent_dim)
     device = torch.device(cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f"Device: {device}")
     print(f"Samples: {args.n_samples}")

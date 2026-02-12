@@ -47,7 +47,7 @@ class EncoderConfig:
     use_stochastic and kl_weight apply only to DiffAE's encoder.
     decoder_type applies only to Graph AE: "graph" or "mlp".
     """
-    latent_dim: int = 4            # Latent representation dimension
+    latent_dim: int = 64            # Latent representation dimension
     hidden_dim: int = 32            # Hidden dimension in encoder layers
     depth: int = 4                  # Number of pooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
@@ -139,7 +139,7 @@ class TrainingConfig:
     epochs: int = 10_000            # Total training epochs
     batch_size: int = 8             # Batch size
     steps_per_epoch: int = 64       # Gradient steps per epoch
-    lr: float = 2e-3                # Learning rate
+    lr: float = 1e-3                # Learning rate
     weight_decay: float = 0         # AdamW weight decay
     ema_decay: float = 0.999        # Exponential moving average decay
     grad_clip: float = 1.0          # Gradient clipping norm
