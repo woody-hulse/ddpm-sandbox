@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 
 from config import Config, default_config, get_config
 from ae import AEContext, reconstruct_ae
-from diffae import DiffAEContext, sample_diffae
+from diffae import DiffAEContext, sample_diffae, apply_lopsided_augmentation
 from compare_rqs import wf_to_z_profile
 
 
@@ -31,7 +31,7 @@ def load_events(cfg: Config, indices: np.ndarray) -> np.ndarray:
     Returns (len(indices), N, 1) array of raw waveforms.
     """
     ctx = AEContext.build(cfg, for_training=False, verbose=False)
-    batch_np, cond = ctx.loader.get_batch(len(indices))
+    batch_np, cond, *_ = ctx.loader.get_batch(len(indices))
     return batch_np, cond, ctx
 
 
@@ -95,7 +95,9 @@ def cmd_view(args):
     cfg = default_config
     np.random.seed(args.seed)
     ctx = AEContext.build(cfg, for_training=False, verbose=False)
-    batch_np, cond = ctx.loader.get_batch(args.n)
+    batch_np, cond, *_ = ctx.loader.get_batch(args.n)
+    if args.lopsided:
+        batch_np = apply_lopsided_augmentation(batch_np, frac=1.0, sigma=args.lopsided_sigma)
     n_channels = ctx.n_channels
     n_time = ctx.n_time_points
 
@@ -121,9 +123,13 @@ def cmd_view(args):
         r, c = divmod(i, cols)
         axes[r, c].set_visible(False)
 
-    fig.suptitle(f"Random MS Events (seed={args.seed})", fontweight="bold")
+    title = f"Random MS Events (seed={args.seed})"
+    if args.lopsided:
+        title += f"  [lopsided σ={args.lopsided_sigma}]"
+    fig.suptitle(title, fontweight="bold")
     fig.tight_layout()
-    out = os.path.join(args.output_dir, "view_events.png")
+    suffix = f"_lopsided_s{args.lopsided_sigma}" if args.lopsided else ""
+    out = os.path.join(args.output_dir, f"view_events{suffix}.png")
     os.makedirs(args.output_dir, exist_ok=True)
     fig.savefig(out, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -135,10 +141,13 @@ def cmd_compress(args):
     np.random.seed(args.seed)
     ctx_ref = AEContext.build(cfg, for_training=False, verbose=False)
     n_needed = args.compress + 1
-    batch_np, cond = ctx_ref.loader.get_batch(n_needed)
+    batch_np, cond, *_ = ctx_ref.loader.get_batch(n_needed)
     n_channels = ctx_ref.n_channels
     n_time = ctx_ref.n_time_points
     time_axis = np.arange(n_time)
+
+    if args.lopsided:
+        batch_np = apply_lopsided_augmentation(batch_np, frac=1.0, sigma=args.lopsided_sigma)
 
     idx = args.compress
     wf_single = batch_np[idx: idx + 1]
@@ -192,10 +201,13 @@ def cmd_compress(args):
         ax.set_ylim(0, y_max)
         ax.legend(fontsize=8, loc="upper right")
 
-    fig.suptitle(f"Event {idx}  (seed={args.seed}, latent_dim={cfg.encoder.latent_dim})",
-                 fontweight="bold")
+    title = f"Event {idx}  (seed={args.seed}, latent_dim={cfg.encoder.latent_dim})"
+    if args.lopsided:
+        title += f"  [lopsided σ={args.lopsided_sigma}]"
+    fig.suptitle(title, fontweight="bold")
     fig.tight_layout()
-    out = os.path.join(args.output_dir, f"compress_event{idx}_{model_arg}_z{cfg.encoder.latent_dim}.png")
+    suffix = f"_lopsided_s{args.lopsided_sigma}" if args.lopsided else ""
+    out = os.path.join(args.output_dir, f"compress_event{idx}_{model_arg}_z{cfg.encoder.latent_dim}{suffix}.png")
     os.makedirs(args.output_dir, exist_ok=True)
     fig.savefig(out, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -213,6 +225,10 @@ def main():
                         help="Latent dim (default: from config)")
     parser.add_argument("--n", type=int, default=8, help="Number of events for --view")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed for reproducible events")
+    parser.add_argument("--lopsided", action="store_true",
+                        help="Gaussian-blur the first half of each event")
+    parser.add_argument("--lopsided-sigma", type=float, default=3.0,
+                        help="Gaussian kernel sigma for --lopsided (default: 3.0)")
     parser.add_argument("--output-dir", type=str, default="event_plots")
     args = parser.parse_args()
 

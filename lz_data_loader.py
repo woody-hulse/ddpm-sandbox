@@ -597,7 +597,7 @@ class TritiumSSDataLoader:
         )
         # return create_3d_adjacency_matrix_sparse(self.channel_positions, num_layers=self.n_time_points, z_sep=z_sep, radius=radius, weighted=weighted).coalesce()
 
-    def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         idx = np.random.randint(0, self.n_samples, size=batch_size, dtype=np.int64)
         # h5py requires strictly increasing indices; load unique sorted, then reconstruct
         uniq_idx, inverse = np.unique(idx, return_inverse=True)
@@ -615,7 +615,7 @@ class TritiumSSDataLoader:
         # Column-order (layer-major) flatten: (C,T) -> (T*C,1)
         wf_col = np.transpose(wf, (0, 2, 1)).reshape(batch_size, -1, 1).astype(np.float32)
         cond = np.stack([xc, yc, dt, intensities, np.zeros_like(intensities)], axis=1)
-        return wf_col, cond
+        return wf_col, cond, idx
 
     def batcher(self, batch_size: int):
         while True:
@@ -674,12 +674,13 @@ class OnlineMSBatcher:
     def load_adjacency_sparse(self, z_sep: float = 10.0, radius: float = 20.0, weighted: bool = False, z_hops: int = 4):
         return self.ss_loader.load_adjacency_sparse(z_sep=z_sep, radius=radius, weighted=weighted, z_hops=z_hops)
 
-    def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Get a batch of MS events generated on-the-fly.
         
         Returns:
             wf_col: (B, N, 1) waveforms in layer-major order
             cond: (B, 6) conditions [xc1, yc1, xc2, yc2, delta_mu, delta_bins]
+            idx1: (B,) primary SS indices (for deterministic augmentation)
         """
         idx1 = self._rng.integers(0, self.n_samples, size=batch_size)
         idx2 = self._rng.integers(0, self.n_samples, size=batch_size)
@@ -721,7 +722,7 @@ class OnlineMSBatcher:
         delta_mu = delta_bins.astype(np.float32) * self.ns_per_bin
         cond = np.stack([xc1, yc1, xc2, yc2, delta_mu, delta_bins.astype(np.float32)], axis=1)
         
-        return wf_col, cond
+        return wf_col, cond, idx1
 
     def batcher(self, batch_size: int):
         while True:

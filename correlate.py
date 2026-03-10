@@ -444,7 +444,7 @@ def generate_samples(
         if current_batch <= 0:
             break
             
-        batch_np, batch_cond = data_loader.get_batch(current_batch)
+        batch_np, batch_cond, *_ = data_loader.get_batch(current_batch)
         batch_cond_t = torch.from_numpy(batch_cond.astype(np.float32)).to(device)
         
         batch_np_std = standardize_batch(batch_np)
@@ -881,7 +881,7 @@ def run_real_vs_real_analysis(
         if remaining <= 0:
             break
         current_batch = min(batch_size, remaining)
-        batch_data, batch_cond = data_loader.get_batch(current_batch)
+        batch_data, batch_cond, *_ = data_loader.get_batch(current_batch)
         for i in range(current_batch):
             all_data.append(batch_data[i])
             all_cond.append(batch_cond[i])

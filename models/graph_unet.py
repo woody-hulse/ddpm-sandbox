@@ -39,9 +39,9 @@ class FiLMFromCond(nn.Module):
             cond = cond.unsqueeze(0)
         film = self.mlp(cond)  # (B, num_layers * 2 * hidden_dim)
         film = film.view(batch_size, self.num_layers, 2, self.hidden_dim)
-        gamma, beta = film[:, :, 0, :], film[:, :, 1, :]  # (B, num_layers, hidden_dim)
-        gamma = 1.0 + 0.5 * torch.tanh(gamma)  # Bounded to [0.5, 1.5]
-        beta = torch.tanh(beta)  # Bounded to [-1, 1]
+        gamma_raw, beta_raw = film[:, :, 0, :], film[:, :, 1, :]
+        gamma = 1.0 + torch.tanh(gamma_raw) * 2.0
+        beta = torch.tanh(beta_raw) * 2.0
         return gamma, beta
 
 
@@ -80,9 +80,9 @@ class GraphResBlock(nn.Module):
         # Conditioning with bounded scale
         cond_out = self.cond_proj(cond)
         cond_scale, cond_shift = cond_out.chunk(2, dim=-1)
-        cond_scale = torch.sigmoid(cond_scale) + 0.5  # Range [0.5, 1.5]
-        
-        # Transform
+        cond_scale = 1.0 + torch.tanh(cond_scale) * 2.0
+        cond_shift = torch.tanh(cond_shift) * 2.0
+
         h = self.lin1(h)
         h = h * cond_scale + cond_shift
         h = self.act(h)
@@ -195,11 +195,13 @@ class GraphDDPMUNet(nn.Module):
         cache_norm_top: bool = True,
         pos_dim: int = 3,
         pos_dropout: float = 0.0,
+        skip_scale: float = 1.0,
     ):
         super().__init__()
         assert 0 < pool_ratio <= 1.0
         self.in_dim = in_dim
         self.cond_dim = cond_dim
+        self.skip_scale = skip_scale
         self.hidden_dim = hidden_dim
         self.depth = depth
         self.blocks_per_stage = blocks_per_stage
@@ -238,7 +240,7 @@ class GraphDDPMUNet(nn.Module):
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, self.out_dim)
 
-        self.film = FiLMFromCond(cond_dim, hidden_dim, num_layers=self.total_blocks, width=max(512, 2 * hidden_dim))
+        self.film = FiLMFromCond(cond_dim, hidden_dim, num_layers=self.total_blocks, width=512)
 
         self.cache_norm_top = cache_norm_top
         self._cached_key = None
@@ -321,7 +323,6 @@ class GraphDDPMUNet(nn.Module):
         h = h + self.pos_drop(pos_emb)
         
         cond_emb = self.cond_mlp(cond)  # (B, hidden_dim)
-        cond_expanded = cond.repeat_interleave(N_single, dim=0)  # (B*N, cond_dim)
         cond_emb_expanded = cond_emb.repeat_interleave(N_single, dim=0)  # (B*N, hidden_dim)
         h = h + cond_emb_expanded
 
@@ -348,7 +349,7 @@ class GraphDDPMUNet(nn.Module):
         for d in reversed(range(self.depth)):
             h_skip, keep_idx, N_prev, npg_prev = skips[d]
             h_up = _unpool_like(h_cur, keep_idx, N_prev)
-            h_cur = h_up + h_skip
+            h_cur = h_up + self.skip_scale * h_skip
             adj_prev = adjs[d]
             nodes_per_graph = npg_prev
             cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)

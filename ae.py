@@ -29,7 +29,7 @@ DataLoaderType = Union[TritiumSSDataLoader, OnlineMSBatcher]
 
 from diffae import (
     GraphEncoder, GraphEncoderStage, GraphEncoderBlock,
-    DiffAEDataStats, visualize_event_3d
+    DiffAEDataStats, visualize_event_3d, apply_lopsided_augmentation,
 )
 from models.graph_unet import (
     TopKPool, build_block_diagonal_adj, _unpool_like
@@ -230,12 +230,59 @@ class GraphDecoder(nn.Module):
         return out
 
 
+class Conv1DEncoder(nn.Module):
+    """
+    1D CNN encoder for AE: processes waveforms with convolutions to capture
+    local texture features. Same interface as MLPEncoder/GraphAEEncoder.
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        latent_dim: int,
+        n_nodes: int,
+        dropout: float = 0.0,
+        channels: tuple = (32, 64, 128),
+        kernel_size: int = 7,
+        pool_size: int = 4,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.latent_dim = latent_dim
+        self.n_nodes = n_nodes
+        conv_layers = []
+        ch_in = in_dim
+        for ch_out in channels:
+            conv_layers.extend([
+                nn.Conv1d(ch_in, ch_out, kernel_size, padding=kernel_size // 2),
+                nn.SiLU(),
+                nn.AvgPool1d(pool_size),
+                nn.Dropout(dropout),
+            ])
+            ch_in = ch_out
+        conv_layers.append(nn.AdaptiveAvgPool1d(4))
+        conv_layers.append(nn.Flatten())
+        self.backbone = nn.Sequential(*conv_layers)
+        self.to_latent = nn.Linear(channels[-1] * 4, latent_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
+        B = batch_size
+        N = x.shape[0] // B
+        x_2d = x.view(B, N, self.in_dim).permute(0, 2, 1)
+        h = self.backbone(x_2d)
+        z = self.to_latent(h)
+        return z, []
+
+
 class MLPEncoder(nn.Module):
     """
     MLP encoder: flattens input and maps to latent. No graph structure used.
     Same interface as GraphAEEncoder for drop-in use.
-
-    Architecture: n_nodes*in_dim → 1024 → 512 → latent_dim
     """
     def __init__(
         self,
@@ -252,16 +299,21 @@ class MLPEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.n_nodes = n_nodes
 
-        input_size = n_nodes * in_dim
-        hidden_sizes = [1024, 512]
-
         layers = []
+        input_size = n_nodes * in_dim
+        n_hidden = num_layers - 1
+        if n_hidden <= 0:
+            layer_sizes = []
+        else:
+            ratio = (latent_dim / input_size) ** (1.0 / n_hidden)
+            layer_sizes = [max(latent_dim, int(round(input_size * ratio ** i))) for i in range(1, n_hidden + 1)]
+
         in_d = input_size
-        for h in hidden_sizes:
-            layers.append(nn.Linear(in_d, h))
+        for out_d in layer_sizes:
+            layers.append(nn.Linear(in_d, out_d))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            in_d = h
+            in_d = out_d
         layers.append(nn.Linear(in_d, latent_dim))
         self.mlp = nn.Sequential(*layers)
         self.reset_parameters()
@@ -519,8 +571,6 @@ class MLPDecoder(nn.Module):
     """
     MLP decoder: latent z -> MLP -> (B*N, out_dim). No graph or position.
     Same interface as SimpleGraphDecoder for drop-in use.
-
-    Architecture: latent_dim → 512 → 1024 → n_nodes*out_dim
     """
     def __init__(
         self,
@@ -537,15 +587,13 @@ class MLPDecoder(nn.Module):
         self.out_dim = out_dim
         self.n_nodes = n_nodes
 
-        hidden_sizes = [512, 1024]
-
         layers = []
         in_d = latent_dim
-        for h in hidden_sizes:
-            layers.append(nn.Linear(in_d, h))
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(in_d, hidden_dim))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            in_d = h
+            in_d = hidden_dim
         layers.append(nn.Linear(in_d, n_nodes * out_dim))
         self.mlp = nn.Sequential(*layers)
         self.reset_parameters()
@@ -632,7 +680,14 @@ class AEContext:
             print(f"Data mean: {data_stats.mean:.4f}, std: {data_stats.std:.4f}")
 
         encoder_type = (getattr(cfg.encoder, "encoder_type", "graph") or "graph").lower()
-        if encoder_type == "mlp":
+        if encoder_type == "cnn":
+            encoder = Conv1DEncoder(
+                in_dim=cfg.model.in_dim,
+                latent_dim=cfg.encoder.latent_dim,
+                n_nodes=n_nodes,
+                dropout=cfg.encoder.dropout,
+            ).to(device)
+        elif encoder_type == "mlp":
             encoder = MLPEncoder(
                 in_dim=cfg.model.in_dim,
                 hidden_dim=cfg.encoder.hidden_dim,
@@ -723,8 +778,19 @@ class AEContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = sorted(glob.glob(os.path.join(self.checkpoint_dir, "ae_epoch_*.pt")))
-        return files[-1] if files else None
+        files = glob.glob(os.path.join(self.checkpoint_dir, "ae_epoch_*.pt"))
+        if not files:
+            return None
+
+        def _epoch_num(path: str) -> int:
+            base = os.path.basename(path)
+            stem = os.path.splitext(base)[0]
+            try:
+                return int(stem.split("_")[-1])
+            except (ValueError, IndexError):
+                return -1
+
+        return max(files, key=_epoch_num)
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
@@ -873,7 +939,7 @@ def save_encoded_dataset(
         if actual_batch_size <= 0:
             break
         
-        wf_col, cond = ctx.loader.get_batch(actual_batch_size)
+        wf_col, cond, *_ = ctx.loader.get_batch(actual_batch_size)
         
         if ctx.use_ms_data:
             xc1 = cond[:, 0]
@@ -1030,6 +1096,9 @@ def train_ae(cfg: Config = default_config):
     global_step = start_epoch * cfg.training.steps_per_epoch
     encoded_output_path = os.path.join(ctx.checkpoint_dir, "ae_encoded_ms_latents.h5")
 
+    if cfg.training.lopsided_aug:
+        print(f"  Lopsided augmentation ON: frac={cfg.training.lopsided_frac}, sigma={cfg.training.lopsided_sigma}")
+
     for epoch in range(start_epoch, cfg.training.epochs):
         encoder.train()
         decoder.train()
@@ -1037,7 +1106,11 @@ def train_ae(cfg: Config = default_config):
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
-            batch_np, _ = tr.get_batch(B)
+            batch_np, _, sample_idx = tr.get_batch(B)
+            if cfg.training.lopsided_aug:
+                batch_np = apply_lopsided_augmentation(
+                    batch_np, frac=cfg.training.lopsided_frac, sigma=cfg.training.lopsided_sigma,
+                    sample_indices=sample_idx)
             batch_np = data_stats.normalize(batch_np)
             
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
@@ -1087,7 +1160,11 @@ def train_ae(cfg: Config = default_config):
             ema_decoder.eval()
             with torch.no_grad():
                 b_vis = min(cfg.training.batch_size, 4)
-                batch_np, _ = tr.get_batch(b_vis)
+                batch_np, _, sample_idx = tr.get_batch(b_vis)
+                if cfg.training.lopsided_aug:
+                    batch_np = apply_lopsided_augmentation(
+                        batch_np, frac=cfg.training.lopsided_frac, sigma=cfg.training.lopsided_sigma,
+                        sample_indices=sample_idx)
                 batch_np_norm = data_stats.normalize(batch_np)
                 x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(device_t)
                 
@@ -1155,7 +1232,7 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
     ctx.decoder.eval()
 
     with torch.no_grad():
-        batch_np, _ = ctx.loader.get_batch(2)
+        batch_np, *_ = ctx.loader.get_batch(2)
         batch_np_norm = ctx.data_stats.normalize(batch_np)
         x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(ctx.device)
         

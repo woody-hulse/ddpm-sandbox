@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from data import Graph, visualize_event, visualize_event_z, SparseGraph
 from lz_data_loader import TritiumSSDataLoader, OnlineMSBatcher
-from config import Config, default_config, print_config
+from config import Config, default_config, get_config, print_config
 
 from models.graph_unet import (
     GraphDDPMUNet, GraphResBlock, TopKPool, FiLMFromCond,
@@ -73,12 +73,75 @@ class GraphEncoderBlock(nn.Module):
         return x + h
 
 
+class Conv1DEncoder(nn.Module):
+    """
+    1D CNN encoder: processes the waveform with convolutions to capture
+    local texture features (noise patterns, smoothness) before compressing to
+    the latent space. Same interface as MLPEncoder/GraphEncoder.
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        latent_dim: int,
+        n_nodes: int,
+        dropout: float = 0.0,
+        use_stochastic: bool = False,
+        channels: tuple = (32, 64, 128),
+        kernel_size: int = 7,
+        pool_size: int = 4,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.latent_dim = latent_dim
+        self.n_nodes = n_nodes
+        self.use_stochastic = use_stochastic
+
+        conv_layers = []
+        ch_in = in_dim
+        for ch_out in channels:
+            conv_layers.extend([
+                nn.Conv1d(ch_in, ch_out, kernel_size, padding=kernel_size // 2),
+                nn.SiLU(),
+                nn.AvgPool1d(pool_size),
+                nn.Dropout(dropout),
+            ])
+            ch_in = ch_out
+
+        conv_layers.append(nn.AdaptiveAvgPool1d(4))
+        conv_layers.append(nn.Flatten())
+        self.backbone = nn.Sequential(*conv_layers)
+
+        final_dim = channels[-1] * 4
+        if use_stochastic:
+            self.to_mu = nn.Linear(final_dim, latent_dim)
+            self.to_logvar = nn.Linear(final_dim, latent_dim)
+        else:
+            self.to_latent = nn.Linear(final_dim, latent_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        B = batch_size
+        N = x.shape[0] // B
+        x_2d = x.view(B, N, self.in_dim).permute(0, 2, 1)  # (B, C, N)
+        h = self.backbone(x_2d)
+        if self.use_stochastic:
+            mu = self.to_mu(h)
+            logvar = self.to_logvar(h)
+            z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+            return z, mu, logvar
+        else:
+            return self.to_latent(h), None, None
+
+
 class MLPEncoder(nn.Module):
     """
     MLP encoder: flattens input and maps to latent. No graph structure used.
     Same interface as GraphEncoder for drop-in use.
-
-    Architecture: n_nodes*in_dim → 1024 → 512 → latent_dim
     """
     def __init__(
         self,
@@ -97,24 +160,29 @@ class MLPEncoder(nn.Module):
         self.n_nodes = n_nodes
         self.use_stochastic = use_stochastic
 
-        input_size = n_nodes * in_dim
-        hidden_sizes = [1024, 512]
-
         layers = []
+        input_size = n_nodes * in_dim
+        n_hidden = num_layers - 1
+        if n_hidden <= 0:
+            layer_sizes = []
+        else:
+            ratio = (latent_dim / input_size) ** (1.0 / n_hidden)
+            layer_sizes = [max(latent_dim, int(round(input_size * ratio ** i))) for i in range(1, n_hidden + 1)]
+
         in_d = input_size
-        for h in hidden_sizes:
-            layers.append(nn.Linear(in_d, h))
+        for out_d in layer_sizes:
+            layers.append(nn.Linear(in_d, out_d))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            in_d = h
+            in_d = out_d
         self.backbone = nn.Sequential(*layers)
 
-        backbone_out = hidden_sizes[-1]
+        final_in = in_d
         if use_stochastic:
-            self.to_mu = nn.Linear(backbone_out, latent_dim)
-            self.to_logvar = nn.Linear(backbone_out, latent_dim)
+            self.to_mu = nn.Linear(final_in, latent_dim)
+            self.to_logvar = nn.Linear(final_in, latent_dim)
         else:
-            self.to_latent = nn.Linear(backbone_out, latent_dim)
+            self.to_latent = nn.Linear(final_in, latent_dim)
 
         self.reset_parameters()
 
@@ -311,7 +379,7 @@ class DiffAEDataStats:
         all_data = []
         samples_collected = 0
         while samples_collected < n_samples:
-            batch_np, _ = loader.get_batch(min(batch_size, n_samples - samples_collected))
+            batch_np, *_ = loader.get_batch(min(batch_size, n_samples - samples_collected))
             all_data.append(batch_np.flatten())
             samples_collected += batch_np.shape[0]
         all_data = np.concatenate(all_data)
@@ -398,7 +466,15 @@ class DiffAEContext:
         schedule = build_cosine_schedule(cfg.diffusion.timesteps, device)
 
         encoder_type = (getattr(cfg.encoder, "encoder_type", "graph") or "graph").lower()
-        if encoder_type == "mlp":
+        if encoder_type == "cnn":
+            encoder = Conv1DEncoder(
+                in_dim=cfg.model.in_dim,
+                latent_dim=cfg.encoder.latent_dim,
+                n_nodes=n_nodes,
+                dropout=cfg.encoder.dropout,
+                use_stochastic=cfg.encoder.use_stochastic,
+            ).to(device)
+        elif encoder_type == "mlp":
             encoder = MLPEncoder(
                 in_dim=cfg.model.in_dim,
                 hidden_dim=cfg.encoder.hidden_dim,
@@ -443,6 +519,7 @@ class DiffAEContext:
             out_dim=cfg.model.out_dim,
             dropout=cfg.model.dropout,
             pos_dim=cfg.model.pos_dim,
+            skip_scale=getattr(cfg.model, 'skip_scale', 1.0),
         ).to(device)
 
         regressive_decoder = None
@@ -538,8 +615,19 @@ class DiffAEContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = sorted(glob.glob(os.path.join(self.checkpoint_dir, "diffae_epoch_*.pt")))
-        return files[-1] if files else None
+        files = glob.glob(os.path.join(self.checkpoint_dir, "diffae_epoch_*.pt"))
+        if not files:
+            return None
+
+        def _epoch_num(path: str) -> int:
+            base = os.path.basename(path)
+            stem = os.path.splitext(base)[0]
+            try:
+                return int(stem.split("_")[-1])
+            except (ValueError, IndexError):
+                return -1
+
+        return max(files, key=_epoch_num)
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
@@ -564,12 +652,12 @@ class DiffAEContext:
     def load_checkpoint(self, path: str, load_optim: bool = True) -> int:
         chk = torch.load(path, map_location=self.device)
         self.encoder.load_state_dict(chk["encoder"], strict=False)
-        self.decoder.load_state_dict(chk["decoder"])
+        self.decoder.load_state_dict(chk["decoder"], strict=False)
         self.latent_proj.load_state_dict(chk["latent_proj"])
         if self.ema_encoder is not None and "ema_encoder" in chk:
             self.ema_encoder.load_state_dict(chk["ema_encoder"], strict=False)
         if self.ema_decoder is not None and "ema_decoder" in chk:
-            self.ema_decoder.load_state_dict(chk["ema_decoder"])
+            self.ema_decoder.load_state_dict(chk["ema_decoder"], strict=False)
         if self.ema_latent_proj is not None and "ema_latent_proj" in chk:
             self.ema_latent_proj.load_state_dict(chk["ema_latent_proj"])
         elif self.ema_latent_proj is not None:
@@ -579,7 +667,10 @@ class DiffAEContext:
         if self.ema_regressive_decoder is not None and "ema_regressive_decoder" in chk:
             self.ema_regressive_decoder.load_state_dict(chk["ema_regressive_decoder"])
         if load_optim and self.optim is not None and chk.get("optim"):
-            self.optim.load_state_dict(chk["optim"])
+            try:
+                self.optim.load_state_dict(chk["optim"])
+            except (ValueError, RuntimeError) as e:
+                print(f"  Optimizer state skipped (param count changed, fine-tuning): {e}")
         if "data_stats" in chk:
             self.data_stats.mean = chk["data_stats"]["mean"]
             self.data_stats.std = chk["data_stats"]["std"]
@@ -720,7 +811,7 @@ def save_encoded_dataset(
         if actual_batch_size <= 0:
             break
         
-        wf_col, cond = ctx.loader.get_batch(actual_batch_size)
+        wf_col, cond, *_ = ctx.loader.get_batch(actual_batch_size)
         
         if ctx.use_ms_data:
             xc1 = cond[:, 0]
@@ -916,6 +1007,78 @@ def sample_from_latent(
     return out
 
 
+@torch.no_grad()
+def sample_diffae_partial(
+    encoder: nn.Module,
+    decoder: nn.Module,
+    latent_proj: nn.Module,
+    schedule: dict,
+    A_sparse: torch.Tensor,
+    pos: torch.Tensor,
+    time_dim: int,
+    x_ref: torch.Tensor,
+    t_start: int,
+    parametrization: str = 'v',
+) -> torch.Tensor:
+    """Reconstruct by forward-noising x_ref to t_start, then reverse-denoising.
+
+    Unlike ``sample_diffae`` which starts from pure noise (t=T), this starts
+    from x_{t_start} = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * noise,
+    preserving progressively more of the original signal as t_start decreases.
+
+    Returns: reconstructed samples (B, 1, N).
+    """
+    B, N, C = x_ref.shape
+    device = x_ref.device
+    T = schedule['betas'].shape[0]
+    t_start = min(t_start, T - 1)
+
+    x_ref_flat = x_ref.view(B * N, C)
+    z, _, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
+    cond_proj = latent_proj(z)
+
+    sqrt_ab = schedule['sqrt_alphas_cumprod'][t_start]
+    sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t_start]
+    noise = torch.randn_like(x_ref)
+    x = sqrt_ab * x_ref + sqrt_om * noise
+
+    for i in reversed(range(t_start + 1)):
+        betas_t = schedule['betas'][i]
+        sqrt_one_minus_ab_t = schedule['sqrt_one_minus_alphas_cumprod'][i]
+        alpha_bar_t = schedule['alphas_cumprod'][i]
+        alpha_bar_prev_t = schedule['alphas_cumprod_prev'][i]
+
+        t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
+        t_emb_batch = t_emb.expand(B, -1)
+        cond_full = torch.cat([cond_proj, t_emb_batch], dim=-1)
+
+        x_flat = x.view(B * N, C)
+        pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
+        pred = pred_flat.view(B, N, C)
+
+        if parametrization == 'eps':
+            eps_theta = pred
+            x0_pred = (x - sqrt_one_minus_ab_t * eps_theta) / torch.clamp(torch.sqrt(alpha_bar_t), min=1e-8)
+        elif parametrization == 'v':
+            a = torch.clamp(torch.sqrt(alpha_bar_t), min=1e-8)
+            b_coef = torch.clamp(torch.sqrt(1.0 - alpha_bar_t), min=1e-8)
+            x0_pred = a * x - b_coef * pred
+        else:
+            raise ValueError("parametrization must be 'eps' or 'v'")
+
+        coef1 = betas_t * torch.sqrt(torch.clamp(alpha_bar_prev_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
+        coef2 = torch.clamp(1.0 - alpha_bar_prev_t, min=0.0) * torch.sqrt(torch.clamp(1.0 - betas_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
+        mean = coef1 * x0_pred + coef2 * x
+
+        if i > 0:
+            posterior_var = schedule['posterior_variance'][i]
+            x = mean + torch.sqrt(posterior_var) * torch.randn_like(x)
+        else:
+            x = mean
+
+    return x.permute(0, 2, 1)
+
+
 def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: bool = False):
     """Visualize event with z axis as time."""
     x = G.positions_xyz[:, 0].cpu().numpy()
@@ -943,6 +1106,56 @@ def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: boo
     ax.set_zlabel('t')
     ax.set_box_aspect([1, 1, 3])
     return ax
+
+
+def apply_lopsided_augmentation(
+    batch_np: np.ndarray,
+    frac: float = 0.5,
+    sigma: float = 3.0,
+    sample_indices: np.ndarray = None,
+) -> np.ndarray:
+    """Apply deterministic lopsided Gaussian blur based on sample index.
+
+    Each event's augmentation is fixed by its dataset index so the model
+    consistently sees the same events as lopsided across epochs.
+
+    Assignment (by index mod 4):
+        0 -> blur left half
+        1 -> blur right half
+        2, 3 -> no augmentation  (gives frac ~0.5)
+
+    When frac != 0.5 the mod bucket boundaries shift accordingly.
+    If sample_indices is None, falls back to random augmentation.
+
+    Args:
+        batch_np: (B, N, 1) waveforms (pre-normalization)
+        frac: fraction of dataset that is lopsided
+        sigma: Gaussian kernel standard deviation
+        sample_indices: (B,) original dataset indices for deterministic assignment
+    """
+    from scipy.ndimage import gaussian_filter1d
+    B, N, C = batch_np.shape
+    half = N // 2
+
+    if sample_indices is None:
+        n_aug = max(1, int(B * frac))
+        idx = np.random.choice(B, size=n_aug, replace=False)
+        sides = np.random.randint(0, 2, size=n_aug)
+        for i, side in zip(idx, sides):
+            if side == 0:
+                batch_np[i, :half, 0] = gaussian_filter1d(batch_np[i, :half, 0], sigma=sigma)
+            else:
+                batch_np[i, half:, 0] = gaussian_filter1d(batch_np[i, half:, 0], sigma=sigma)
+        return batch_np
+
+    buckets = int(round(1.0 / max(frac, 1e-6)))
+    for i in range(B):
+        mod = int(sample_indices[i]) % max(buckets, 2)
+        if mod == 0:
+            batch_np[i, :half, 0] = gaussian_filter1d(batch_np[i, :half, 0], sigma=sigma)
+        elif mod == 1:
+            batch_np[i, half:, 0] = gaussian_filter1d(batch_np[i, half:, 0], sigma=sigma)
+    return batch_np
 
 
 def train_diffae(cfg: Config = default_config):
@@ -1004,6 +1217,9 @@ def train_diffae(cfg: Config = default_config):
     global_step = start_epoch * cfg.training.steps_per_epoch
     encoded_output_path = os.path.join(ctx.checkpoint_dir, "encoded_ms_latents.h5")
 
+    if cfg.training.lopsided_aug:
+        print(f"  Lopsided augmentation ON: frac={cfg.training.lopsided_frac}, sigma={cfg.training.lopsided_sigma}")
+
     for epoch in range(start_epoch, cfg.training.epochs):
         encoder.train()
         decoder.train()
@@ -1016,7 +1232,11 @@ def train_diffae(cfg: Config = default_config):
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
-            batch_np, _ = tr.get_batch(B)
+            batch_np, _, sample_idx = tr.get_batch(B)
+            if cfg.training.lopsided_aug:
+                batch_np = apply_lopsided_augmentation(
+                    batch_np, frac=cfg.training.lopsided_frac, sigma=cfg.training.lopsided_sigma,
+                    sample_indices=sample_idx)
             batch_np = data_stats.normalize(batch_np)
             
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
@@ -1108,7 +1328,6 @@ def train_diffae(cfg: Config = default_config):
                 if use_regressive:
                     for p_ema, p in zip(ema_regressive_decoder.parameters(), regressive_decoder.parameters()):
                         p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
-
             global_step += 1
 
             postfix = {"loss": epoch_loss / (step + 1)}
@@ -1132,7 +1351,11 @@ def train_diffae(cfg: Config = default_config):
             ctx.ema_latent_proj.eval()
             with torch.no_grad():
                 b_vis = min(cfg.training.batch_size, 4)
-                batch_np, _ = tr.get_batch(b_vis)
+                batch_np, _, sample_idx = tr.get_batch(b_vis)
+                if cfg.training.lopsided_aug:
+                    batch_np = apply_lopsided_augmentation(
+                        batch_np, frac=cfg.training.lopsided_frac, sigma=cfg.training.lopsided_sigma,
+                        sample_indices=sample_idx)
                 batch_np_norm = data_stats.normalize(batch_np)
                 x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(device_t)
                 
@@ -1204,7 +1427,7 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
     ctx.decoder.eval()
 
     with torch.no_grad():
-        batch_np, _ = ctx.loader.get_batch(2)
+        batch_np, *_ = ctx.loader.get_batch(2)
         batch_np_norm = ctx.data_stats.normalize(batch_np)
         x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(ctx.device)
         
@@ -1263,4 +1486,5 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
 
 
 if __name__ == "__main__":
-    train_diffae(default_config)
+    cfg = get_config(epochs=20_000)
+    train_diffae(cfg)

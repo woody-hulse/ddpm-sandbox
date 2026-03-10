@@ -388,6 +388,7 @@ def main():
     args = parser.parse_args()
 
     cfg = default_config
+    cfg.encoder.hidden_dim = max(cfg.encoder.hidden_dim, cfg.encoder.latent_dim)
     cfg.conditioning.cond_proj_dim = max(cfg.conditioning.cond_proj_dim, cfg.encoder.latent_dim)
     device = torch.device(cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f"Device: {device}")
@@ -454,7 +455,7 @@ def main():
         if B <= 0:
             break
 
-        wf_col, _ = loader.get_batch(B)
+        wf_col, *_ = loader.get_batch(B)
         raw_denorm = wf_col[:, :, 0]
         all_raw.append(raw_denorm)
 

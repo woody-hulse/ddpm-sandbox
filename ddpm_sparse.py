@@ -227,7 +227,7 @@ class DataStats:
         all_data = []
         samples_collected = 0
         while samples_collected < n_samples:
-            batch_np, _ = loader.get_batch(min(batch_size, n_samples - samples_collected))
+            batch_np, *_ = loader.get_batch(min(batch_size, n_samples - samples_collected))
             all_data.append(batch_np.flatten())
             samples_collected += batch_np.shape[0]
         
@@ -340,7 +340,7 @@ def train(cfg: Config = default_config):
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
-            batch_np, batch_cond = tr.get_batch(B)
+            batch_np, batch_cond, _ = tr.get_batch(B)
             batch_cond = torch.from_numpy(batch_cond.astype(np.float32)).to(device_t)
             batch_np = data_stats.normalize(batch_np)
             
@@ -471,7 +471,7 @@ def train(cfg: Config = default_config):
         if epoch % cfg.training.visualize_every == 0:
             core.eval()
             with torch.no_grad():
-                val_np, val_cond = tr.get_batch(4)
+                val_np, val_cond, _ = tr.get_batch(4)
                 val_cond_t = torch.from_numpy(val_cond.astype(np.float32)).to(device_t)
                 val_np_norm = data_stats.normalize(val_np)
                 x0_val = torch.from_numpy(val_np_norm.astype(np.float32)).to(device_t)
@@ -517,7 +517,7 @@ def train(cfg: Config = default_config):
             ema_core.eval()
             with torch.no_grad():
                 b_vis = min(cfg.training.batch_size, 4)
-                batch_np, batch_cond = tr.get_batch(b_vis)
+                batch_np, batch_cond, _ = tr.get_batch(b_vis)
                 batch_cond_t = torch.from_numpy(batch_cond.astype(np.float32)).to(device_t)
                 cond_vis = cond_proj(batch_cond_t)
                 samples = sample_core(
@@ -617,7 +617,7 @@ def generate_samples(cfg: Config):
 
     with torch.no_grad():
         b_vis = min(cfg.training.batch_size, 4)
-        batch_np, batch_cond = tr.get_batch(b_vis)
+        batch_np, batch_cond, _ = tr.get_batch(b_vis)
         batch_cond_t = torch.from_numpy(batch_cond.astype(np.float32)).to(ctx.device)
         cond_vis = cond_proj(batch_cond_t)
         samples = sample_core(

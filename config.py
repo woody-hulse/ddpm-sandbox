@@ -29,7 +29,7 @@ class ModelConfig:
     """
     in_dim: int = 1                 # Input feature dimension per node
     out_dim: int = 1                # Output feature dimension per node
-    hidden_dim: int = 32            # Hidden dimension in graph convolutions
+    hidden_dim: int = 64            # Hidden dimension in graph convolutions
     depth: int = 3                  # Number of pooling/unpooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.7         # Fraction of nodes to keep per pooling
@@ -37,6 +37,7 @@ class ModelConfig:
     pos_dim: int = 3                # Position embedding dimension (x, y, z)
     pos_dropout: float = 0.0        # Dropout on position embeddings
     cache_norm_top: bool = True     # Cache normalization at top level
+#     skip_scale: float = 0.1         # Scale factor for U-Net skip connections (lower = more reliance on z)
 
 
 @dataclass
@@ -48,18 +49,18 @@ class EncoderConfig:
     decoder_type applies only to Graph AE: "graph" or "mlp".
     """
     latent_dim: int = 64            # Latent representation dimension
-    hidden_dim: int = 32            # Hidden dimension in encoder layers
+    hidden_dim: int = 64            # Hidden dimension in encoder layers
     depth: int = 4                  # Number of pooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.5         # Pooling ratio per stage
     dropout: float = 0.0            # Dropout rate
     use_stochastic: bool = False    # DiffAE encoder: stochastic (VAE-style) encoding
     kl_weight: float = 0.001        # DiffAE: KL weight when use_stochastic
-    encoder_type: str = "mlp"     # Encoder: "graph" or "mlp"
+    encoder_type: str = "cnn"     # Encoder: "cnn", "mlp", or "graph"
     decoder_type: str = "mlp"     # AE decoder: "graph" (SimpleGraphDecoder) or "mlp"
     mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
     mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
-    use_regressive_head: bool = True   # DiffAE: add a second decoder head with regressive (MSE) loss
+    use_regressive_head: bool = False   # DiffAE: add a second decoder head with regressive (MSE) loss
     regressive_head_weight: float = 1.0 # DiffAE: weight for the regressive head loss
 
 
@@ -86,9 +87,8 @@ class DiffusionConfig:
     """
     timesteps: int = 250            # Number of diffusion timesteps
     parametrization: str = "v"      # Prediction target: "v" (velocity) or "eps" (noise)
-    p2_gamma: float = 0.5           # P2 loss weighting gamma
+    p2_gamma: float = 0.0           # P2 loss weighting gamma (0 = uniform, >0 upweights high-noise steps)
     p2_k: float = 1.0               # P2 loss weighting k
-
 
 # =============================================================================
 # Graph Construction  
@@ -136,17 +136,22 @@ class TrainingConfig:
     Controls optimization, checkpointing, and dataset encoding.
     """
     # Optimization
-    epochs: int = 10_000            # Total training epochs
-    batch_size: int = 8             # Batch size
+    epochs: int = 20_000            # Total training epochs
+    batch_size: int = 4             # Batch size
     steps_per_epoch: int = 64       # Gradient steps per epoch
     lr: float = 1e-3                # Learning rate
     weight_decay: float = 0         # AdamW weight decay
     ema_decay: float = 0.999        # Exponential moving average decay
     grad_clip: float = 1.0          # Gradient clipping norm
     
+    # Augmentation
+    lopsided_aug: bool = True       # Apply lopsided Gaussian blur to fraction of events
+    lopsided_frac: float = 0.5     # Fraction of events to augment (default 50%)
+    lopsided_sigma: float = 10.0    # Gaussian kernel sigma for lopsided augmentation
+
     # Checkpointing
-    checkpoint_every: int = 100     # Save checkpoint every N epochs
-    visualize_every: int = 100      # Generate visualizations every N epochs
+    checkpoint_every: int = 25     # Save checkpoint every N epochs
+    visualize_every: int = 25      # Generate visualizations every N epochs
     
     # Encoded dataset export (for aux task)
     encode_dataset_every: int = 500    # Export encoded latents every N epochs (0 = disable)
@@ -218,7 +223,7 @@ class Config:
     
     # Runtime flags
     device: Optional[str] = None    # Device override (None = auto-detect)
-    resume: bool = False             # Resume from checkpoint if available
+    resume: bool = True             # Resume from checkpoint if available
     visualize: bool = True          # Generate visualizations during training
 
 

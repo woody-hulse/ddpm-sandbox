@@ -50,8 +50,8 @@ def test_encoder_sensitivity():
     ctx.encoder.eval()
     
     with torch.no_grad():
-        batch_np1, _ = ctx.loader.get_batch(4)
-        batch_np2, _ = ctx.loader.get_batch(4)
+        batch_np1, *_ = ctx.loader.get_batch(4)
+        batch_np2, *_ = ctx.loader.get_batch(4)
         
         x1 = torch.from_numpy(ctx.data_stats.normalize(batch_np1).astype(np.float32)).to(ctx.device)
         x2 = torch.from_numpy(ctx.data_stats.normalize(batch_np2).astype(np.float32)).to(ctx.device)
@@ -167,7 +167,7 @@ def test_gradient_flow():
     ctx.latent_proj.train()
     
     B = 2
-    batch_np, _ = ctx.loader.get_batch(B)
+    batch_np, *_ = ctx.loader.get_batch(B)
     x0 = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
     x0_flat = x0.view(B * ctx.n_nodes, 1)
     
@@ -243,7 +243,7 @@ def test_latent_proj_output():
         ctx.load_checkpoint(latest_ckpt, load_optim=False)
     
     with torch.no_grad():
-        batch_np, _ = ctx.loader.get_batch(8)
+        batch_np, *_ = ctx.loader.get_batch(8)
         x = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
         x_flat = x.view(8 * ctx.n_nodes, 1)
         
@@ -300,7 +300,7 @@ def test_reconstruction_correlation():
     ctx.decoder.eval()
     
     with torch.no_grad():
-        batch_np, _ = ctx.loader.get_batch(4)
+        batch_np, *_ = ctx.loader.get_batch(4)
         batch_np_norm = ctx.data_stats.normalize(batch_np)
         x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(ctx.device)
         
@@ -357,7 +357,7 @@ def test_conditioning_ablation():
     
     with torch.no_grad():
         B = 4
-        batch_np, _ = ctx.loader.get_batch(B)
+        batch_np, *_ = ctx.loader.get_batch(B)
         x0 = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
         x0_flat = x0.view(B * ctx.n_nodes, 1)
         
@@ -498,7 +498,7 @@ def test_input_vs_conditioning_scale():
     
     with torch.no_grad():
         B = 4
-        batch_np, _ = ctx.loader.get_batch(B)
+        batch_np, *_ = ctx.loader.get_batch(B)
         x0 = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
         x0_flat = x0.view(B * ctx.n_nodes, 1)
         

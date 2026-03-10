@@ -16,6 +16,7 @@ correlation_analysis/
 data/*.npz
 data/*.h5
 
+.claude/
 .vscode/
 .idea/
 *.swp

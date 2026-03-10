@@ -37,7 +37,10 @@ import matplotlib.pyplot as plt
 
 from config import Config, default_config, get_config
 from ae import AEContext, reconstruct_ae, save_encoded_dataset as ae_save_encoded
-from diffae import DiffAEContext, sample_diffae, save_encoded_dataset as diffae_save_encoded
+from diffae import (
+    DiffAEContext, sample_diffae, apply_lopsided_augmentation,
+    save_encoded_dataset as diffae_save_encoded,
+)
 from compare_rqs import wf_to_z_profile
 from aux import (
     EncodedMSDataset, OnlineMSDataset, MLP,
@@ -105,7 +108,11 @@ def train_ae_early_stop(
             ncols=120, file=sys.stdout, disable=not verbose,
         )
         for step in pbar:
-            batch_np, _ = ctx.loader.get_batch(B)
+            batch_np, _, sample_idx = ctx.loader.get_batch(B)
+            if cfg.training.lopsided_aug:
+                batch_np = apply_lopsided_augmentation(
+                    batch_np, frac=cfg.training.lopsided_frac, sigma=cfg.training.lopsided_sigma,
+                    sample_indices=sample_idx)
             batch_np = ctx.data_stats.normalize(batch_np)
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(ctx.device)
             x0_flat = x0.view(B * ctx.n_nodes, 1)
@@ -236,7 +243,11 @@ def train_diffae_early_stop(
             ncols=140, file=sys.stdout, disable=not verbose,
         )
         for step in pbar:
-            batch_np, _ = ctx.loader.get_batch(B)
+            batch_np, _, sample_idx = ctx.loader.get_batch(B)
+            if cfg.training.lopsided_aug:
+                batch_np = apply_lopsided_augmentation(
+                    batch_np, frac=cfg.training.lopsided_frac, sigma=cfg.training.lopsided_sigma,
+                    sample_indices=sample_idx)
             batch_np = ctx.data_stats.normalize(batch_np)
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(ctx.device)
             x0_flat = x0.view(B * ctx.n_nodes, 1)
@@ -515,14 +526,13 @@ def generate_z_profiles(
     base_cfg = get_config(latent_dim=latent_dims[0])
     ref_ctx = AEContext.build(base_cfg, for_training=False, verbose=False)
     np.random.seed(seed)
-    batch_np, _ = ref_ctx.loader.get_batch(n_examples)
+    batch_np, *_ = ref_ctx.loader.get_batch(n_examples)
     n_channels = ref_ctx.n_channels
     n_time = ref_ctx.n_time_points
     time_axis = np.arange(n_time)
 
     for ldim in latent_dims:
         cfg = get_config(latent_dim=ldim)
-        cfg.conditioning.cond_proj_dim = max(cfg.conditioning.cond_proj_dim, ldim)
 
         ae_ckpt = find_ae_checkpoint(cfg, ldim)
         dae_ckpt = find_diffae_checkpoint(cfg, ldim)
@@ -746,7 +756,7 @@ def main():
         plot_comparison(
             latent_dims, ae_results, diffae_results,
             baseline_mean, baseline_std,
-            os.path.join(args.output_dir, "latent_comparison_mae.pdf"),
+            os.path.join(args.output_dir, "latent_comparison_mae.png"),
         )
         return
 
@@ -762,7 +772,6 @@ def main():
         print(f"{'='*60}")
 
         cfg = get_config(latent_dim=ldim)
-        cfg.conditioning.cond_proj_dim = max(cfg.conditioning.cond_proj_dim, ldim)
         cfg.resume = True
         cfg.visualize = False
 
@@ -884,7 +893,7 @@ def main():
     plot_comparison(
         latent_dims, ae_results, diffae_results,
         baseline_mean, baseline_std,
-        os.path.join(args.output_dir, "latent_comparison_mae.pdf"),
+        os.path.join(args.output_dir, "latent_comparison_mae.png"),
     )
 
     # ---------------------------------------------------------------
