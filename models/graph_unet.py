@@ -59,6 +59,7 @@ class GraphResBlock(nn.Module):
         
         # Conditioning projection for scale and shift
         self.cond_proj = nn.Linear(cond_dim, hidden_dim * 2)
+        self.node_cond_proj = nn.Linear(hidden_dim, hidden_dim * 2)
         
         # Initialize for stable but expressive training
         nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
@@ -67,9 +68,11 @@ class GraphResBlock(nn.Module):
         nn.init.zeros_(self.lin2.bias)
         nn.init.xavier_uniform_(self.cond_proj.weight, gain=0.5)
         nn.init.zeros_(self.cond_proj.bias)
+        nn.init.xavier_uniform_(self.node_cond_proj.weight, gain=0.5)
+        nn.init.zeros_(self.node_cond_proj.bias)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor,
-                gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+                node_cond: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         # Normalize input for stability
         h = self.norm(x)
         
@@ -83,8 +86,14 @@ class GraphResBlock(nn.Module):
         cond_scale = 1.0 + torch.tanh(cond_scale) * 2.0
         cond_shift = torch.tanh(cond_shift) * 2.0
 
+        node_out = self.node_cond_proj(node_cond)
+        node_scale, node_shift = node_out.chunk(2, dim=-1)
+        node_scale = 1.0 + torch.tanh(node_scale) * 2.0
+        node_shift = torch.tanh(node_shift) * 2.0
+
         h = self.lin1(h)
         h = h * cond_scale + cond_shift
+        h = h * node_scale + node_shift
         h = self.act(h)
         h = self.lin2(h)
         
@@ -141,6 +150,7 @@ class GraphUNetStage(nn.Module):
                                      for _ in range(blocks_per_stage)])
 
     def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, cond_expanded: torch.Tensor,
+                node_cond_expanded: torch.Tensor,
                 gammas: torch.Tensor, betas: torch.Tensor, gamma_offset: int,
                 batch_size: int) -> Tuple[torch.Tensor, int]:
         i = gamma_offset
@@ -150,7 +160,7 @@ class GraphUNetStage(nn.Module):
             nodes_per_graph = x.size(0) // batch_size
             g_expanded = g.repeat_interleave(nodes_per_graph, dim=0)  # (B*N, hidden_dim)
             bt_expanded = bt.repeat_interleave(nodes_per_graph, dim=0)
-            x = blk(x, adj_hat, cond_expanded, g_expanded, bt_expanded)
+            x = blk(x, adj_hat, cond_expanded, node_cond_expanded, g_expanded, bt_expanded)
             i += 1
         return x, i
 
@@ -196,6 +206,7 @@ class GraphDDPMUNet(nn.Module):
         pos_dim: int = 3,
         pos_dropout: float = 0.0,
         skip_scale: float = 1.0,
+        node_cond_in_dim: Optional[int] = None,
     ):
         super().__init__()
         assert 0 < pool_ratio <= 1.0
@@ -209,6 +220,7 @@ class GraphDDPMUNet(nn.Module):
         self.out_dim = in_dim if out_dim is None else out_dim
 
         self.pos_dim = int(pos_dim)
+        self.node_cond_in_dim = int(cond_dim if node_cond_in_dim is None else node_cond_in_dim)
         self.pos_mlp = nn.Sequential(
             nn.Linear(self.pos_dim, hidden_dim),
             nn.SiLU(),
@@ -218,6 +230,11 @@ class GraphDDPMUNet(nn.Module):
         
         self.cond_mlp = nn.Sequential(
             nn.Linear(cond_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.node_cond_mlp = nn.Sequential(
+            nn.Linear(self.node_cond_in_dim + self.pos_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
@@ -263,6 +280,9 @@ class GraphDDPMUNet(nn.Module):
         for m in self.cond_mlp:
             if isinstance(m, nn.Linear):
                 init_linear(m)
+        for m in self.node_cond_mlp:
+            if isinstance(m, nn.Linear):
+                init_linear(m)
         # Use larger gain for output to produce non-trivial outputs
         nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
         nn.init.zeros_(self.out_proj.bias)
@@ -288,8 +308,9 @@ class GraphDDPMUNet(nn.Module):
         self._cached_block_adj[key] = block_adj
         return block_adj
 
-    def forward(self, x0: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor, 
-                pos: Optional[torch.Tensor] = None, batch_size: int = 1) -> torch.Tensor:
+    def forward(self, x0: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor,
+                pos: Optional[torch.Tensor] = None, batch_size: int = 1,
+                node_cond_input: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass with batched graph inputs.
         
@@ -321,39 +342,48 @@ class GraphDDPMUNet(nn.Module):
         pos_tiled = pos.repeat(batch_size, 1)
         pos_emb = self.pos_mlp(pos_tiled.to(x0.dtype))
         h = h + self.pos_drop(pos_emb)
-        
+
         cond_emb = self.cond_mlp(cond)  # (B, hidden_dim)
         cond_emb_expanded = cond_emb.repeat_interleave(N_single, dim=0)  # (B*N, hidden_dim)
         h = h + cond_emb_expanded
 
+        if node_cond_input is None:
+            node_cond_input = cond
+        node_cond_expanded = node_cond_input.repeat_interleave(N_single, dim=0)
+        node_cond_cur = self.node_cond_mlp(torch.cat([node_cond_expanded, pos_tiled.to(x0.dtype)], dim=-1))
+
         nodes_per_graph = N_single
 
-        skips: List[Tuple[torch.Tensor, torch.Tensor, int, int]] = []
+        skips: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]] = []
         adjs: List[torch.Tensor] = []
         h_cur, adj_cur = h, adj0
 
         for d in range(self.depth):
             cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-            h_cur, g_ptr = self.enc_stages[d](h_cur, adj_cur, cond_exp_cur, gammas, betas, g_ptr, batch_size)
+            h_cur, g_ptr = self.enc_stages[d](h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size)
             h_skip = h_cur
+            node_cond_skip = node_cond_cur
             h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
+            node_cond_pool = node_cond_cur[keep_idx]
             K = h_pool.size(0)
             adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
-            skips.append((h_skip, keep_idx, h_cur.size(0), nodes_per_graph))
+            skips.append((h_skip, node_cond_skip, keep_idx, h_cur.size(0), nodes_per_graph))
             adjs.append(adj_cur)
-            h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
+            h_cur, node_cond_cur, adj_cur, nodes_per_graph = h_pool, node_cond_pool, adj_next, k_per_graph
 
         cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-        h_cur, g_ptr = self.bottleneck(h_cur, adj_cur, cond_exp_cur, gammas, betas, g_ptr, batch_size)
+        h_cur, g_ptr = self.bottleneck(h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size)
 
         for d in reversed(range(self.depth)):
-            h_skip, keep_idx, N_prev, npg_prev = skips[d]
+            h_skip, node_cond_skip, keep_idx, N_prev, npg_prev = skips[d]
             h_up = _unpool_like(h_cur, keep_idx, N_prev)
+            node_cond_up = _unpool_like(node_cond_cur, keep_idx, N_prev)
             h_cur = h_up + self.skip_scale * h_skip
+            node_cond_cur = node_cond_up + self.skip_scale * node_cond_skip
             adj_prev = adjs[d]
             nodes_per_graph = npg_prev
             cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-            h_cur, g_ptr = self.dec_stages[d](h_cur, adj_prev, cond_exp_cur, gammas, betas, g_ptr, batch_size)
+            h_cur, g_ptr = self.dec_stages[d](h_cur, adj_prev, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size)
 
         h_cur = F.silu(self.out_norm(h_cur))
         y = self.out_proj(h_cur)

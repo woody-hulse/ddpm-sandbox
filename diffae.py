@@ -528,7 +528,7 @@ class DiffAEContext:
 
         decoder = GraphDDPMUNet(
             in_dim=cfg.model.in_dim,
-            cond_dim=cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim,
+            cond_dim=cfg.encoder.latent_dim + cfg.conditioning.time_dim,
             hidden_dim=cfg.model.hidden_dim,
             depth=cfg.model.depth,
             blocks_per_stage=cfg.model.blocks_per_stage,
@@ -917,7 +917,7 @@ def sample_diffae(
     
     x_ref_flat = x_ref.view(B * N, C)
     z, _, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
-    cond_proj = latent_proj(z)
+    _ = latent_proj  # conditioning now uses z directly
 
     x = torch.randn((B, N, C), device=device)
     T = schedule['betas'].shape[0]
@@ -930,7 +930,7 @@ def sample_diffae(
         
         t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
         t_emb_batch = t_emb.expand(B, -1)
-        cond_full = torch.cat([cond_proj, t_emb_batch], dim=-1)
+        cond_full = torch.cat([z, t_emb_batch], dim=-1)
         
         x_flat = x.view(B * N, C)
         pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
@@ -980,7 +980,7 @@ def sample_from_latent(
     device = z.device
     C = 1
     
-    cond_proj = latent_proj(z)
+    _ = latent_proj  # conditioning now uses z directly
 
     x = torch.randn((B, n_nodes, C), device=device)
     T = schedule['betas'].shape[0]
@@ -993,7 +993,7 @@ def sample_from_latent(
         
         t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
         t_emb_batch = t_emb.expand(B, -1)
-        cond_full = torch.cat([cond_proj, t_emb_batch], dim=-1)
+        cond_full = torch.cat([z, t_emb_batch], dim=-1)
         
         x_flat = x.view(B * n_nodes, C)
         pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
@@ -1052,7 +1052,7 @@ def sample_diffae_partial(
 
     x_ref_flat = x_ref.view(B * N, C)
     z, _, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
-    cond_proj = latent_proj(z)
+    _ = latent_proj  # conditioning now uses z directly
 
     sqrt_ab = schedule['sqrt_alphas_cumprod'][t_start]
     sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t_start]
@@ -1067,7 +1067,7 @@ def sample_diffae_partial(
 
         t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
         t_emb_batch = t_emb.expand(B, -1)
-        cond_full = torch.cat([cond_proj, t_emb_batch], dim=-1)
+        cond_full = torch.cat([z, t_emb_batch], dim=-1)
 
         x_flat = x.view(B * N, C)
         pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
@@ -1260,26 +1260,21 @@ def train_diffae(cfg: Config = default_config):
             x0_flat = x0.view(B * n_nodes, 1)
             
             z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B)
-            cond_base = latent_proj(z)  # (B, cond_proj_dim)
             
             if step == 0 and epoch % 50 == 0:
                 with torch.no_grad():
                     z_std = z.std().item()
-                    cond_std = cond_base.std().item()
                     z_sim = 0.0
                     if B > 1:
                         z_norm = z / (z.norm(dim=1, keepdim=True) + 1e-8)
                         z_sim = (z_norm @ z_norm.T).fill_diagonal_(0).abs().mean().item()
                     print(f"\n  [Monitor] Latent z: std={z_std:.4f}, within-batch similarity={z_sim:.4f}")
-                    print(f"  [Monitor] Cond projection: std={cond_std:.4f}")
-                    if cond_std < 0.01:
-                        print(f"  [WARNING] Conditioning std is very low - potential collapse!")
                     if z_sim > 0.95:
                         print(f"  [WARNING] Latent similarity is very high - encoder may be collapsing!")
             
             t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=device_t, dtype=torch.long)
             t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-            cond_full = torch.cat([cond_base, t_emb], dim=-1)
+            cond_full = torch.cat([z, t_emb], dim=-1)
 
             sqrt_ab = schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
             sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
