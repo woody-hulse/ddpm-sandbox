@@ -57,7 +57,7 @@ class EncoderConfig:
     use_stochastic: bool = False    # DiffAE encoder: stochastic (VAE-style) encoding
     kl_weight: float = 0.001        # DiffAE: KL weight when use_stochastic
     encoder_type: str = "graph"   # Encoder: "cnn", "mlp", or "graph"
-    decoder_type: str = "cnn"     # AE decoder: "graph" (SimpleGraphDecoder), "cnn", or "mlp"
+    decoder_type: str = "graph"     # AE decoder: "graph" (SimpleGraphDecoder), "cnn", or "mlp"
     mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
     mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
     use_regressive_head: bool = False   # DiffAE: add a second decoder head with regressive (MSE) loss
@@ -142,16 +142,16 @@ class TrainingConfig:
     lr: float = 1e-3                # Learning rate
     weight_decay: float = 0         # AdamW weight decay
     ema_decay: float = 0.999        # Exponential moving average decay
-    grad_clip: float = 1.0          # Gradient clipping norm
+    grad_clip: float = 5.0          # Gradient clipping norm
 
     # AE-specific regularization (applies in train_ae)
     ae_denoising: bool = False      # Optional denoising mode (corrupt input, reconstruct clean)
-    ae_input_noise_std: float = 0.05  # Gaussian input corruption std (normalized space)
-    ae_mask_prob: float = 0.10      # Random feature masking probability for denoising AE
+    ae_input_noise_std: float = 0.0  # Gaussian input corruption std (normalized space)
+    ae_mask_prob: float = 0.0      # Random feature masking probability for denoising AE
     ae_latent_l1_weight: float = 0.0  # Optional L1 sparsity penalty on latent activations
     
     # Augmentation
-    lopsided_aug: bool = True       # Apply lopsided Gaussian blur to fraction of events
+    lopsided_aug: bool = False       # Apply lopsided Gaussian blur to fraction of events
     lopsided_frac: float = 0.5     # Fraction of events to augment (default 50%)
     lopsided_sigma: float = 10.0    # Gaussian kernel sigma for lopsided augmentation
 
@@ -190,8 +190,8 @@ class PathConfig:
     Checkpoint/plot subdirs use {latent_dim} placeholder for organization.
     """
     # Input data
-    tritium_h5: str = "data/tritium_ss_single_node.h5"
-    channel_positions: str = "data/pmt_xy_single_node.h5"
+    tritium_h5: str = "data/tritium_ss_42.h5"
+    channel_positions: str = "data/pmt_xy_42.h5"
     
     # Output directories
     checkpoint_dir: str = "checkpoints"
