@@ -25,15 +25,650 @@ import torch.nn.functional as F
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
-from ae import GraphAEEncoder
+from ae import DiffAEDataStats, apply_lopsided_augmentation
 from config import Config, default_config, get_config, print_config
 from data import Graph, SparseGraph, visualize_event, visualize_event_z
-from diffae import DiffAEDataStats, apply_lopsided_augmentation
 from lz_data_loader import OnlineMSBatcher, TritiumSSDataLoader
-from models.graph_unet import _unpool_like, build_block_diagonal_adj
+from models.graph_unet import TopKPool, _unpool_like, build_block_diagonal_adj
 from utils.sparse_ops import subgraph_coo, to_binary, to_coalesced_coo
 from utils.visualization import build_xy_adjacency_radius
 
+
+# ---------------------------------------------------------------------------
+# Graph encoder components (improved versions from diffae.py)
+# ---------------------------------------------------------------------------
+
+class GraphEncoderBlock(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.post_agg_norm = nn.LayerNorm(hidden_dim)
+        ffn_dim = hidden_dim * 2
+        self.lin1 = nn.Linear(hidden_dim, ffn_dim)
+        self.lin2 = nn.Linear(ffn_dim, hidden_dim)
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        self.eps = nn.Parameter(torch.tensor(eps_init))
+
+        nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
+        nn.init.zeros_(self.lin1.bias)
+        nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
+        nn.init.zeros_(self.lin2.bias)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        neighbor_sum = torch.sparse.mm(adj, h)
+        h = self.post_agg_norm((1 + self.eps) * h + neighbor_sum)
+        h = self.lin1(h)
+        h = self.act(h)
+        h = self.lin2(h)
+        h = self.dropout(h)
+        return x + h
+
+
+class GraphEncoderStage(nn.Module):
+    def __init__(self, hidden_dim: int, blocks_per_stage: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            GraphEncoderBlock(hidden_dim, dropout=dropout)
+            for _ in range(blocks_per_stage)
+        ])
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        for blk in self.blocks:
+            x = blk(x, adj)
+        return x
+
+
+class GraphEncoder(nn.Module):
+    """
+    Graph encoder that maps input events to latent representations.
+    Uses hierarchical pooling to aggregate information into a global latent.
+
+    Note: Output is normalized to prevent collapse and ensure stable conditioning.
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        latent_dim: int,
+        depth: int = 3,
+        blocks_per_stage: int = 2,
+        pool_ratio: float = 0.5,
+        dropout: float = 0.0,
+        pos_dim: int = 3,
+        use_stochastic: bool = False,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.depth = depth
+        self.pool_ratio = pool_ratio
+        self.use_stochastic = use_stochastic
+
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.stages = nn.ModuleList([
+            GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
+            for _ in range(depth)
+        ])
+        self.pools = nn.ModuleList([
+            TopKPool(hidden_dim, ratio=pool_ratio)
+            for _ in range(depth)
+        ])
+
+        self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
+
+        self.readout_norm = nn.LayerNorm(hidden_dim)
+
+        if use_stochastic:
+            self.to_mu = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+            self.to_logvar = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+        else:
+            self.to_latent = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+
+        self._cached_block_adj = {}
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def _init(seq: nn.Sequential, gain: float = 1.0):
+            for m in seq:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=gain)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+        nn.init.xavier_uniform_(self.in_proj.weight, gain=1.0)
+        nn.init.zeros_(self.in_proj.bias)
+        _init(self.pos_mlp, gain=1.0)
+        if self.use_stochastic:
+            _init(self.to_mu, gain=0.5)
+            _init(self.to_logvar, gain=0.1)
+        else:
+            _init(self.to_latent, gain=1.0)
+
+    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+        key = (adj.device, adj.size(), adj._nnz(), batch_size)
+        if key in self._cached_block_adj:
+            return self._cached_block_adj[key]
+        adj_binary = to_binary(adj)
+        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        self._cached_block_adj[key] = block_adj
+        return block_adj
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Encode input events to latent representations.
+
+        Args:
+            x: Node features (B*N, in_dim)
+            adj: Single graph adjacency (N, N)
+            pos: Node positions (N, pos_dim)
+            batch_size: Number of graphs in batch
+
+        Returns:
+            z: Latent representation (B, latent_dim)
+            mu: Mean if stochastic (B, latent_dim) or None
+            logvar: Log variance if stochastic (B, latent_dim) or None
+        """
+        N_single = adj.size(0)
+        total_nodes = x.size(0)
+        assert total_nodes == batch_size * N_single
+
+        adj0 = self._get_block_adj(adj, batch_size).to(device=x.device, dtype=x.dtype)
+
+        h = self.in_proj(x)
+        pos_tiled = pos.repeat(batch_size, 1)
+        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
+        pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
+        h = h + pos_emb
+
+        nodes_per_graph = N_single
+        h_cur, adj_cur = h, adj0
+
+        for d in range(self.depth):
+            h_cur = self.stages[d](h_cur, adj_cur)
+            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
+            K = h_pool.size(0)
+            adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
+            h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
+
+        h_cur = self.final_stage(h_cur, adj_cur)
+        h_cur = self.readout_norm(h_cur)
+
+        h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
+        h_mean = h_graph.mean(dim=1)
+        h_std = h_graph.std(dim=1) + 1e-6
+        h_agg = torch.cat([h_mean, h_std], dim=-1)  # (B, hidden_dim * 2)
+
+        if self.use_stochastic:
+            mu = self.to_mu(h_agg)
+            logvar = self.to_logvar(h_agg)
+            logvar = torch.clamp(logvar, min=-10, max=2)
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+            return z, mu, logvar
+        else:
+            z = self.to_latent(h_agg)
+            return z, None, None
+
+
+# ---------------------------------------------------------------------------
+# Graph decoder components (from ae.py)
+# ---------------------------------------------------------------------------
+
+class GraphDecoderBlock(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.lin1 = nn.Linear(hidden_dim, hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        self.eps = nn.Parameter(torch.tensor(eps_init))
+
+        nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
+        nn.init.zeros_(self.lin1.bias)
+        nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
+        nn.init.zeros_(self.lin2.bias)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        neighbor_sum = torch.sparse.mm(adj, h)
+        h = (1 + self.eps) * h + neighbor_sum
+        h = self.lin1(h)
+        h = self.act(h)
+        h = self.lin2(h)
+        h = self.dropout(h)
+        return x + h
+
+
+class GraphDecoderStage(nn.Module):
+    def __init__(self, hidden_dim: int, blocks_per_stage: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            GraphDecoderBlock(hidden_dim, dropout=dropout)
+            for _ in range(blocks_per_stage)
+        ])
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        for blk in self.blocks:
+            x = blk(x, adj)
+        return x
+
+
+class GraphDecoder(nn.Module):
+    """
+    Graph decoder that maps latent representations back to node features.
+    Uses hierarchical unpooling to reconstruct the full graph.
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        n_nodes: int,
+        depth: int = 3,
+        blocks_per_stage: int = 2,
+        pool_ratio: float = 0.5,
+        dropout: float = 0.0,
+        pos_dim: int = 3,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.n_nodes = n_nodes
+        self.depth = depth
+        self.pool_ratio = pool_ratio
+
+        # Compute sizes at each level
+        self.level_sizes = [n_nodes]
+        current_size = n_nodes
+        for _ in range(depth):
+            current_size = max(1, int(math.ceil(current_size * pool_ratio)))
+            self.level_sizes.append(current_size)
+        self.level_sizes = self.level_sizes[::-1]  # smallest to largest
+
+        # Project latent to initial hidden state
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * self.level_sizes[0]),
+        )
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Upsampling layers
+        self.upsample_layers = nn.ModuleList([
+            nn.Linear(hidden_dim, hidden_dim)
+            for _ in range(depth)
+        ])
+
+        # Decoder stages (after each upsampling)
+        self.stages = nn.ModuleList([
+            GraphDecoderStage(hidden_dim, blocks_per_stage, dropout)
+            for _ in range(depth)
+        ])
+
+        self.final_stage = GraphDecoderStage(hidden_dim, blocks_per_stage, dropout)
+
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, out_dim)
+
+        self._cached_block_adj = {}
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.latent_proj:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for m in self.pos_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for layer in self.upsample_layers:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight, gain=1.0)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+        key = (adj.device, adj.size(), adj._nnz(), batch_size)
+        if key in self._cached_block_adj:
+            return self._cached_block_adj[key]
+        adj_binary = to_binary(adj)
+        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        self._cached_block_adj[key] = block_adj
+        return block_adj
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        encoder_pool_indices: List[Tuple[torch.Tensor, int, int]],
+        batch_size: int = 1
+    ) -> torch.Tensor:
+        """
+        Decode latent representations to node features.
+
+        Args:
+            z: Latent representation (B, latent_dim)
+            adj: Single graph adjacency (N, N)
+            pos: Node positions (N, pos_dim)
+            encoder_pool_indices: List of (keep_idx, N_prev, npg_prev) from encoder
+            batch_size: Number of graphs in batch
+
+        Returns:
+            Reconstructed node features (B*N, out_dim)
+        """
+        B = batch_size
+        initial_size = self.level_sizes[0]
+
+        # Project latent to initial nodes
+        h = self.latent_proj(z)  # (B, hidden_dim * initial_size)
+        h = h.view(B * initial_size, self.hidden_dim)
+
+        # Build adjacency for smallest graph
+        adj0 = self._get_block_adj(adj, B).to(device=z.device, dtype=z.dtype)
+
+        # Process through decoder stages with upsampling
+        for d in range(self.depth):
+            keep_idx, N_prev, npg_prev = encoder_pool_indices[self.depth - 1 - d]
+
+            # Upsample
+            h_up = _unpool_like(h, keep_idx, N_prev)
+            h = self.upsample_layers[d](h_up)
+
+            # Get adjacency at this level
+            adj_level = subgraph_coo(adj0, torch.arange(N_prev, device=z.device), N_prev)
+            adj_level = to_binary(adj_level)
+
+            # Process with graph convolutions
+            h = self.stages[d](h, adj_level)
+
+        # Add position embeddings at final resolution
+        pos_tiled = pos.repeat(B, 1)
+        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
+        pos_emb = self.pos_mlp(pos_normalized.to(z.dtype))
+        h = h + pos_emb
+
+        # Final processing
+        h = self.final_stage(h, adj0)
+        h = F.silu(self.out_norm(h))
+        out = self.out_proj(h)
+
+        return out
+
+
+class GraphAEEncoder(nn.Module):
+    """
+    Graph encoder that returns latent z and pooling indices for the decoder.
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        latent_dim: int,
+        depth: int = 3,
+        blocks_per_stage: int = 2,
+        pool_ratio: float = 0.5,
+        dropout: float = 0.0,
+        pos_dim: int = 3,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.depth = depth
+        self.pool_ratio = pool_ratio
+
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.stages = nn.ModuleList([
+            GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
+            for _ in range(depth)
+        ])
+        self.pools = nn.ModuleList([
+            TopKPool(hidden_dim, ratio=pool_ratio)
+            for _ in range(depth)
+        ])
+
+        self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
+
+        self.to_latent = nn.Linear(hidden_dim * 2, latent_dim)
+
+        self._cached_block_adj = {}
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.in_proj.weight, gain=1.0)
+        nn.init.zeros_(self.in_proj.bias)
+        for m in self.pos_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.xavier_uniform_(self.to_latent.weight, gain=0.5)
+        nn.init.zeros_(self.to_latent.bias)
+
+    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+        key = (adj.device, adj.size(), adj._nnz(), batch_size)
+        if key in self._cached_block_adj:
+            return self._cached_block_adj[key]
+        adj_binary = to_binary(adj)
+        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        self._cached_block_adj[key] = block_adj
+        return block_adj
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
+        """
+        Encode input events to latent representations.
+
+        Returns:
+            z: Latent representation (B, latent_dim)
+            pool_indices: List of (keep_idx, N_prev, npg_prev) for decoder
+        """
+        N_single = adj.size(0)
+        total_nodes = x.size(0)
+        assert total_nodes == batch_size * N_single
+
+        adj0 = self._get_block_adj(adj, batch_size).to(device=x.device, dtype=x.dtype)
+
+        h = self.in_proj(x)
+        pos_tiled = pos.repeat(batch_size, 1)
+        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
+        pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
+        h = h + pos_emb
+
+        nodes_per_graph = N_single
+        h_cur, adj_cur = h, adj0
+
+        pool_indices = []
+        for d in range(self.depth):
+            h_cur = self.stages[d](h_cur, adj_cur)
+            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
+
+            pool_indices.append((keep_idx, h_cur.size(0), nodes_per_graph))
+
+            K = h_pool.size(0)
+            adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
+            h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
+
+        h_cur = self.final_stage(h_cur, adj_cur)
+
+        h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
+        h_mean = h_graph.mean(dim=1)
+        h_std = h_graph.std(dim=1) + 1e-6
+        h_agg = torch.cat([h_mean, h_std], dim=-1)
+        z = self.to_latent(h_agg)
+        return z, pool_indices
+
+
+class SimpleGraphDecoder(nn.Module):
+    """
+    Simple MLP-based decoder that broadcasts latent to all nodes,
+    then refines with graph message passing.
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        n_nodes: int,
+        depth: int = 3,
+        blocks_per_stage: int = 2,
+        dropout: float = 0.0,
+        pos_dim: int = 3,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.n_nodes = n_nodes
+        self.depth = depth
+
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.stages = nn.ModuleList([
+            GraphDecoderStage(hidden_dim, blocks_per_stage, dropout)
+            for _ in range(depth)
+        ])
+
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, out_dim)
+
+        self._cached_block_adj = {}
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.latent_proj:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for m in self.pos_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+        key = (adj.device, adj.size(), adj._nnz(), batch_size)
+        if key in self._cached_block_adj:
+            return self._cached_block_adj[key]
+        adj_binary = to_binary(adj)
+        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        self._cached_block_adj[key] = block_adj
+        return block_adj
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1
+    ) -> torch.Tensor:
+        """
+        Decode latent representations to node features.
+
+        Args:
+            z: Latent representation (B, latent_dim)
+            adj: Single graph adjacency (N, N)
+            pos: Node positions (N, pos_dim)
+            batch_size: Number of graphs in batch
+
+        Returns:
+            Reconstructed node features (B*N, out_dim)
+        """
+        N = self.n_nodes
+        B = batch_size
+
+        adj0 = self._get_block_adj(adj, B).to(device=z.device, dtype=z.dtype)
+
+        # Project latent and broadcast to all nodes
+        z_proj = self.latent_proj(z)  # (B, hidden_dim)
+        h = z_proj.unsqueeze(1).expand(B, N, -1).reshape(B * N, self.hidden_dim)
+
+        # Add position embeddings
+        pos_tiled = pos.repeat(B, 1)
+        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
+        pos_emb = self.pos_mlp(pos_normalized.to(z.dtype))
+        h = h + pos_emb
+
+        # Graph message passing stages
+        for stage in self.stages:
+            h = stage(h, adj0)
+
+        h = F.silu(self.out_norm(h))
+        out = self.out_proj(h)
+
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Transpose decoder (graphae.py original)
+# ---------------------------------------------------------------------------
 
 class GraphTransposeDecoderBlock(nn.Module):
     """Residual decoder block using transpose graph aggregation."""

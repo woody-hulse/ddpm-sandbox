@@ -9,7 +9,7 @@ import sys
 import glob
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 from copy import deepcopy
 
 import h5py
@@ -32,384 +32,12 @@ from diffusion.schedule import build_cosine_schedule, sinusoidal_embedding
 from utils.sparse_ops import to_coalesced_coo, subgraph_coo, to_binary
 from utils.visualization import build_xy_adjacency_radius
 
+from ae import (
+    DiffAEDataStats, apply_lopsided_augmentation, visualize_event_3d,
+    Conv1DEncoder, MLPEncoder, MLPDecoder,
+)
+from graphae import GraphEncoder, SimpleGraphDecoder  # type: ignore[import]
 
-class GraphEncoderStage(nn.Module):
-    def __init__(self, hidden_dim: int, blocks_per_stage: int = 2, dropout: float = 0.0):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            GraphEncoderBlock(hidden_dim, dropout=dropout)
-            for _ in range(blocks_per_stage)
-        ])
-
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        for blk in self.blocks:
-            x = blk(x, adj)
-        return x
-
-
-class GraphEncoderBlock(nn.Module):
-    def __init__(self, hidden_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
-        super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.post_agg_norm = nn.LayerNorm(hidden_dim)
-        ffn_dim = hidden_dim * 2
-        self.lin1 = nn.Linear(hidden_dim, ffn_dim)
-        self.lin2 = nn.Linear(ffn_dim, hidden_dim)
-        self.act = nn.SiLU()
-        self.dropout = nn.Dropout(dropout)
-        self.eps = nn.Parameter(torch.tensor(eps_init))
-
-        nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
-        nn.init.zeros_(self.lin1.bias)
-        nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
-        nn.init.zeros_(self.lin2.bias)
-
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
-        neighbor_sum = torch.sparse.mm(adj, h)
-        h = self.post_agg_norm((1 + self.eps) * h + neighbor_sum)
-        h = self.lin1(h)
-        h = self.act(h)
-        h = self.lin2(h)
-        h = self.dropout(h)
-        return x + h
-
-
-class Conv1DEncoder(nn.Module):
-    """
-    1D CNN encoder: processes the waveform with convolutions to capture
-    local texture features (noise patterns, smoothness) before compressing to
-    the latent space. Same interface as MLPEncoder/GraphEncoder.
-    """
-    def __init__(
-        self,
-        in_dim: int,
-        latent_dim: int,
-        n_nodes: int,
-        dropout: float = 0.0,
-        use_stochastic: bool = False,
-        channels: tuple = (32, 64, 128),
-        kernel_size: int = 7,
-        pool_size: int = 4,
-    ):
-        super().__init__()
-        self.in_dim = in_dim
-        self.latent_dim = latent_dim
-        self.n_nodes = n_nodes
-        self.use_stochastic = use_stochastic
-
-        conv_layers = []
-        ch_in = in_dim
-        for ch_out in channels:
-            conv_layers.extend([
-                nn.Conv1d(ch_in, ch_out, kernel_size, padding=kernel_size // 2),
-                nn.SiLU(),
-                nn.AvgPool1d(pool_size),
-                nn.Dropout(dropout),
-            ])
-            ch_in = ch_out
-
-        conv_layers.append(nn.AdaptiveAvgPool1d(4))
-        conv_layers.append(nn.Flatten())
-        self.backbone = nn.Sequential(*conv_layers)
-
-        final_dim = channels[-1] * 4
-        if use_stochastic:
-            self.to_mu = nn.Linear(final_dim, latent_dim)
-            self.to_logvar = nn.Linear(final_dim, latent_dim)
-        else:
-            self.to_latent = nn.Linear(final_dim, latent_dim)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        adj: torch.Tensor,
-        pos: torch.Tensor,
-        batch_size: int = 1,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        B = batch_size
-        N = x.shape[0] // B
-        x_2d = x.view(B, N, self.in_dim).permute(0, 2, 1)  # (B, C, N)
-        h = self.backbone(x_2d)
-        if self.use_stochastic:
-            mu = self.to_mu(h)
-            logvar = self.to_logvar(h)
-            z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-            return z, mu, logvar
-        else:
-            return self.to_latent(h), None, None
-
-
-class MLPEncoder(nn.Module):
-    """
-    MLP encoder: flattens input and maps to latent. No graph structure used.
-    Same interface as GraphEncoder for drop-in use.
-    """
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        latent_dim: int,
-        n_nodes: int,
-        num_layers: int = 3,
-        dropout: float = 0.0,
-        use_stochastic: bool = False,
-    ):
-        super().__init__()
-        self.in_dim = in_dim
-        self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
-        self.n_nodes = n_nodes
-        self.use_stochastic = use_stochastic
-
-        layers = []
-        input_size = n_nodes * in_dim
-        n_hidden = num_layers - 1
-        if n_hidden <= 0:
-            layer_sizes = []
-        else:
-            ratio = (latent_dim / input_size) ** (1.0 / n_hidden)
-            layer_sizes = [max(latent_dim, int(round(input_size * ratio ** i))) for i in range(1, n_hidden + 1)]
-
-        in_d = input_size
-        for out_d in layer_sizes:
-            layers.append(nn.Linear(in_d, out_d))
-            layers.append(nn.SiLU())
-            layers.append(nn.Dropout(dropout))
-            in_d = out_d
-        self.backbone = nn.Sequential(*layers)
-
-        final_in = in_d
-        if use_stochastic:
-            self.to_mu = nn.Linear(final_in, latent_dim)
-            self.to_logvar = nn.Linear(final_in, latent_dim)
-        else:
-            self.to_latent = nn.Linear(final_in, latent_dim)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        for m in self.backbone:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        if self.use_stochastic:
-            nn.init.xavier_uniform_(self.to_mu.weight, gain=0.5)
-            nn.init.zeros_(self.to_mu.bias)
-            nn.init.xavier_uniform_(self.to_logvar.weight, gain=0.1)
-            nn.init.zeros_(self.to_logvar.bias)
-        else:
-            nn.init.xavier_uniform_(self.to_latent.weight, gain=1.0)
-            nn.init.zeros_(self.to_latent.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        adj: torch.Tensor,
-        pos: torch.Tensor,
-        batch_size: int = 1,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        B = batch_size
-        x_flat = x.view(B, -1)
-        h = self.backbone(x_flat)
-
-        if self.use_stochastic:
-            mu = self.to_mu(h)
-            logvar = self.to_logvar(h)
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-            return z, mu, logvar
-        else:
-            z = self.to_latent(h)
-            return z, None, None
-
-
-class GraphEncoder(nn.Module):
-    """
-    Graph encoder that maps input events to latent representations.
-    Uses hierarchical pooling to aggregate information into a global latent.
-    
-    Note: Output is normalized to prevent collapse and ensure stable conditioning.
-    """
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        latent_dim: int,
-        depth: int = 3,
-        blocks_per_stage: int = 2,
-        pool_ratio: float = 0.5,
-        dropout: float = 0.0,
-        pos_dim: int = 3,
-        use_stochastic: bool = False,
-    ):
-        super().__init__()
-        self.in_dim = in_dim
-        self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
-        self.depth = depth
-        self.pool_ratio = pool_ratio
-        self.use_stochastic = use_stochastic
-
-        self.in_proj = nn.Linear(in_dim, hidden_dim)
-        
-        self.pos_mlp = nn.Sequential(
-            nn.Linear(pos_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        self.stages = nn.ModuleList([
-            GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
-            for _ in range(depth)
-        ])
-        self.pools = nn.ModuleList([
-            TopKPool(hidden_dim, ratio=pool_ratio)
-            for _ in range(depth)
-        ])
-
-        self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
-
-        self.readout_norm = nn.LayerNorm(hidden_dim)
-
-        if use_stochastic:
-            self.to_mu = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, latent_dim),
-            )
-            self.to_logvar = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, latent_dim),
-            )
-        else:
-            self.to_latent = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, latent_dim),
-            )
-
-        self._cached_block_adj = {}
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        def _init(seq: nn.Sequential, gain: float = 1.0):
-            for m in seq:
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=gain)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-
-        nn.init.xavier_uniform_(self.in_proj.weight, gain=1.0)
-        nn.init.zeros_(self.in_proj.bias)
-        _init(self.pos_mlp, gain=1.0)
-        if self.use_stochastic:
-            _init(self.to_mu, gain=0.5)
-            _init(self.to_logvar, gain=0.1)
-        else:
-            _init(self.to_latent, gain=1.0)
-
-    def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
-        key = (adj.device, adj.size(), adj._nnz(), batch_size)
-        if key in self._cached_block_adj:
-            return self._cached_block_adj[key]
-        adj_binary = to_binary(adj)
-        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
-        self._cached_block_adj[key] = block_adj
-        return block_adj
-
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        adj: torch.Tensor, 
-        pos: torch.Tensor,
-        batch_size: int = 1
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Encode input events to latent representations.
-        
-        Args:
-            x: Node features (B*N, in_dim)
-            adj: Single graph adjacency (N, N)
-            pos: Node positions (N, pos_dim)
-            batch_size: Number of graphs in batch
-            
-        Returns:
-            z: Latent representation (B, latent_dim)
-            mu: Mean if stochastic (B, latent_dim) or None
-            logvar: Log variance if stochastic (B, latent_dim) or None
-        """
-        N_single = adj.size(0)
-        total_nodes = x.size(0)
-        assert total_nodes == batch_size * N_single
-
-        adj0 = self._get_block_adj(adj, batch_size).to(device=x.device, dtype=x.dtype)
-
-        h = self.in_proj(x)
-        pos_tiled = pos.repeat(batch_size, 1)
-        pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
-        pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
-        h = h + pos_emb
-
-        nodes_per_graph = N_single
-        h_cur, adj_cur = h, adj0
-
-        for d in range(self.depth):
-            h_cur = self.stages[d](h_cur, adj_cur)
-            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
-            K = h_pool.size(0)
-            adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
-            h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
-
-        h_cur = self.final_stage(h_cur, adj_cur)
-        h_cur = self.readout_norm(h_cur)
-
-        h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
-        h_mean = h_graph.mean(dim=1)
-        h_std = h_graph.std(dim=1) + 1e-6
-        h_agg = torch.cat([h_mean, h_std], dim=-1)  # (B, hidden_dim * 2)
-
-        if self.use_stochastic:
-            mu = self.to_mu(h_agg)
-            logvar = self.to_logvar(h_agg)
-            logvar = torch.clamp(logvar, min=-10, max=2)
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-            return z, mu, logvar
-        else:
-            z = self.to_latent(h_agg)
-            return z, None, None
-
-
-class DiffAEDataStats:
-    """Compute and store data statistics for normalization."""
-    def __init__(self, mean: float = 0.0, std: float = 1.0):
-        self.mean = mean
-        self.std = std
-    
-    @classmethod
-    def from_loader(cls, loader, n_samples: int = 1000, batch_size: int = 32) -> 'DiffAEDataStats':
-        all_data = []
-        samples_collected = 0
-        while samples_collected < n_samples:
-            batch_np, *_ = loader.get_batch(min(batch_size, n_samples - samples_collected))
-            all_data.append(batch_np.flatten())
-            samples_collected += batch_np.shape[0]
-        all_data = np.concatenate(all_data)
-        return cls(mean=float(np.mean(all_data)), std=float(np.std(all_data)))
-    
-    def normalize(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.mean) / (self.std + 1e-8)
-    
-    def denormalize(self, x: np.ndarray) -> np.ndarray:
-        return x * self.std + self.mean
-
-
-from typing import Union
 
 DataLoaderType = Union[TritiumSSDataLoader, OnlineMSBatcher]
 
@@ -460,7 +88,7 @@ class DiffAEContext:
                 print(f"Using online MS data: delta=[{cfg.ms_data.delta_min}, {cfg.ms_data.delta_max}] bins")
         else:
             loader = TritiumSSDataLoader(cfg.paths.tritium_h5, cfg.paths.channel_positions)
-        
+
         graph = loader.load_adjacency_sparse(
             z_sep=cfg.graph.z_sep,
             radius=cfg.graph.radius,
@@ -519,7 +147,7 @@ class DiffAEContext:
             nn.SiLU(),
             nn.Linear(cfg.conditioning.cond_proj_dim * 2, cfg.conditioning.cond_proj_dim),
         ).to(device)
-        
+
         for m in latent_proj.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
@@ -541,7 +169,6 @@ class DiffAEContext:
 
         regressive_decoder = None
         if cfg.encoder.use_regressive_head:
-            from ae import SimpleGraphDecoder, MLPDecoder
             decoder_type = (getattr(cfg.encoder, "decoder_type", "mlp") or "mlp").lower()
             if decoder_type == "mlp":
                 regressive_decoder = MLPDecoder(
@@ -578,8 +205,8 @@ class DiffAEContext:
             ema_decoder = deepcopy(decoder).to(device)
             ema_latent_proj = deepcopy(latent_proj).to(device)
             all_params = (
-                list(encoder.parameters()) + 
-                list(decoder.parameters()) + 
+                list(encoder.parameters()) +
+                list(decoder.parameters()) +
                 list(latent_proj.parameters())
             )
             if regressive_decoder is not None:
@@ -698,11 +325,11 @@ class DiffAEContext:
         same_latent = self.latest_checkpoint()
         if same_latent is not None:
             return same_latent
-        
+
         parent_dir = os.path.dirname(self.checkpoint_dir)
         if not os.path.isdir(parent_dir):
             return None
-        
+
         all_ckpts = []
         for subdir in os.listdir(parent_dir):
             if subdir.startswith("diffae_z"):
@@ -710,7 +337,7 @@ class DiffAEContext:
                 ckpt_files = sorted(glob.glob(os.path.join(subdir_path, "diffae_epoch_*.pt")))
                 if ckpt_files:
                     all_ckpts.append(ckpt_files[-1])
-        
+
         if all_ckpts:
             return max(all_ckpts, key=os.path.getmtime)
         return None
@@ -718,27 +345,27 @@ class DiffAEContext:
     def load_checkpoint_partial(self, path: str, verbose: bool = True) -> Tuple[int, bool]:
         """
         Load checkpoint with partial weight loading for different latent sizes.
-        
+
         Loads all compatible weights from checkpoint and keeps latent-dependent
         layers freshly initialized if sizes don't match.
-        
+
         Returns:
             (epoch, is_full_load): epoch from checkpoint, True if all weights loaded
         """
         chk = torch.load(path, map_location=self.device)
-        
-        encoder_latent_keys = {'to_latent.weight', 'to_latent.bias', 
-                               'to_mu.weight', 'to_mu.bias', 
+
+        encoder_latent_keys = {'to_latent.weight', 'to_latent.bias',
+                               'to_mu.weight', 'to_mu.bias',
                                'to_logvar.weight', 'to_logvar.bias',
                                'latent_norm.weight', 'latent_norm.bias',
                                'pre_latent_norm.weight', 'pre_latent_norm.bias'}
-        
+
         def load_partial(model: nn.Module, state_dict: dict, skip_keys: set, name: str) -> List[str]:
             """Load state dict, skipping keys with mismatched sizes."""
             model_dict = model.state_dict()
             loaded_keys = []
             skipped_keys = []
-            
+
             for key, value in state_dict.items():
                 if key in skip_keys:
                     skipped_keys.append(key)
@@ -749,29 +376,29 @@ class DiffAEContext:
                         loaded_keys.append(key)
                     else:
                         skipped_keys.append(key)
-            
+
             model.load_state_dict(model_dict)
             if verbose and skipped_keys:
                 print(f"  {name}: loaded {len(loaded_keys)}/{len(state_dict)} keys, skipped: {skipped_keys}")
             return skipped_keys
-        
+
         latent_proj_keys = {'0.weight', '0.bias'}
-        
+
         all_skipped = []
-        
+
         all_skipped.extend(load_partial(self.encoder, chk["encoder"], encoder_latent_keys, "encoder"))
         all_skipped.extend(load_partial(self.decoder, chk["decoder"], set(), "decoder"))
         all_skipped.extend(load_partial(self.latent_proj, chk["latent_proj"], latent_proj_keys, "latent_proj"))
-        
+
         if self.ema_encoder is not None and "ema_encoder" in chk:
             load_partial(self.ema_encoder, chk["ema_encoder"], encoder_latent_keys, "ema_encoder")
         if self.ema_decoder is not None and "ema_decoder" in chk:
             load_partial(self.ema_decoder, chk["ema_decoder"], set(), "ema_decoder")
-        
+
         if "data_stats" in chk:
             self.data_stats.mean = chk["data_stats"]["mean"]
             self.data_stats.std = chk["data_stats"]["std"]
-        
+
         is_full_load = len(all_skipped) == 0
         epoch = int(chk.get("epoch", 0))
         return epoch, is_full_load
@@ -788,11 +415,11 @@ def save_encoded_dataset(
 ) -> str:
     """
     Encode MS events and save latent vectors with delta_mu to h5.
-    
+
     This is designed for the aux task: it encodes MS events and saves the
     latents along with delta_mu targets so that aux training only needs to
     load pre-computed embeddings (no encoder calls during MLP training).
-    
+
     Args:
         ctx: DiffAE context with loader, graph, etc.
         output_path: Path to save the encoded dataset h5 file.
@@ -800,16 +427,16 @@ def save_encoded_dataset(
         batch_size: Batch size for encoding.
         n_samples: Number of MS samples to encode (only for OnlineMSBatcher).
         verbose: Print progress information.
-        
+
     Returns:
         Path to the saved h5 file.
     """
     if encoder is None:
         encoder = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
     encoder.eval()
-    
+
     latent_dim = ctx.cfg.encoder.latent_dim
-    
+
     all_latents = []
     all_delta_mu = []
     all_delta_bins = []
@@ -817,19 +444,19 @@ def save_encoded_dataset(
     all_yc1 = []
     all_xc2 = []
     all_yc2 = []
-    
+
     n_batches = (n_samples + batch_size - 1) // batch_size
     pbar = tqdm(range(n_batches), desc="Encoding MS dataset", disable=not verbose, ncols=120)
-    
+
     samples_encoded = 0
     for batch_idx in pbar:
         remaining = n_samples - samples_encoded
         actual_batch_size = min(batch_size, remaining)
         if actual_batch_size <= 0:
             break
-        
+
         wf_col, cond, *_ = ctx.loader.get_batch(actual_batch_size)
-        
+
         if ctx.use_ms_data:
             xc1 = cond[:, 0]
             yc1 = cond[:, 1]
@@ -843,22 +470,22 @@ def save_encoded_dataset(
             all_yc2.append(yc2)
             all_delta_mu.append(delta_mu)
             all_delta_bins.append(delta_bins)
-        
+
         wf_norm = ctx.data_stats.normalize(wf_col)
         x = torch.from_numpy(wf_norm).to(ctx.device)
         x_flat = x.view(actual_batch_size * ctx.n_nodes, 1)
-        
+
         z, _, _ = encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=actual_batch_size)
         all_latents.append(z.cpu().numpy())
         samples_encoded += actual_batch_size
-    
+
     latents = np.concatenate(all_latents, axis=0)
-    
+
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-    
+
     with h5py.File(output_path, 'w') as f:
         f.create_dataset('latents', data=latents, dtype=np.float32)
-        
+
         if all_delta_mu:
             f.create_dataset('delta_mu', data=np.concatenate(all_delta_mu), dtype=np.float32)
             f.create_dataset('delta_bins', data=np.concatenate(all_delta_bins), dtype=np.float32)
@@ -866,18 +493,16 @@ def save_encoded_dataset(
             f.create_dataset('yc1', data=np.concatenate(all_yc1), dtype=np.float32)
             f.create_dataset('xc2', data=np.concatenate(all_xc2), dtype=np.float32)
             f.create_dataset('yc2', data=np.concatenate(all_yc2), dtype=np.float32)
-        
+
         f.attrs['latent_dim'] = latent_dim
         f.attrs['n_samples'] = samples_encoded
         f.attrs['data_mean'] = ctx.data_stats.mean
         f.attrs['data_std'] = ctx.data_stats.std
         f.attrs['is_ms_data'] = ctx.use_ms_data
-    
+
     if verbose:
         print(f"Saved encoded MS dataset to {output_path}: {samples_encoded} samples, latent_dim={latent_dim}")
-    
-    return output_path
-    
+
     return output_path
 
 
@@ -896,7 +521,7 @@ def sample_diffae(
 ) -> torch.Tensor:
     """
     Sample from DiffAE by encoding reference events then decoding via diffusion.
-    
+
     Args:
         encoder: Graph encoder
         decoder: Diffusion U-Net decoder
@@ -908,30 +533,30 @@ def sample_diffae(
         x_ref: Reference events to encode (B, N, 1)
         parametrization: 'v' or 'eps'
         pbar: Show progress bar
-    
+
     Returns:
         Reconstructed samples (B, 1, N)
     """
     B, N, C = x_ref.shape
     device = x_ref.device
-    
+
     x_ref_flat = x_ref.view(B * N, C)
     z, _, _ = encoder(x_ref_flat, A_sparse, pos, batch_size=B)
     _ = latent_proj  # conditioning now uses z directly
 
     x = torch.randn((B, N, C), device=device)
     T = schedule['betas'].shape[0]
-    
+
     for i in tqdm(reversed(range(T)), desc="Sampling", disable=not pbar, total=T, ncols=150):
         betas_t = schedule['betas'][i]
         sqrt_one_minus_ab_t = schedule['sqrt_one_minus_alphas_cumprod'][i]
         alpha_bar_t = schedule['alphas_cumprod'][i]
         alpha_bar_prev_t = schedule['alphas_cumprod_prev'][i]
-        
+
         t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
         t_emb_batch = t_emb.expand(B, -1)
         cond_full = torch.cat([z, t_emb_batch], dim=-1)
-        
+
         x_flat = x.view(B * N, C)
         pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
         pred = pred_flat.view(B, N, C)
@@ -949,14 +574,14 @@ def sample_diffae(
         coef1 = betas_t * torch.sqrt(torch.clamp(alpha_bar_prev_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
         coef2 = torch.clamp(1.0 - alpha_bar_prev_t, min=0.0) * torch.sqrt(torch.clamp(1.0 - betas_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
         mean = coef1 * x0_pred + coef2 * x
-        
+
         if i > 0:
             posterior_var = schedule['posterior_variance'][i]
             noise = torch.randn_like(x)
             x = mean + torch.sqrt(posterior_var) * noise
         else:
             x = mean
-    
+
     return x.permute(0, 2, 1)  # (B, C, N)
 
 
@@ -979,22 +604,22 @@ def sample_from_latent(
     B = z.shape[0]
     device = z.device
     C = 1
-    
+
     _ = latent_proj  # conditioning now uses z directly
 
     x = torch.randn((B, n_nodes, C), device=device)
     T = schedule['betas'].shape[0]
-    
+
     for i in tqdm(reversed(range(T)), desc="Sampling", disable=not pbar, total=T, ncols=150):
         betas_t = schedule['betas'][i]
         sqrt_one_minus_ab_t = schedule['sqrt_one_minus_alphas_cumprod'][i]
         alpha_bar_t = schedule['alphas_cumprod'][i]
         alpha_bar_prev_t = schedule['alphas_cumprod_prev'][i]
-        
+
         t_emb = sinusoidal_embedding(torch.tensor([i], device=device), time_dim)
         t_emb_batch = t_emb.expand(B, -1)
         cond_full = torch.cat([z, t_emb_batch], dim=-1)
-        
+
         x_flat = x.view(B * n_nodes, C)
         pred_flat = decoder(x_flat, A_sparse, cond_full, pos, batch_size=B)
         pred = pred_flat.view(B, n_nodes, C)
@@ -1012,14 +637,14 @@ def sample_from_latent(
         coef1 = betas_t * torch.sqrt(torch.clamp(alpha_bar_prev_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
         coef2 = torch.clamp(1.0 - alpha_bar_prev_t, min=0.0) * torch.sqrt(torch.clamp(1.0 - betas_t, min=1e-12)) / torch.clamp(1.0 - alpha_bar_t, min=1e-12)
         mean = coef1 * x0_pred + coef2 * x
-        
+
         if i > 0:
             posterior_var = schedule['posterior_variance'][i]
             noise = torch.randn_like(x)
             x = mean + torch.sqrt(posterior_var) * noise
         else:
             x = mean
-    
+
     out = x.permute(0, 2, 1)
     return out
 
@@ -1096,91 +721,12 @@ def sample_diffae_partial(
     return x.permute(0, 2, 1)
 
 
-def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: bool = False):
-    """Visualize event with z axis as time."""
-    x = G.positions_xyz[:, 0].cpu().numpy()
-    y = G.positions_xyz[:, 1].cpu().numpy()
-    z_pos = G.positions_xyz[:, 2].cpu().numpy()
-
-    if ax is None:
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection="3d")
-
-    s = np.clip(event * 20.0, 0.1, 100)
-    mask = event >= 0.5
-    
-    if mask.sum() > 0:
-        scatter = ax.scatter(
-            x[mask], y[mask], z_pos[mask], 
-            c=event[mask], s=s[mask], 
-            cmap='viridis', alpha=0.5
-        )
-        if colorbar:
-            plt.colorbar(scatter, ax=ax, shrink=0.5, aspect=10)
-    
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('t')
-    ax.set_box_aspect([1, 1, 3])
-    return ax
-
-
-def apply_lopsided_augmentation(
-    batch_np: np.ndarray,
-    frac: float = 0.5,
-    sigma: float = 3.0,
-    sample_indices: np.ndarray = None,
-) -> np.ndarray:
-    """Apply deterministic lopsided Gaussian blur based on sample index.
-
-    Each event's augmentation is fixed by its dataset index so the model
-    consistently sees the same events as lopsided across epochs.
-
-    Assignment (by index mod 4):
-        0 -> blur left half
-        1 -> blur right half
-        2, 3 -> no augmentation  (gives frac ~0.5)
-
-    When frac != 0.5 the mod bucket boundaries shift accordingly.
-    If sample_indices is None, falls back to random augmentation.
-
-    Args:
-        batch_np: (B, N, 1) waveforms (pre-normalization)
-        frac: fraction of dataset that is lopsided
-        sigma: Gaussian kernel standard deviation
-        sample_indices: (B,) original dataset indices for deterministic assignment
-    """
-    from scipy.ndimage import gaussian_filter1d
-    B, N, C = batch_np.shape
-    half = N // 2
-
-    if sample_indices is None:
-        n_aug = max(1, int(B * frac))
-        idx = np.random.choice(B, size=n_aug, replace=False)
-        sides = np.random.randint(0, 2, size=n_aug)
-        for i, side in zip(idx, sides):
-            if side == 0:
-                batch_np[i, :half, 0] = gaussian_filter1d(batch_np[i, :half, 0], sigma=sigma)
-            else:
-                batch_np[i, half:, 0] = gaussian_filter1d(batch_np[i, half:, 0], sigma=sigma)
-        return batch_np
-
-    buckets = int(round(1.0 / max(frac, 1e-6)))
-    for i in range(B):
-        mod = int(sample_indices[i]) % max(buckets, 2)
-        if mod == 0:
-            batch_np[i, :half, 0] = gaussian_filter1d(batch_np[i, :half, 0], sigma=sigma)
-        elif mod == 1:
-            batch_np[i, half:, 0] = gaussian_filter1d(batch_np[i, half:, 0], sigma=sigma)
-    return batch_np
-
-
 def train_diffae(cfg: Config = default_config):
     """Main DiffAE training function."""
     print_config(cfg, include_encoder=True)
-    
+
     ctx = DiffAEContext.build(cfg, for_training=True, verbose=True)
-    
+
     device_t = ctx.device
     encoder = ctx.encoder
     decoder = ctx.decoder
@@ -1212,7 +758,7 @@ def train_diffae(cfg: Config = default_config):
             except Exception as e:
                 print(f"Could not resume exact checkpoint: {e}")
                 start_epoch = 0
-        
+
         if start_epoch == 0:
             best_ckpt = ctx.find_best_checkpoint()
             if best_ckpt is not None:
@@ -1230,7 +776,7 @@ def train_diffae(cfg: Config = default_config):
         g["lr"] = cfg.training.lr
 
     B = cfg.training.batch_size
-    
+
     global_step = start_epoch * cfg.training.steps_per_epoch
     encoded_output_path = os.path.join(ctx.checkpoint_dir, "encoded_ms_latents.h5")
 
@@ -1247,7 +793,7 @@ def train_diffae(cfg: Config = default_config):
         epoch_kl = 0.0
         epoch_reg_loss = 0.0
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
-        
+
         for step in pbar:
             batch_np, _, sample_idx = tr.get_batch(B)
             if cfg.training.lopsided_aug:
@@ -1255,12 +801,12 @@ def train_diffae(cfg: Config = default_config):
                     batch_np, frac=cfg.training.lopsided_frac, sigma=cfg.training.lopsided_sigma,
                     sample_indices=sample_idx)
             batch_np = data_stats.normalize(batch_np)
-            
+
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
             x0_flat = x0.view(B * n_nodes, 1)
-            
+
             z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B)
-            
+
             if step == 0 and epoch % 50 == 0:
                 with torch.no_grad():
                     z_std = z.std().item()
@@ -1271,7 +817,7 @@ def train_diffae(cfg: Config = default_config):
                     print(f"\n  [Monitor] Latent z: std={z_std:.4f}, within-batch similarity={z_sim:.4f}")
                     if z_sim > 0.95:
                         print(f"  [WARNING] Latent similarity is very high - encoder may be collapsing!")
-            
+
             t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=device_t, dtype=torch.long)
             t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
             cond_full = torch.cat([z, t_emb], dim=-1)
@@ -1295,7 +841,7 @@ def train_diffae(cfg: Config = default_config):
                 raise ValueError("parametrization must be 'eps' or 'v'")
 
             mse_per_sample = F.mse_loss(pred, target, reduction='none').mean(dim=(1, 2))
-            
+
             if cfg.diffusion.p2_gamma > 0.0:
                 weight = torch.pow(cfg.diffusion.p2_k + snr_t, -cfg.diffusion.p2_gamma)
                 mse_per_sample = mse_per_sample * weight
@@ -1318,12 +864,12 @@ def train_diffae(cfg: Config = default_config):
                 print(f"  WARNING: NaN/Inf loss at step {step}! Skipping...")
                 optim.zero_grad(set_to_none=True)
                 continue
-            
+
             epoch_loss += float(loss.item())
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
-            
+
             clip_params = list(encoder.parameters()) + list(decoder.parameters()) + list(latent_proj.parameters())
             if use_regressive:
                 clip_params += list(regressive_decoder.parameters())
@@ -1370,7 +916,7 @@ def train_diffae(cfg: Config = default_config):
                         sample_indices=sample_idx)
                 batch_np_norm = data_stats.normalize(batch_np)
                 x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(device_t)
-                
+
                 samples = sample_diffae(
                     encoder=ema_encoder,
                     decoder=ema_decoder,
@@ -1384,7 +930,7 @@ def train_diffae(cfg: Config = default_config):
                 )
                 samples_denorm = data_stats.denormalize(samples.cpu().numpy())
                 samples_denorm = np.clip(samples_denorm, 0, None)
-                
+
                 true_data = batch_np[:, :, 0]
                 gen_data = samples_denorm[:, 0, :]
                 print(f"\n  [Vis] True data - mean: {true_data.mean():.4f}, std: {true_data.std():.4f}")
@@ -1392,7 +938,7 @@ def train_diffae(cfg: Config = default_config):
 
             plots_dir = f"{ctx.plot_dir}/epoch_{epoch}"
             os.makedirs(plots_dir, exist_ok=True)
-            
+
             for idx in range(samples.shape[0]):
                 rec_int = samples_denorm[idx, 0]
                 true_int = batch_np[idx, :, 0]
@@ -1405,7 +951,7 @@ def train_diffae(cfg: Config = default_config):
 
                 adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
                 Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))
-                
+
                 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
                 visualize_event(Gxy, true_xy, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
@@ -1428,13 +974,13 @@ def train_diffae(cfg: Config = default_config):
 def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
     """Generate interpolations between two events in latent space."""
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=True)
-    
+
     latest_ckpt = ctx.latest_checkpoint()
     if latest_ckpt is None:
         raise FileNotFoundError(f"No checkpoints found in {ctx.checkpoint_dir}")
     print(f"Loading checkpoint: {latest_ckpt}")
     ctx.load_checkpoint(latest_ckpt, load_optim=False)
-    
+
     ctx.encoder.eval()
     ctx.decoder.eval()
 
@@ -1442,7 +988,7 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
         batch_np, *_ = ctx.loader.get_batch(2)
         batch_np_norm = ctx.data_stats.normalize(batch_np)
         x_ref = torch.from_numpy(batch_np_norm.astype(np.float32)).to(ctx.device)
-        
+
         x_ref_flat = x_ref.view(2 * ctx.n_nodes, 1)
         z, _, _ = ctx.encoder(x_ref_flat, ctx.A_sparse, ctx.pos, batch_size=2)
         z1, z2 = z[0], z[1]
@@ -1462,33 +1008,33 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
             parametrization=cfg.diffusion.parametrization,
             pbar=True,
         )
-        
+
         samples_denorm = ctx.data_stats.denormalize(samples.cpu().numpy())
         samples_denorm = np.clip(samples_denorm, 0, None)
 
     plots_dir = f"{ctx.plot_dir}/interpolation"
     os.makedirs(plots_dir, exist_ok=True)
-    
+
     channel_positions = ctx.loader.channel_positions
     adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
-    
+
     fig, axes = plt.subplots(1, n_steps + 2, figsize=(3 * (n_steps + 2), 3))
-    
+
     true1 = batch_np[0, :, 0].reshape(ctx.n_channels, ctx.n_time_points, order='F').sum(axis=1)
     true2 = batch_np[1, :, 0].reshape(ctx.n_channels, ctx.n_time_points, order='F').sum(axis=1)
-    
+
     Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(ctx.n_channels, dtype=np.float32))
     visualize_event(Gxy, true1, None, ax=axes[0])
     axes[0].set_title("Event A")
-    
+
     for i in range(n_steps):
         interp_xy = samples_denorm[i, 0].reshape(ctx.n_channels, ctx.n_time_points, order='F').sum(axis=1)
         visualize_event(Gxy, interp_xy, None, ax=axes[i + 1])
         axes[i + 1].set_title(f"α={alphas[i].item():.2f}")
-    
+
     visualize_event(Gxy, true2, None, ax=axes[-1])
     axes[-1].set_title("Event B")
-    
+
     plt.tight_layout()
     fig.savefig(f"{plots_dir}/interpolation.png", dpi=150)
     plt.close(fig)
