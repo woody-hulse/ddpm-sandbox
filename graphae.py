@@ -29,7 +29,7 @@ from ae import DiffAEDataStats, apply_lopsided_augmentation
 from config import Config, default_config, get_config, print_config
 from data import Graph, SparseGraph, visualize_event, visualize_event_z
 from lz_data_loader import OnlineMSBatcher, TritiumSSDataLoader
-from models.graph_unet import TopKPool, _unpool_like, build_block_diagonal_adj
+from models.graph_unet import GraclusPool, _unpool_like, build_block_diagonal_adj
 from utils.sparse_ops import subgraph_coo, to_binary, to_coalesced_coo
 from utils.visualization import build_xy_adjacency_radius
 
@@ -119,10 +119,7 @@ class GraphEncoder(nn.Module):
             GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
             for _ in range(depth)
         ])
-        self.pools = nn.ModuleList([
-            TopKPool(hidden_dim, ratio=pool_ratio)
-            for _ in range(depth)
-        ])
+        self.pool = GraclusPool()
 
         self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
 
@@ -208,15 +205,16 @@ class GraphEncoder(nn.Module):
         pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
         h = h + pos_emb
 
-        nodes_per_graph = N_single
+        adj_single = adj
         h_cur, adj_cur = h, adj0
+        nodes_per_graph = N_single
 
         for d in range(self.depth):
             h_cur = self.stages[d](h_cur, adj_cur)
-            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
-            K = h_pool.size(0)
-            adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
-            h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
+            h_cur, _assign, adj_single_coarse, K = self.pool(h_cur, adj_single, batch_size)
+            adj_single = adj_single_coarse
+            adj_cur = self._get_block_adj(adj_single, batch_size).to(device=h_cur.device, dtype=h_cur.dtype)
+            nodes_per_graph = K
 
         h_cur = self.final_stage(h_cur, adj_cur)
         h_cur = self.readout_norm(h_cur)
@@ -471,10 +469,7 @@ class GraphAEEncoder(nn.Module):
             GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
             for _ in range(depth)
         ])
-        self.pools = nn.ModuleList([
-            TopKPool(hidden_dim, ratio=pool_ratio)
-            for _ in range(depth)
-        ])
+        self.pool = GraclusPool()
 
         self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
 
@@ -509,13 +504,13 @@ class GraphAEEncoder(nn.Module):
         adj: torch.Tensor,
         pos: torch.Tensor,
         batch_size: int = 1
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]]]:
         """
         Encode input events to latent representations.
 
         Returns:
             z: Latent representation (B, latent_dim)
-            pool_indices: List of (keep_idx, N_prev, npg_prev) for decoder
+            pool_indices: List of (assign, K, adj_single_fine, adj_single_coarse) for decoder
         """
         N_single = adj.size(0)
         total_nodes = x.size(0)
@@ -529,19 +524,19 @@ class GraphAEEncoder(nn.Module):
         pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
         h = h + pos_emb
 
-        nodes_per_graph = N_single
+        adj_single = adj
         h_cur, adj_cur = h, adj0
+        nodes_per_graph = N_single
 
-        pool_indices = []
+        pool_indices: List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]] = []
         for d in range(self.depth):
             h_cur = self.stages[d](h_cur, adj_cur)
-            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
-
-            pool_indices.append((keep_idx, h_cur.size(0), nodes_per_graph))
-
-            K = h_pool.size(0)
-            adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
-            h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
+            adj_single_fine = adj_single
+            h_cur, assign, adj_single_coarse, K = self.pool(h_cur, adj_single, batch_size)
+            pool_indices.append((assign, K, adj_single_fine, adj_single_coarse))
+            adj_single = adj_single_coarse
+            adj_cur = self._get_block_adj(adj_single, batch_size).to(device=h_cur.device, dtype=h_cur.dtype)
+            nodes_per_graph = K
 
         h_cur = self.final_stage(h_cur, adj_cur)
 
@@ -716,7 +711,7 @@ class GraphTransposeDecoder(nn.Module):
     Mirror decoder for GraphAEEncoder outputs.
 
     Expects encoder pooling indices:
-        pool_indices[d] = (keep_idx, N_prev_total, nodes_per_graph_prev)
+        pool_indices[d] = (assign, K, adj_single_fine, adj_single_coarse)
     """
 
     def __init__(
@@ -739,15 +734,10 @@ class GraphTransposeDecoder(nn.Module):
         self.depth = depth
         self.pool_ratio = pool_ratio
 
-        deepest_nodes = n_nodes
-        for _ in range(depth):
-            deepest_nodes = max(1, int(math.ceil(deepest_nodes * pool_ratio)))
-        self.deepest_nodes = deepest_nodes
-
         self.latent_proj = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim * 2),
             nn.SiLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * deepest_nodes),
+            nn.Linear(hidden_dim * 2, hidden_dim),
         )
 
         self.bottleneck = GraphTransposeDecoderStage(
@@ -797,42 +787,34 @@ class GraphTransposeDecoder(nn.Module):
     def _transpose_adj(adj: torch.Tensor) -> torch.Tensor:
         return to_coalesced_coo(adj.transpose(0, 1))
 
-    def _build_adj_pyramid(
-        self,
-        adj0: torch.Tensor,
-        pool_indices: List[Tuple[torch.Tensor, int, int]],
-    ) -> List[torch.Tensor]:
-        adjs = [adj0]
-        adj_cur = adj0
-        for keep_idx, _, _ in pool_indices:
-            K = int(keep_idx.numel())
-            adj_cur = to_binary(subgraph_coo(adj_cur, keep_idx, K))
-            adjs.append(adj_cur)
-        return adjs
-
     def forward(
         self,
         z: torch.Tensor,
         adj: torch.Tensor,
         pos: torch.Tensor,
-        pool_indices: List[Tuple[torch.Tensor, int, int]],
+        pool_indices: List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]],
         batch_size: int = 1,
     ) -> torch.Tensor:
         B = batch_size
-        N_single = adj.size(0)
         if len(pool_indices) != self.depth:
             raise ValueError(f"Expected {self.depth} pool levels, got {len(pool_indices)}")
 
-        adj0 = self._get_block_adj(adj, B).to(device=z.device, dtype=z.dtype)
-        adjs = self._build_adj_pyramid(adj0, pool_indices)
-
-        h = self.latent_proj(z).view(B * self.deepest_nodes, self.hidden_dim)
-        h = self.bottleneck(h, self._transpose_adj(adjs[-1]))
+        # Broadcast latent to coarsest nodes
+        _, K_coarsest, _, adj_single_coarsest = pool_indices[-1]
+        h = self.latent_proj(z)  # (B, hidden_dim)
+        h = h.unsqueeze(1).expand(-1, K_coarsest, -1).reshape(B * K_coarsest, self.hidden_dim)
+        adj_cur = self._get_block_adj(adj_single_coarsest, B).to(device=z.device, dtype=z.dtype)
+        h = self.bottleneck(h, self._transpose_adj(adj_cur))
 
         for d in reversed(range(self.depth)):
-            keep_idx, N_prev, _ = pool_indices[d]
-            h = _unpool_like(h, keep_idx, N_prev)
-            h = self.stages[d](h, self._transpose_adj(adjs[d]))
+            assign, K_coarse, adj_single_fine, _ = pool_indices[d]
+            # Prolongation: gather coarse features to fine nodes
+            assign_exp = assign.unsqueeze(0).expand(B, -1)  # (B, N_fine)
+            offsets = torch.arange(B, device=z.device).unsqueeze(1) * K_coarse
+            global_assign = (assign_exp + offsets).reshape(-1)  # (B*N_fine,)
+            h = h[global_assign]  # (B*N_fine, hidden_dim)
+            adj_cur = self._get_block_adj(adj_single_fine, B).to(device=z.device, dtype=z.dtype)
+            h = self.stages[d](h, self._transpose_adj(adj_cur))
 
         pos_tiled = pos.repeat(B, 1)
         pos_norm = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (
@@ -889,7 +871,7 @@ class GraphAutoencoder(nn.Module):
         adj: torch.Tensor,
         pos: torch.Tensor,
         batch_size: int = 1,
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]]]:
         return self.encoder(x, adj, pos, batch_size=batch_size)
 
     def decode(
@@ -897,7 +879,7 @@ class GraphAutoencoder(nn.Module):
         z: torch.Tensor,
         adj: torch.Tensor,
         pos: torch.Tensor,
-        pool_indices: List[Tuple[torch.Tensor, int, int]],
+        pool_indices: List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]],
         batch_size: int = 1,
     ) -> torch.Tensor:
         return self.decoder(z, adj, pos, pool_indices, batch_size=batch_size)

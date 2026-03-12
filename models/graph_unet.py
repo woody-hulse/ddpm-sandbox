@@ -143,6 +143,106 @@ def _unpool_like(x_small: torch.Tensor, keep_idx: torch.Tensor, N: int) -> torch
     return x_big
 
 
+def build_block_diagonal_rect(P: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Build block-diagonal of rectangular sparse P (N, K) → (B*N, B*K)."""
+    P = to_coalesced_coo(P)
+    N, K = P.size()
+    indices = P.indices()
+    values = P.values()
+    all_indices = []
+    all_values = []
+    for b in range(batch_size):
+        offsets = torch.tensor([[b * N], [b * K]], device=indices.device, dtype=indices.dtype)
+        all_indices.append(indices + offsets)
+        all_values.append(values)
+    final_indices = torch.cat(all_indices, dim=1)
+    final_values = torch.cat(all_values, dim=0)
+    return torch.sparse_coo_tensor(
+        final_indices, final_values,
+        size=(batch_size * N, batch_size * K),
+        device=P.device, dtype=P.dtype,
+    ).coalesce()
+
+
+class GraclusPool(nn.Module):
+    """
+    Graph coarsening via Graclus greedy matching.
+    Precomputes matching on first use, cached by (device, N, nnz).
+    Every fine node maps to exactly one coarse cluster — no information loss.
+    pool_indices entry: (assign, K, adj_single_fine, adj_single_coarse)
+    """
+    def __init__(self):
+        super().__init__()
+        self._cache: dict = {}
+
+    @staticmethod
+    def _greedy_matching(adj: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        adj_coo = to_coalesced_coo(adj).cpu()
+        N = adj_coo.size(0)
+        rows = adj_coo.indices()[0].tolist()
+        cols = adj_coo.indices()[1].tolist()
+        neighbors: List[List[int]] = [[] for _ in range(N)]
+        for r, c in zip(rows, cols):
+            if r != c:
+                neighbors[r].append(c)
+        assign = [-1] * N
+        K = 0
+        for i in range(N):
+            if assign[i] != -1:
+                continue
+            assign[i] = K
+            for j in neighbors[i]:
+                if assign[j] == -1:
+                    assign[j] = K
+                    break
+            K += 1
+        return torch.tensor(assign, dtype=torch.long), K
+
+    @staticmethod
+    def _coarsen_adj(adj_single: torch.Tensor, assign: torch.Tensor, K: int) -> torch.Tensor:
+        """
+        Compute coarse adjacency via edge-level scatter — no dense materialization.
+
+        For each edge (i, j) in adj_single, map it to (assign[i], assign[j]) in A_coarse.
+        Self-loops (assign[i] == assign[j]) are dropped by to_binary.
+        """
+        adj_coo = to_coalesced_coo(adj_single)
+        rows_fine = adj_coo.indices()[0]   # (nnz,)
+        cols_fine = adj_coo.indices()[1]   # (nnz,)
+        rows_coarse = assign[rows_fine]
+        cols_coarse = assign[cols_fine]
+        coarse_vals = torch.ones(rows_coarse.size(0), dtype=adj_single.dtype, device=adj_single.device)
+        A_coarse_raw = torch.sparse_coo_tensor(
+            torch.stack([rows_coarse, cols_coarse]),
+            coarse_vals, size=(K, K), device=adj_single.device,
+        ).coalesce()
+        return to_binary(A_coarse_raw)
+
+    def _get(self, adj_single: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        key = (str(adj_single.device), adj_single.size(0), adj_single._nnz())
+        if key not in self._cache:
+            N = adj_single.size(0)
+            assign, K = self._greedy_matching(adj_single)
+            assign = assign.to(adj_single.device)
+            cluster_sizes = torch.bincount(assign, minlength=K).float()
+            weights = (1.0 / cluster_sizes[assign]).to(adj_single.dtype)
+            P = torch.sparse_coo_tensor(
+                torch.stack([torch.arange(N, device=adj_single.device), assign]),
+                weights, size=(N, K), device=adj_single.device,
+            ).coalesce()
+            A_coarse = self._coarsen_adj(adj_single, assign, K)
+            self._cache[key] = (assign, P, A_coarse, K)
+        return self._cache[key]
+
+    def forward(
+        self, h: torch.Tensor, adj_single: torch.Tensor, batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        assign, P_single, adj_coarse, K = self._get(adj_single)
+        P_block = build_block_diagonal_rect(P_single, batch_size).to(device=h.device, dtype=h.dtype)
+        h_coarse = torch.sparse.mm(P_block.t(), h)
+        return h_coarse, assign, adj_coarse, K
+
+
 class GraphUNetStage(nn.Module):
     def __init__(self, hidden_dim: int, cond_dim: int, blocks_per_stage: int = 1, dropout: float = 0.0):
         super().__init__()
