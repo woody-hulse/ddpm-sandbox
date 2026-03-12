@@ -46,7 +46,7 @@ class EncoderConfig:
 
     The encoder maps input graphs to latent representations.
     use_stochastic and kl_weight apply only to DiffAE's encoder.
-    decoder_type applies only to Graph AE: "graph" or "mlp".
+    decoder_type applies only to AE: "graph", "cnn", or "mlp".
     """
     latent_dim: int = 64            # Latent representation dimension
     hidden_dim: int = 64            # Hidden dimension in encoder layers
@@ -56,8 +56,8 @@ class EncoderConfig:
     dropout: float = 0.0            # Dropout rate
     use_stochastic: bool = False    # DiffAE encoder: stochastic (VAE-style) encoding
     kl_weight: float = 0.001        # DiffAE: KL weight when use_stochastic
-    encoder_type: str = "cnn"     # Encoder: "cnn", "mlp", or "graph"
-    decoder_type: str = "mlp"     # AE decoder: "graph" (SimpleGraphDecoder) or "mlp"
+    encoder_type: str = "graph"   # Encoder: "cnn", "mlp", or "graph"
+    decoder_type: str = "cnn"     # AE decoder: "graph" (SimpleGraphDecoder), "cnn", or "mlp"
     mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
     mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
     use_regressive_head: bool = False   # DiffAE: add a second decoder head with regressive (MSE) loss
@@ -143,6 +143,12 @@ class TrainingConfig:
     weight_decay: float = 0         # AdamW weight decay
     ema_decay: float = 0.999        # Exponential moving average decay
     grad_clip: float = 1.0          # Gradient clipping norm
+
+    # AE-specific regularization (applies in train_ae)
+    ae_denoising: bool = False      # Optional denoising mode (corrupt input, reconstruct clean)
+    ae_input_noise_std: float = 0.05  # Gaussian input corruption std (normalized space)
+    ae_mask_prob: float = 0.10      # Random feature masking probability for denoising AE
+    ae_latent_l1_weight: float = 0.0  # Optional L1 sparsity penalty on latent activations
     
     # Augmentation
     lopsided_aug: bool = True       # Apply lopsided Gaussian blur to fraction of events
@@ -150,8 +156,8 @@ class TrainingConfig:
     lopsided_sigma: float = 10.0    # Gaussian kernel sigma for lopsided augmentation
 
     # Checkpointing
-    checkpoint_every: int = 25     # Save checkpoint every N epochs
-    visualize_every: int = 25      # Generate visualizations every N epochs
+    checkpoint_every: int = 100     # Save checkpoint every N epochs
+    visualize_every: int = 100      # Generate visualizations every N epochs
     
     # Encoded dataset export (for aux task)
     encode_dataset_every: int = 500    # Export encoded latents every N epochs (0 = disable)

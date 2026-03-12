@@ -199,13 +199,22 @@ def reduce_pca(latents: np.ndarray, **kwargs):
 
 
 def reduce_umap(latents: np.ndarray, **kwargs):
-    import umap
-    reducer = umap.UMAP(
+    # Import UMAP class directly to avoid triggering optional parametric/tensorflow imports.
+    from umap.umap_ import UMAP
+    reducer = UMAP(
         n_neighbors=kwargs.get("n_neighbors", 15),
         min_dist=kwargs.get("min_dist", 0.1),
         random_state=kwargs.get("seed", 42),
     )
-    return reducer.fit_transform(latents)
+    try:
+        return reducer.fit_transform(latents)
+    except TypeError as e:
+        if "force_all_finite" in str(e):
+            raise RuntimeError(
+                "UMAP/scikit-learn version mismatch detected. "
+                "Pin scikit-learn to a compatible version (e.g. 1.5.2)."
+            ) from e
+        raise
 
 
 def reduce_tsne(latents: np.ndarray, **kwargs):

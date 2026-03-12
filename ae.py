@@ -38,6 +38,21 @@ from utils.sparse_ops import to_coalesced_coo, subgraph_coo, to_binary
 from utils.visualization import build_xy_adjacency_radius
 
 
+def corrupt_ae_input(
+    x_clean: torch.Tensor,
+    noise_std: float = 0.05,
+    mask_prob: float = 0.1,
+) -> torch.Tensor:
+    """Apply denoising-AE style corruption in normalized space."""
+    x_noisy = x_clean
+    if noise_std > 0.0:
+        x_noisy = x_noisy + noise_std * torch.randn_like(x_noisy)
+    if mask_prob > 0.0:
+        keep = (torch.rand_like(x_noisy) > mask_prob).to(x_noisy.dtype)
+        x_noisy = x_noisy * keep
+    return x_noisy
+
+
 class GraphDecoderBlock(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
         super().__init__()
@@ -277,6 +292,75 @@ class Conv1DEncoder(nn.Module):
         h = self.backbone(x_2d)
         z = self.to_latent(h)
         return z, []
+
+
+class Conv1DDecoder(nn.Module):
+    """
+    1D CNN decoder for AE: latent -> waveform with learned upsampling + conv refinement.
+    Same interface as MLPDecoder/SimpleGraphDecoder.
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        out_dim: int,
+        n_nodes: int,
+        dropout: float = 0.0,
+        channels: tuple = (32, 64, 128),
+        kernel_size: int = 7,
+        pool_size: int = 4,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.out_dim = out_dim
+        self.n_nodes = n_nodes
+        self.pool_size = pool_size
+        self.start_width = 4
+
+        self.from_latent = nn.Linear(latent_dim, channels[-1] * self.start_width)
+
+        hidden_channels = list(reversed(channels[:-1]))  # e.g. [64, 32]
+        blocks = []
+        in_ch = channels[-1]
+        for out_ch in hidden_channels:
+            blocks.append(nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size, padding=kernel_size // 2),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+            ))
+            in_ch = out_ch
+        self.blocks = nn.ModuleList(blocks)
+        self.out_conv = nn.Conv1d(in_ch, out_dim, kernel_size, padding=kernel_size // 2)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.from_latent.weight, gain=1.0)
+        nn.init.zeros_(self.from_latent.bias)
+        for blk in self.blocks:
+            conv = blk[0]
+            nn.init.xavier_uniform_(conv.weight, gain=1.0)
+            if conv.bias is not None:
+                nn.init.zeros_(conv.bias)
+        nn.init.xavier_uniform_(self.out_conv.weight, gain=1.0)
+        if self.out_conv.bias is not None:
+            nn.init.zeros_(self.out_conv.bias)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        adj: torch.Tensor,
+        pos: torch.Tensor,
+        batch_size: int = 1,
+    ) -> torch.Tensor:
+        B = batch_size
+        h = self.from_latent(z).view(B, -1, self.start_width)  # (B, C, 4)
+        for blk in self.blocks:
+            h = F.interpolate(h, scale_factor=self.pool_size, mode='linear', align_corners=False)
+            h = blk(h)
+
+        # Ensure exact target length regardless of pooling arithmetic.
+        h = F.interpolate(h, size=self.n_nodes, mode='linear', align_corners=False)
+        out = self.out_conv(h)  # (B, out_dim, N)
+        return out.permute(0, 2, 1).reshape(B * self.n_nodes, self.out_dim)
 
 
 class MLPEncoder(nn.Module):
@@ -718,6 +802,13 @@ class AEContext:
                 num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
                 dropout=cfg.encoder.dropout,
             ).to(device)
+        elif decoder_type == "cnn":
+            decoder = Conv1DDecoder(
+                latent_dim=cfg.encoder.latent_dim,
+                out_dim=cfg.model.out_dim,
+                n_nodes=n_nodes,
+                dropout=cfg.encoder.dropout,
+            ).to(device)
         else:
             decoder = SimpleGraphDecoder(
                 latent_dim=cfg.encoder.latent_dim,
@@ -1098,11 +1189,18 @@ def train_ae(cfg: Config = default_config):
 
     if cfg.training.lopsided_aug:
         print(f"  Lopsided augmentation ON: frac={cfg.training.lopsided_frac}, sigma={cfg.training.lopsided_sigma}")
+    print(
+        f"  AE denoising: {cfg.training.ae_denoising} "
+        f"(noise_std={cfg.training.ae_input_noise_std}, mask_prob={cfg.training.ae_mask_prob}), "
+        f"latent_l1={cfg.training.ae_latent_l1_weight}"
+    )
 
     for epoch in range(start_epoch, cfg.training.epochs):
         encoder.train()
         decoder.train()
         epoch_loss = 0.0
+        epoch_recon = 0.0
+        epoch_l1 = 0.0
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
@@ -1114,12 +1212,21 @@ def train_ae(cfg: Config = default_config):
             batch_np = data_stats.normalize(batch_np)
             
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
-            x0_flat = x0.view(B * n_nodes, 1)
+            x_in = x0
+            if cfg.training.ae_denoising:
+                x_in = corrupt_ae_input(
+                    x0,
+                    noise_std=cfg.training.ae_input_noise_std,
+                    mask_prob=cfg.training.ae_mask_prob,
+                )
+            x_in_flat = x_in.view(B * n_nodes, 1)
             
-            z, _ = encoder(x0_flat, A_sparse, pos, batch_size=B)
+            z, _ = encoder(x_in_flat, A_sparse, pos, batch_size=B)
             rec_flat = decoder(z, A_sparse, pos, batch_size=B)
             rec = rec_flat.view(B, n_nodes, 1)
-            loss = F.mse_loss(rec, x0, reduction='mean')
+            recon_loss = F.mse_loss(rec, x0, reduction='mean')
+            l1_loss = z.abs().mean() if cfg.training.ae_latent_l1_weight > 0 else torch.zeros((), device=z.device)
+            loss = recon_loss + cfg.training.ae_latent_l1_weight * l1_loss
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"  WARNING: NaN/Inf loss at step {step}! Skipping...")
@@ -1127,6 +1234,8 @@ def train_ae(cfg: Config = default_config):
                 continue
             
             epoch_loss += float(loss.item())
+            epoch_recon += float(recon_loss.item())
+            epoch_l1 += float(l1_loss.item())
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -1145,7 +1254,11 @@ def train_ae(cfg: Config = default_config):
 
             global_step += 1
 
-            pbar.set_postfix(loss=epoch_loss / (step + 1))
+            pbar.set_postfix(
+                loss=epoch_loss / (step + 1),
+                recon=epoch_recon / (step + 1),
+                l1=epoch_l1 / (step + 1),
+            )
 
         if (epoch + 1) % cfg.training.checkpoint_every == 0:
             ctx.save_checkpoint(epoch)

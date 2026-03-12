@@ -51,12 +51,14 @@ class GraphEncoderBlock(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
-        self.lin1 = nn.Linear(hidden_dim, hidden_dim)
-        self.lin2 = nn.Linear(hidden_dim, hidden_dim)
+        self.post_agg_norm = nn.LayerNorm(hidden_dim)
+        ffn_dim = hidden_dim * 2
+        self.lin1 = nn.Linear(hidden_dim, ffn_dim)
+        self.lin2 = nn.Linear(ffn_dim, hidden_dim)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.eps = nn.Parameter(torch.tensor(eps_init))
-        
+
         nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
         nn.init.zeros_(self.lin1.bias)
         nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
@@ -65,7 +67,7 @@ class GraphEncoderBlock(nn.Module):
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
         neighbor_sum = torch.sparse.mm(adj, h)
-        h = (1 + self.eps) * h + neighbor_sum
+        h = self.post_agg_norm((1 + self.eps) * h + neighbor_sum)
         h = self.lin1(h)
         h = self.act(h)
         h = self.lin2(h)
@@ -270,31 +272,45 @@ class GraphEncoder(nn.Module):
 
         self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
 
+        self.readout_norm = nn.LayerNorm(hidden_dim)
+
         if use_stochastic:
-            self.to_mu = nn.Linear(hidden_dim * 2, latent_dim)
-            self.to_logvar = nn.Linear(hidden_dim * 2, latent_dim)
+            self.to_mu = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+            self.to_logvar = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
         else:
-            self.to_latent = nn.Linear(hidden_dim * 2, latent_dim)
+            self.to_latent = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
 
         self._cached_block_adj = {}
         self.reset_parameters()
 
     def reset_parameters(self):
+        def _init(seq: nn.Sequential, gain: float = 1.0):
+            for m in seq:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=gain)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
         nn.init.xavier_uniform_(self.in_proj.weight, gain=1.0)
         nn.init.zeros_(self.in_proj.bias)
-        for m in self.pos_mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        _init(self.pos_mlp, gain=1.0)
         if self.use_stochastic:
-            nn.init.xavier_uniform_(self.to_mu.weight, gain=0.5)
-            nn.init.zeros_(self.to_mu.bias)
-            nn.init.xavier_uniform_(self.to_logvar.weight, gain=0.1)
-            nn.init.zeros_(self.to_logvar.bias)
+            _init(self.to_mu, gain=0.5)
+            _init(self.to_logvar, gain=0.1)
         else:
-            nn.init.xavier_uniform_(self.to_latent.weight, gain=1.0)
-            nn.init.zeros_(self.to_latent.bias)
+            _init(self.to_latent, gain=1.0)
 
     def _get_block_adj(self, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
         key = (adj.device, adj.size(), adj._nnz(), batch_size)
@@ -349,6 +365,7 @@ class GraphEncoder(nn.Module):
             h_cur, adj_cur, nodes_per_graph = h_pool, adj_next, k_per_graph
 
         h_cur = self.final_stage(h_cur, adj_cur)
+        h_cur = self.readout_norm(h_cur)
 
         h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
         h_mean = h_graph.mean(dim=1)
