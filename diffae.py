@@ -939,18 +939,18 @@ def train_diffae(cfg: Config = default_config):
             plots_dir = f"{ctx.plot_dir}/epoch_{epoch}"
             os.makedirs(plots_dir, exist_ok=True)
 
+            adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
+            Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))
+            Gz = Graph(adjacency=np.eye(n_channels, dtype=np.float32), positions_xy=channel_positions, positions_z=np.arange(n_time_points, dtype=np.float32))
+
             for idx in range(samples.shape[0]):
                 rec_int = samples_denorm[idx, 0]
                 true_int = batch_np[idx, :, 0]
 
                 rec_xy = rec_int.reshape(n_channels, n_time_points, order='F').sum(axis=1)
                 true_xy = true_int.reshape(n_channels, n_time_points, order='F').sum(axis=1)
-
                 rec_z = rec_int.reshape(n_channels, n_time_points, order='F')
                 true_z = true_int.reshape(n_channels, n_time_points, order='F')
-
-                adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
-                Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))
 
                 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
                 visualize_event(Gxy, true_xy, None, ax=axes[0])
@@ -962,12 +962,31 @@ def train_diffae(cfg: Config = default_config):
                 plt.close(fig)
 
                 fig, axes = plt.subplots(1, 2, figsize=(10, 3))
-                visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), true_z, None, ax=axes[0])
+                visualize_event_z(Gz, true_z, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
-                visualize_event_z(Graph(adjacency=None, positions_xy=channel_positions, positions_z=np.concatenate([range(n_time_points) for i in range(n_channels)])), rec_z, None, ax=axes[1])
+                visualize_event_z(Gz, rec_z, None, ax=axes[1])
                 axes[1].set_title("DiffAE reconstruction")
                 plt.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_z.png")
+                plt.close(fig)
+
+                # Temporal cross-sections for strongest channels.
+                top_k = min(4, n_channels)
+                top_channels = np.argsort(true_xy)[-top_k:][::-1]
+                fig, axes = plt.subplots(top_k, 1, figsize=(10, 2.2 * top_k), sharex=True)
+                if top_k == 1:
+                    axes = [axes]
+                t_axis = np.arange(n_time_points)
+                for ax, ch in zip(axes, top_channels):
+                    ax.plot(t_axis, true_z[ch], color="black", linewidth=1.2, label="truth")
+                    ax.plot(t_axis, rec_z[ch], color="#d62728", linewidth=1.0, alpha=0.9, label="recon")
+                    ax.set_ylabel(f"ch {ch}")
+                    ax.grid(alpha=0.25, linewidth=0.4)
+                axes[0].legend(loc="upper right", fontsize=8)
+                axes[-1].set_xlabel("time bin")
+                fig.suptitle("Cross-section comparison (top channels)")
+                plt.tight_layout()
+                fig.savefig(f"{plots_dir}/event_{idx}_cross_sections.png")
                 plt.close(fig)
 
 
