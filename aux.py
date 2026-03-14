@@ -27,9 +27,9 @@ from matplotlib.patches import Patch
 from config import Config, default_config, MSDataConfig, AuxTaskConfig
 from lz_data_loader import TritiumSSDataLoader, create_3d_adjacency_matrix_sparse_
 from data import SparseGraph
-from diffae import GraphEncoder, DiffAEContext, DiffAEDataStats, sample_diffae
+from diffae import DiffAEContext, DiffAEDataStats, sample_diffae
 from diffusion.schedule import build_cosine_schedule
-from ae import GraphAEEncoder
+from graphae import GraphEncoder, GraphAEEncoder  # type: ignore[import]
 from models.graph_unet import TopKPool, build_block_diagonal_adj, GraphDDPMUNet
 from utils.sparse_ops import to_binary, subgraph_coo
 
