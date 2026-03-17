@@ -526,7 +526,9 @@ def plot_results(
 # ---------------------------------------------------------------------------
 
 def load_diffae(cfg: Config, device: torch.device) -> Optional[DiffAEContext]:
-    ctx = DiffAEContext.build(cfg, for_training=False, verbose=True)
+    # Build with for_training=True so EMA shadow copies are allocated; we skip
+    # the optimiser to keep memory footprint equivalent to inference-only mode.
+    ctx = DiffAEContext.build(cfg, for_training=True, verbose=True)
     ckpt = ctx.latest_checkpoint()
     if ckpt is None:
         print("WARNING: no DiffAE checkpoint found — skipping DiffAE.")

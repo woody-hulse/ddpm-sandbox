@@ -307,6 +307,134 @@ def fit_reduce(
 
 
 # ---------------------------------------------------------------------------
+# Anomaly scoring — Mahalanobis distance + percentile rank
+# ---------------------------------------------------------------------------
+
+def _mahal_distances(
+    Z_real: np.ndarray,
+    Z_queries: np.ndarray,
+    reg: float = 1e-4,
+) -> np.ndarray:
+    """
+    Mahalanobis distance of each row in Z_queries from the real distribution.
+
+    Uses the empirical covariance of Z_real plus a small ridge to ensure
+    invertibility even when n_samples < n_dims (shouldn't be an issue here
+    but makes the call robust).
+    """
+    mu  = Z_real.mean(axis=0)
+    cov = np.cov(Z_real.T) + reg * np.eye(Z_real.shape[1])
+    cov_inv = np.linalg.inv(cov)
+    delta = Z_queries - mu
+    return np.sqrt(np.einsum("ij,jk,ik->i", delta, cov_inv, delta))
+
+
+def anomaly_scores(
+    Z_real: np.ndarray,
+    Z_protos: np.ndarray,
+    reg: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns
+    -------
+    d_protos : (n_protos,)  Mahalanobis distance of each prototype
+    pct_rank : (n_protos,)  % of real events with *smaller* distance
+                             (0 = inside the core, 100 = most extreme outlier)
+    """
+    d_real   = _mahal_distances(Z_real, Z_real,    reg)
+    d_protos = _mahal_distances(Z_real, Z_protos,  reg)
+    pct_rank = np.array([(dp > d_real).mean() * 100.0 for dp in d_protos])
+    return d_protos, pct_rank
+
+
+# ---------------------------------------------------------------------------
+# Anomaly heatmap
+# ---------------------------------------------------------------------------
+
+def anomaly_heatmap(
+    scores: dict[str, np.ndarray | None],   # space_label → (n_types,) pct_rank
+    anomaly_labels: list[str],              # display names, len = n_types
+    path: str,
+) -> None:
+    """
+    Heatmap: rows = anomaly types, columns = representation space.
+    Cell colour = percentile rank of prototype Mahalanobis distance
+    (0 = indistinguishable from core, 100 = maximally anomalous).
+    Annotated with the numeric value.
+    """
+    space_labels  = [k for k, v in scores.items() if v is not None]
+    valid_arrays  = [scores[k] for k in space_labels]           # all non-None
+    data = np.column_stack(valid_arrays)                        # (n_types, n_spaces)
+
+    n_types, n_spaces = data.shape
+    fig, ax = plt.subplots(figsize=(2.4 + 1.8 * n_spaces, 0.45 * n_types + 1.2))
+
+    im = ax.imshow(data, aspect="auto", cmap="YlOrRd", vmin=0, vmax=100)
+
+    # Annotate each cell
+    for r in range(n_types):
+        for c in range(n_spaces):
+            v = data[r, c]
+            txt_col = "white" if v > 70 else "black"
+            ax.text(c, r, f"{v:.0f}%", ha="center", va="center",
+                    fontsize=9, color=txt_col)
+
+    ax.set_xticks(range(n_spaces))
+    ax.set_xticklabels(space_labels, fontsize=10)
+    ax.set_yticks(range(n_types))
+    ax.set_yticklabels(anomaly_labels, fontsize=9)
+    ax.set_title("Anomaly percentile rank by representation space", fontsize=11)
+    ax.set_xlabel("Representation space", fontsize=10)
+
+    cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.03)
+    cb.set_label("Percentile rank of Mahalanobis distance", fontsize=8)
+    cb.set_ticks([0, 25, 50, 75, 100])
+
+    # Thin separator lines between family groups (spatial/temporal)
+    n_spatial = sum(1 for t in ANOMALY_TYPES if t[3] == "spatial")
+    ax.axhline(n_spatial - 0.5, color="white", linewidth=2)
+
+    plt.tight_layout()
+    fig.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  {os.path.basename(path)}")
+
+
+def print_score_table(
+    scores: dict[str, np.ndarray | None],
+    d_scores: dict[str, np.ndarray | None],
+) -> None:
+    """Print a formatted table of Mahalanobis distances and percentile ranks."""
+    space_labels = [k for k, v in scores.items() if v is not None]
+    col_w = max(len(k) for k in space_labels) + 4
+
+    header = f"{'Anomaly type':<26}" + "".join(f"{k:>{col_w}}" for k in space_labels)
+    print("\n" + "=" * len(header))
+    print("Mahalanobis distance  (percentile rank)")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+
+    prev_family = None
+    for i, (atype, label, _, family) in enumerate(ANOMALY_TYPES):
+        if prev_family is not None and family != prev_family:
+            print()
+        prev_family = family
+        row = f"{label:<26}"
+        for k in space_labels:
+            s_arr = scores[k]
+            d_arr = d_scores[k]
+            if s_arr is not None and d_arr is not None:
+                d   = float(d_arr[i])
+                pct = float(s_arr[i])
+                row += f"{d:>{col_w - 8}.2f} ({pct:4.0f}%)"
+            else:
+                row += f"{'—':>{col_w}}"
+        print(row)
+    print("=" * len(header))
+
+
+# ---------------------------------------------------------------------------
 # Scatter plot
 # ---------------------------------------------------------------------------
 
@@ -560,10 +688,40 @@ def main():
             path        = os.path.join(args.output_dir, "scatter_diffae.png"),
         )
 
+    # -----------------------------------------------------------------------
+    # 8. Anomaly scoring: Mahalanobis distance + percentile ranks
+    # -----------------------------------------------------------------------
+    print("\nComputing anomaly scores …")
+
+    # Standardise RQ matrix before Mahalanobis (columns have very different scales)
+    rq_std = RQ_real.std(axis=0, keepdims=True) + 1e-8
+    RQ_real_n   = (RQ_real   - RQ_real.mean(axis=0)) / rq_std
+    RQ_protos_n = (RQ_protos - RQ_real.mean(axis=0)) / rq_std
+
+    d_rq,  pct_rq  = anomaly_scores(RQ_real_n, RQ_protos_n)
+
+    d_ae,     pct_ae     = (anomaly_scores(Z_ae_real,     Z_ae_protos)
+                             if Z_ae_real is not None else (None, None))
+    d_diffae, pct_diffae = (anomaly_scores(Z_diffae_real, Z_diffae_protos)
+                             if Z_diffae_real is not None else (None, None))
+
+    scores_map  = {"RQ metrics": pct_rq,  "GraphAE": pct_ae,  "DiffAE": pct_diffae}
+    d_score_map = {"RQ metrics": d_rq,    "GraphAE": d_ae,    "DiffAE": d_diffae}
+
+    proto_labels = [t[1] for t in ANOMALY_TYPES]
+    print_score_table(scores_map, d_score_map)
+
+    anomaly_heatmap(
+        scores        = scores_map,
+        anomaly_labels = proto_labels,
+        path          = os.path.join(args.output_dir, "anomaly_scores.png"),
+    )
+
     print(f"\nDone → {args.output_dir}/")
     print("  scatter_rq.png     — RQ space (poor separability expected)")
     print("  scatter_ae.png     — GraphAE latent space")
     print("  scatter_diffae.png — DiffAE latent space")
+    print("  anomaly_scores.png — Mahalanobis percentile-rank heatmap")
 
 
 if __name__ == "__main__":
