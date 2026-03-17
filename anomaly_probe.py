@@ -29,6 +29,8 @@ Usage:
 """
 
 import argparse
+import copy
+import glob
 import os
 
 import h5py
@@ -418,7 +420,7 @@ def main():
     np.random.seed(args.seed)
     use_umap = HAS_UMAP and not args.no_umap
 
-    cfg = default_config
+    cfg = copy.deepcopy(default_config)
 
     # -----------------------------------------------------------------------
     # 1. Load real SS events
@@ -437,7 +439,7 @@ def main():
 
     # Load channel positions from DiffAEContext (needed before building models)
     print("Building contexts to get graph / channel positions …")
-    cfg_diffae = default_config
+    cfg_diffae = copy.deepcopy(default_config)
     cfg_diffae.encoder.latent_dim = args.diffae_latent_dim
     ctx_diffae = DiffAEContext.build(cfg_diffae, for_training=True,
                                      verbose=False, use_ms_data=False)
@@ -526,8 +528,28 @@ def main():
     # 6. Load GraphAE encoder and encode
     # -----------------------------------------------------------------------
     print(f"\nLoading GraphAE encoder (latent_dim={args.ae_latent_dim}) …")
-    cfg_ae = default_config
+    cfg_ae = copy.deepcopy(default_config)
     cfg_ae.encoder.latent_dim = args.ae_latent_dim
+
+    # Find the checkpoint before building so we can infer hidden_dim from the
+    # saved weights, which may differ from the current config default.
+    _graphae_subdir = cfg_ae.paths.graph_ae_subdir.format(latent_dim=args.ae_latent_dim)
+    _graphae_ckpt_dir = os.path.join(cfg_ae.paths.checkpoint_dir, _graphae_subdir)
+    _graphae_files = glob.glob(os.path.join(_graphae_ckpt_dir, "graphae_epoch_*.pt"))
+
+    if _graphae_files:
+        def _epoch_num(p):
+            try:
+                return int(os.path.splitext(os.path.basename(p))[0].split("_")[-1])
+            except (ValueError, IndexError):
+                return -1
+        _ckpt_peek = max(_graphae_files, key=_epoch_num)
+        _state = torch.load(_ckpt_peek, map_location="cpu", weights_only=False)
+        # encoder.in_proj.weight has shape [hidden_dim, in_dim=1]
+        _hidden_dim = int(_state["model"]["encoder.in_proj.weight"].shape[0])
+        cfg_ae.encoder.hidden_dim = _hidden_dim
+        print(f"  Inferred hidden_dim={_hidden_dim} from checkpoint weights")
+
     ctx_ae = GraphAEContext.build(cfg_ae, for_training=True, verbose=False,
                                   use_ms_data=False)
     ckpt_ae = ctx_ae.latest_checkpoint()
