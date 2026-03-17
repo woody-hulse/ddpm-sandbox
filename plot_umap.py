@@ -25,8 +25,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
+from plot_style import apply_style, COLORS
 
 from config import default_config, get_config
+
+apply_style()
 
 METHODS = ["pca", "umap", "tsne"]
 
@@ -271,7 +274,7 @@ def plot_delta_mu(panels, axes, ldim, args, method_label):
         ax.grid(False)
 
     cbar = axes[0, 0].figure.colorbar(sc, ax=axes[0, :].tolist(), shrink=0.8, pad=0.04)
-    cbar.set_label(r"$|\Delta\mu|$ (ns)", fontsize=11)
+    cbar.set_label(r"$|\Delta\mu|$ (ns)")
 
 
 def plot_noise(panels, axes, ldim, args, method_label):
@@ -300,12 +303,12 @@ def plot_noise(panels, axes, ldim, args, method_label):
         ax.grid(False)
 
     cbar = axes[0, 0].figure.colorbar(sc, ax=axes[0, :].tolist(), shrink=0.8, pad=0.04)
-    cbar.set_label("Waveform roughness (mean |Δz|)", fontsize=10)
+    cbar.set_label(r"Waveform roughness (mean $|\Delta z|$)")
 
 
 def plot_lopsided(panels, axes, ldim, args, method_label):
     """Plot panels colored by lopsided side: grey=none, red=left, blue=right."""
-    COLORS = {0: "#aaaaaa", 1: "#d62728", 2: "#1f77b4"}
+    LOPSIDED_COLORS = {0: COLORS["lop_none"], 1: COLORS["lop_left"], 2: COLORS["lop_right"]}
 
     for col, (name, emb, sides, lat) in enumerate(panels):
         ax = axes[0, col]
@@ -316,7 +319,7 @@ def plot_lopsided(panels, axes, ldim, args, method_label):
                 continue
             ax.scatter(
                 emb[mask, 0], emb[mask, 1],
-                c=COLORS[side_val], s=args.point_size, alpha=0.6,
+                c=LOPSIDED_COLORS[side_val], s=args.point_size, alpha=0.6,
                 edgecolors="none", rasterized=True, label=label,
                 zorder=2 if side_val == 0 else 3,
             )
@@ -334,11 +337,11 @@ def plot_lopsided(panels, axes, ldim, args, method_label):
         ax.grid(False)
 
     legend_elements = [
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#aaaaaa",
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=LOPSIDED_COLORS[0],
                markersize=6, label="None"),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#d62728",
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=LOPSIDED_COLORS[1],
                markersize=6, label="Left"),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#1f77b4",
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=LOPSIDED_COLORS[2],
                markersize=6, label="Right"),
     ]
     axes[0, -1].legend(handles=legend_elements, loc="upper right", fontsize=8,
@@ -427,18 +430,19 @@ def main():
             return
 
         n_panels = len(panels)
-        panel_size = 5.5
+        panel_size = 5.0
         fig, axes = plt.subplots(1, n_panels,
                                  figsize=(panel_size * n_panels + 0.5, panel_size),
                                  squeeze=False)
         plot_lopsided(panels, axes, ldim, args, method_label)
 
         fig.suptitle(
-            f"{method_label}  —  z={ldim}  —  lopsided (σ={args.lopsided_sigma}, frac={args.lopsided_frac})",
-            fontsize=13, fontweight="bold")
+            f"{method_label} of encoded latents  (z={ldim},"
+            f" lopsided: σ={args.lopsided_sigma}, frac={args.lopsided_frac})",
+            fontweight="bold")
         os.makedirs(args.output_dir, exist_ok=True)
         out_path = os.path.join(args.output_dir, f"{method}_z{ldim}_lopsided.png")
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        fig.savefig(out_path, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved {out_path}")
 
@@ -460,18 +464,17 @@ def main():
             return
 
         n_panels = len(panels)
-        panel_size = 5.5
+        panel_size = 5.0
         fig, axes = plt.subplots(1, n_panels,
                                  figsize=(panel_size * n_panels + 1.2, panel_size),
                                  squeeze=False)
         plot_noise(panels, axes, ldim, args, method_label)
 
-        fig.suptitle(
-            f"{method_label}  —  z={ldim}  —  waveform roughness",
-            fontsize=13, fontweight="bold")
+        fig.suptitle(f"{method_label} of encoded latents  (z={ldim},  waveform roughness)",
+                     fontweight="bold")
         os.makedirs(args.output_dir, exist_ok=True)
         out_path = os.path.join(args.output_dir, f"{method}_z{ldim}_noise.png")
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        fig.savefig(out_path, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved {out_path}")
 
@@ -506,17 +509,17 @@ def main():
             return
 
         n_panels = len(panels)
-        panel_size = 5.5
+        panel_size = 5.0
         fig, axes = plt.subplots(1, n_panels,
                                  figsize=(panel_size * n_panels + 1.2, panel_size),
                                  squeeze=False)
         plot_delta_mu(panels, axes, ldim, args, method_label)
 
-        fig.suptitle(f"{method_label} of Encoded Latents  —  latent dim = {ldim}",
-                     fontsize=14, fontweight="bold")
+        fig.suptitle(f"{method_label} of encoded latents  (z={ldim})",
+                     fontweight="bold")
         os.makedirs(args.output_dir, exist_ok=True)
         out_path = os.path.join(args.output_dir, f"{method}_z{ldim}.png")
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        fig.savefig(out_path, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved {out_path}")
 

@@ -15,9 +15,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats as sp_stats
 from tqdm import tqdm
+from plot_style import apply_style, COLORS, MODEL_COLORS
 
 from config import Config, default_config, get_config
 from lz_data_loader import OnlineMSBatcher
@@ -119,12 +122,13 @@ RQ_UNITS = {
 }
 
 
-MODEL_PALETTE = ['#6C9BC4', '#E8907E', '#7DBCB0', '#9B8DC4', '#D4A96A', '#C47D7D']
+apply_style()
+
 PLOT_DPI = 300
 
 
 def _color_map(names):
-    return {n: MODEL_PALETTE[i % len(MODEL_PALETTE)] for i, n in enumerate(names)}
+    return {n: MODEL_COLORS[i % len(MODEL_COLORS)] for i, n in enumerate(names)}
 
 
 def plot_rq_comparison(
@@ -187,35 +191,41 @@ def plot_rq_comparison(
             r2 = float(1 - np.sum(residuals ** 2) / (np.sum((t - t.mean()) ** 2) + 1e-12))
 
             ax_hex = axes[0, i]
-            ax_hex.hexbin(t, p, gridsize=30, cmap='Blues', mincnt=1)
-            ax_hex.plot(lims, lims, 'r--', alpha=0.7, linewidth=1.5)
+            ax_hex.hexbin(t, p, gridsize=28, cmap='Blues', mincnt=1, linewidths=0.2)
+            ax_hex.plot(lims, lims, color=COLORS["truth"], linestyle='--',
+                        linewidth=1.0, alpha=0.7, zorder=3)
             ax_hex.set_xlim(lims)
             ax_hex.set_ylim(lims)
             ax_hex.set_xlabel(f'True ({unit})')
             ax_hex.set_ylabel(f'Reconstructed ({unit})')
-            ax_hex.set_title(f'{mname}\nMAE={mae:.2f}, R²={r2:.3f}')
+            ax_hex.set_title(f'{mname}\nMAE={mae:.2f}  R²={r2:.3f}')
             ax_hex.set_aspect('equal', adjustable='box')
 
             ax_res = axes[1, i]
-            ax_res.hist(residuals, bins=resid_bins, color=cmap[mname], alpha=0.7, edgecolor='white', linewidth=0.5)
-            ax_res.axvline(0, color='r', linestyle='--', linewidth=1.5)
             mu_r = float(np.mean(residuals))
             sigma_r = float(np.std(residuals))
-            ax_res.axvline(mu_r, color='black', linestyle='-', linewidth=1.5,
-                           label=f'μ={mu_r:.2f}')
+            ax_res.hist(residuals, bins=resid_bins, color=cmap[mname],
+                        alpha=0.75, edgecolor='white', linewidth=0.3)
+            ax_res.axvline(0, color=COLORS["truth"], linestyle='--', linewidth=0.9, alpha=0.6)
+            ax_res.axvline(mu_r, color=cmap[mname], linestyle='-', linewidth=1.2,
+                           label=f'μ = {mu_r:.2f}')
             ax_res.set_xlabel(f'Residual ({unit})')
             ax_res.set_ylabel('Count')
-            ax_res.set_title(f'σ={sigma_r:.2f}')
+            ax_res.set_title(f'σ = {sigma_r:.2f} {unit}')
             ax_res.set_xlim(-resid_xlim, resid_xlim)
-            ax_res.legend(fontsize=8)
+            ax_res.legend()
 
         fig.suptitle(display_name, fontsize=14, fontweight='bold', y=1.01)
         plt.tight_layout()
         fig.savefig(os.path.join(output_dir, f'rq_{rq_name}.png'), dpi=PLOT_DPI, bbox_inches='tight')
         plt.close(fig)
 
-    fig_vio, axes_vio = plt.subplots(2, 4, figsize=(18, 8))
-    axes_flat = axes_vio.flatten()
+    n_rqs = len(rq_names)
+    n_cols_vio = 4
+    n_rows_vio = (n_rqs + n_cols_vio - 1) // n_cols_vio
+    fig_vio, axes_vio = plt.subplots(n_rows_vio, n_cols_vio,
+                                     figsize=(4.2 * n_cols_vio, 3.5 * n_rows_vio))
+    axes_flat = np.array(axes_vio).flatten()
 
     for idx, rq_name in enumerate(rq_names):
         if idx >= len(axes_flat):
@@ -238,35 +248,33 @@ def plot_rq_comparison(
 
         if any(len(d) > 0 for d in data_list):
             positions = np.arange(len(data_list))
-            vp = ax.violinplot(data_list, positions=positions, widths=0.7,
-                               showmeans=True, showmedians=True)
+            vp = ax.violinplot(data_list, positions=positions, widths=0.65,
+                               showmeans=True, showmedians=False, showextrema=False)
             for j, body in enumerate(vp['bodies']):
                 body.set_facecolor(cmap[model_names[j]])
                 body.set_edgecolor(cmap[model_names[j]])
-                body.set_alpha(0.6)
-            for partname in ('cmeans', 'cmedians', 'cmins', 'cmaxes', 'cbars'):
-                if partname in vp:
-                    vp[partname].set_edgecolor('#333333')
-                    vp[partname].set_linewidth(1.0)
+                body.set_alpha(0.55)
+                body.set_linewidth(0.8)
+            if 'cmeans' in vp:
+                vp['cmeans'].set_edgecolor('#333333')
+                vp['cmeans'].set_linewidth(1.2)
             ax.set_xticks(positions)
-            ax.set_xticklabels(labels)
+            ax.set_xticklabels(labels, fontsize=8)
 
-            for j, d in enumerate(data_list):
+            for j, (d, mae_v) in enumerate(zip(data_list, mae_vals)):
                 if len(d) > 0:
-                    violin_max = float(d.max())
-                    ax.annotate(f'MAE={mae_vals[j]:.2f}', (j, violin_max),
-                                textcoords="offset points", xytext=(0, 8),
-                                ha='center', fontsize=7)
+                    ax.annotate(f'{mae_v:.2f}', (j, float(np.percentile(d, 95))),
+                                textcoords="offset points", xytext=(0, 5),
+                                ha='center', fontsize=7, color='#333333')
 
-        ax.set_title(display_name, fontsize=10, fontweight='bold')
+        ax.set_title(display_name, fontweight='bold')
         ax.set_ylabel(f'|Error| ({unit})')
-        ax.grid(axis='y', alpha=0.3)
 
-    for idx in range(len(rq_names), len(axes_flat)):
+    for idx in range(n_rqs, len(axes_flat)):
         axes_flat[idx].set_visible(False)
 
-    plt.suptitle('Absolute Error Distribution per RQ', fontsize=14, fontweight='bold')
-    plt.tight_layout()
+    fig_vio.suptitle('Absolute Error Distribution per Reduced Quantity', y=1.01)
+    fig_vio.tight_layout()
     fig_vio.savefig(os.path.join(output_dir, 'rq_error_summary.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig_vio)
 
@@ -299,74 +307,83 @@ def plot_example_reconstructions(
     if diffae_rec is not None:
         models['DiffAE'] = diffae_rec
     n_cols = 1 + len(models)
+    model_cmap = _color_map(list(models.keys()))
 
     time_axis = np.arange(n_time)
 
-    fig, axes = plt.subplots(len(indices), n_cols, figsize=(4 * n_cols, 2.8 * len(indices)),
+    fig, axes = plt.subplots(len(indices), n_cols,
+                             figsize=(3.8 * n_cols, 2.2 * len(indices)),
                              squeeze=False)
 
     for row, idx in enumerate(indices):
         z_raw = wf_to_z_profile(raw[idx], n_channels, n_time)
+        y_max = max(z_raw.max() * 1.15, 1)
 
         ax = axes[row, 0]
-        ax.plot(time_axis, z_raw, color='black', linewidth=1.5)
-        ax.fill_between(time_axis, z_raw, alpha=0.15, color='black')
+        ax.plot(time_axis, z_raw, color=COLORS["truth"], linewidth=1.3)
+        ax.fill_between(time_axis, z_raw, alpha=0.10, color=COLORS["truth"])
         if row == 0:
             ax.set_title('Raw', fontweight='bold')
-        ax.set_ylabel(f'#{idx}', fontweight='bold', rotation=0, labelpad=30)
+        ax.set_ylabel(f'#{idx}', fontweight='bold', rotation=0, labelpad=25)
         if row == len(indices) - 1:
             ax.set_xlabel('Time bin')
-        y_max = z_raw.max() * 1.15
-        ax.set_ylim(0, max(y_max, 1))
+        ax.set_ylim(0, y_max)
+        ax.set_yticks([])
 
-        model_cmap = _color_map(list(models.keys()))
         for col_offset, (mname, rec_data) in enumerate(models.items(), start=1):
             z_rec = wf_to_z_profile(rec_data[idx], n_channels, n_time)
             mc = model_cmap[mname]
 
             ax = axes[row, col_offset]
-            ax.plot(time_axis, z_raw, color='black', linewidth=1, alpha=0.4, label='Raw')
-            ax.plot(time_axis, z_rec, color=mc, linewidth=1.5, label=mname)
-            ax.fill_between(time_axis, z_rec, alpha=0.2, color=mc)
+            ax.plot(time_axis, z_raw, color=COLORS["truth"], linewidth=0.7,
+                    alpha=0.28, label='Raw')
+            ax.plot(time_axis, z_rec, color=mc, linewidth=1.3, label=mname)
+            ax.fill_between(time_axis, z_rec, alpha=0.12, color=mc)
             if row == 0:
                 ax.set_title(mname, fontweight='bold')
+                ax.legend(fontsize=8, loc='upper right', handlelength=1.2)
             if row == len(indices) - 1:
                 ax.set_xlabel('Time bin')
-            ax.set_ylim(0, max(y_max, 1))
-            ax.legend(fontsize=7, loc='upper right')
+            ax.set_ylim(0, y_max)
+            ax.set_yticks([])
 
-    plt.suptitle('Example Z-Profile Reconstructions', fontsize=14, fontweight='bold', y=1.01)
-    plt.tight_layout()
+    fig.suptitle('Z-Profile Reconstructions', y=1.01)
+    fig.tight_layout()
     fig.savefig(os.path.join(output_dir, 'example_z_profiles.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig)
 
-    fig2, axes2 = plt.subplots(len(indices), n_cols, figsize=(4 * n_cols, 2.2 * len(indices)),
-                                squeeze=False)
+    # 2D heatmaps — channel × time
+    fig2, axes2 = plt.subplots(len(indices), n_cols,
+                               figsize=(3.8 * n_cols, 2.0 * len(indices)),
+                               squeeze=False)
 
     for row, idx in enumerate(indices):
         wf_2d_raw = raw[idx].reshape(n_channels, n_time, order='F')
         vmax = wf_2d_raw.max()
 
         ax = axes2[row, 0]
-        ax.imshow(wf_2d_raw, aspect='auto', origin='lower', cmap='viridis', vmin=0, vmax=vmax)
+        ax.imshow(wf_2d_raw, aspect='auto', origin='lower', cmap='inferno',
+                  vmin=0, vmax=vmax, interpolation='nearest')
         if row == 0:
             ax.set_title('Raw', fontweight='bold')
-        ax.set_ylabel(f'#{idx}', fontweight='bold', rotation=0, labelpad=30)
+        ax.set_ylabel(f'#{idx}', fontweight='bold', rotation=0, labelpad=25)
+        ax.set_yticks([])
         if row == len(indices) - 1:
             ax.set_xlabel('Time bin')
 
         for col_offset, (mname, rec_data) in enumerate(models.items(), start=1):
             wf_2d_rec = rec_data[idx].reshape(n_channels, n_time, order='F')
             ax = axes2[row, col_offset]
-            ax.imshow(wf_2d_rec, aspect='auto', origin='lower', cmap='viridis', vmin=0, vmax=vmax)
+            ax.imshow(wf_2d_rec, aspect='auto', origin='lower', cmap='inferno',
+                      vmin=0, vmax=vmax, interpolation='nearest')
             if row == 0:
                 ax.set_title(mname, fontweight='bold')
+            ax.set_yticks([])
             if row == len(indices) - 1:
                 ax.set_xlabel('Time bin')
 
-    plt.suptitle('Example 2D Waveform Reconstructions (channel × time)', fontsize=14,
-                 fontweight='bold', y=1.01)
-    plt.tight_layout()
+    fig2.suptitle('Waveform Reconstructions (channel × time)', y=1.01)
+    fig2.tight_layout()
     fig2.savefig(os.path.join(output_dir, 'example_heatmaps.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig2)
 

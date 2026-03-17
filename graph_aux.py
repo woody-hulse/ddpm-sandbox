@@ -41,6 +41,7 @@ from typing import List, Optional, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from plot_style import apply_style, COLORS, MODEL_COLORS
 import numpy as np
 import torch
 import torch.nn as nn
@@ -401,54 +402,59 @@ def run_encoder_branch(
 # ---------------------------------------------------------------------------
 
 def plot_results(results: List[AuxTrainingResult], output_dir: str) -> None:
+    apply_style()
     os.makedirs(output_dir, exist_ok=True)
-    colors = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e"]
+    colors = MODEL_COLORS
 
     # --- loss curves ---
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
     for r, col in zip(results, colors):
-        axes[0].plot(r.train_losses, label=r.model_name, color=col, linewidth=1.2)
-        axes[1].plot(r.val_losses, label=r.model_name, color=col, linewidth=1.2)
-    for ax, title in zip(axes, ["Train MSE loss", "Val MSE loss"]):
+        axes[0].plot(r.train_losses, label=r.model_name, color=col)
+        axes[1].plot(r.val_losses, label=r.model_name, color=col)
+    for ax, title in zip(axes, ["Training loss", "Validation loss"]):
         ax.set_xlabel("Epoch")
         ax.set_ylabel("MSE (ns²)")
         ax.set_title(title)
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(os.path.join(output_dir, "loss_curves.png"), dpi=150)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "loss_curves.png"))
     plt.close(fig)
 
-    # --- scatter: pred vs true ---
+    # --- scatter + residuals: 2×N grid ---
     n_models = len(results)
-    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 4.5), squeeze=False)
-    for ax, r, col in zip(axes[0], results, colors):
+    fig, axes = plt.subplots(2, n_models, figsize=(4.5 * n_models, 8), squeeze=False)
+
+    for col_idx, (r, color) in enumerate(zip(results, colors)):
+        # top row: scatter
+        ax = axes[0, col_idx]
         lim = max(np.abs(r.targets).max(), np.abs(r.predictions).max()) * 1.05
-        ax.scatter(r.targets, r.predictions, s=2, alpha=0.3, color=col, rasterized=True)
-        ax.plot([-lim, lim], [-lim, lim], "k--", linewidth=0.8, label="ideal")
+        ax.scatter(r.targets, r.predictions, s=2, alpha=0.25, color=color,
+                   rasterized=True, edgecolors='none')
+        ax.plot([-lim, lim], [-lim, lim], color=COLORS["truth"],
+                linestyle="--", linewidth=0.9, alpha=0.7)
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
-        ax.set_xlabel("True δμ (ns)")
-        ax.set_ylabel("Predicted δμ (ns)")
-        ax.set_title(f"{r.model_name}\nMAE={r.test_mae:.1f} ns  RMSE={r.test_rmse:.1f} ns")
-        ax.set_aspect("equal")
-        ax.grid(alpha=0.25)
-    plt.tight_layout()
-    fig.savefig(os.path.join(output_dir, "scatter.png"), dpi=150)
-    plt.close(fig)
+        ax.set_xlabel(r"True $\delta\mu$ (ns)")
+        ax.set_ylabel(r"Predicted $\delta\mu$ (ns)")
+        ax.set_title(f"{r.model_name}\nMAE = {r.test_mae:.1f} ns,  RMSE = {r.test_rmse:.1f} ns")
+        ax.set_aspect("equal", adjustable="box")
 
-    # --- residuals ---
-    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 4), squeeze=False)
-    for ax, r, col in zip(axes[0], results, colors):
+        # bottom row: residual histogram
+        ax2 = axes[1, col_idx]
         resid = r.predictions - r.targets
-        ax.hist(resid, bins=80, color=col, alpha=0.7, density=True)
-        ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
-        ax.set_xlabel("Residual (ns)")
-        ax.set_ylabel("Density")
-        ax.set_title(f"{r.model_name}\nMAE={r.test_mae:.1f} ns")
-        ax.grid(alpha=0.25)
-    plt.tight_layout()
-    fig.savefig(os.path.join(output_dir, "residuals.png"), dpi=150)
+        mu_r = float(np.mean(resid))
+        sigma_r = float(np.std(resid))
+        ax2.hist(resid, bins=70, color=color, alpha=0.75, density=True, edgecolor='none')
+        ax2.axvline(0, color=COLORS["truth"], linestyle="--", linewidth=0.9, alpha=0.6)
+        ax2.axvline(mu_r, color=color, linestyle="-", linewidth=1.0,
+                    label=f"μ = {mu_r:.1f} ns")
+        ax2.set_xlabel(r"Residual (ns)")
+        ax2.set_ylabel("Density")
+        ax2.set_title(f"σ = {sigma_r:.1f} ns")
+        ax2.legend()
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "scatter_residuals.png"))
     plt.close(fig)
 
 

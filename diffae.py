@@ -17,7 +17,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
 from matplotlib import pyplot as plt
+from plot_style import apply_style, COLORS
 from tqdm import tqdm
 
 from data import Graph, visualize_event, visualize_event_z, SparseGraph
@@ -943,6 +946,7 @@ def train_diffae(cfg: Config = default_config):
             Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))
             Gz = Graph(adjacency=np.eye(n_channels, dtype=np.float32), positions_xy=channel_positions, positions_z=np.arange(n_time_points, dtype=np.float32))
 
+            apply_style()
             for idx in range(samples.shape[0]):
                 rec_int = samples_denorm[idx, 0]
                 true_int = batch_np[idx, :, 0]
@@ -952,40 +956,41 @@ def train_diffae(cfg: Config = default_config):
                 rec_z = rec_int.reshape(n_channels, n_time_points, order='F')
                 true_z = true_int.reshape(n_channels, n_time_points, order='F')
 
-                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
                 visualize_event(Gxy, true_xy, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event(Gxy, rec_xy, None, ax=axes[1])
                 axes[1].set_title("DiffAE reconstruction")
-                plt.tight_layout()
+                fig.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_xy.png")
                 plt.close(fig)
 
-                fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+                fig, axes = plt.subplots(1, 2, figsize=(9, 3.2))
                 visualize_event_z(Gz, true_z, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event_z(Gz, rec_z, None, ax=axes[1])
                 axes[1].set_title("DiffAE reconstruction")
-                plt.tight_layout()
+                fig.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_z.png")
                 plt.close(fig)
 
                 # Temporal cross-sections for strongest channels.
                 top_k = min(4, n_channels)
                 top_channels = np.argsort(true_xy)[-top_k:][::-1]
-                fig, axes = plt.subplots(top_k, 1, figsize=(10, 2.2 * top_k), sharex=True)
+                fig, axes = plt.subplots(top_k, 1, figsize=(9, 2.0 * top_k), sharex=True)
                 if top_k == 1:
                     axes = [axes]
                 t_axis = np.arange(n_time_points)
                 for ax, ch in zip(axes, top_channels):
-                    ax.plot(t_axis, true_z[ch], color="black", linewidth=1.2, label="truth")
-                    ax.plot(t_axis, rec_z[ch], color="#d62728", linewidth=1.0, alpha=0.9, label="recon")
+                    ax.plot(t_axis, true_z[ch], color=COLORS["truth"],
+                            linewidth=1.2, label="Truth")
+                    ax.plot(t_axis, rec_z[ch], color=COLORS["diffae"],
+                            linewidth=1.0, alpha=0.9, label="DiffAE")
                     ax.set_ylabel(f"ch {ch}")
-                    ax.grid(alpha=0.25, linewidth=0.4)
-                axes[0].legend(loc="upper right", fontsize=8)
-                axes[-1].set_xlabel("time bin")
-                fig.suptitle("Cross-section comparison (top channels)")
-                plt.tight_layout()
+                axes[0].legend(loc="upper right", handlelength=1.2)
+                axes[-1].set_xlabel("Time bin")
+                fig.suptitle("Channel cross-sections (top 4 by charge)")
+                fig.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_cross_sections.png")
                 plt.close(fig)
 
@@ -1037,7 +1042,8 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
     channel_positions = ctx.loader.channel_positions
     adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
 
-    fig, axes = plt.subplots(1, n_steps + 2, figsize=(3 * (n_steps + 2), 3))
+    apply_style()
+    fig, axes = plt.subplots(1, n_steps + 2, figsize=(2.8 * (n_steps + 2), 2.8))
 
     true1 = batch_np[0, :, 0].reshape(ctx.n_channels, ctx.n_time_points, order='F').sum(axis=1)
     true2 = batch_np[1, :, 0].reshape(ctx.n_channels, ctx.n_time_points, order='F').sum(axis=1)
@@ -1049,13 +1055,14 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
     for i in range(n_steps):
         interp_xy = samples_denorm[i, 0].reshape(ctx.n_channels, ctx.n_time_points, order='F').sum(axis=1)
         visualize_event(Gxy, interp_xy, None, ax=axes[i + 1])
-        axes[i + 1].set_title(f"α={alphas[i].item():.2f}")
+        axes[i + 1].set_title(f"α = {alphas[i].item():.2f}")
 
     visualize_event(Gxy, true2, None, ax=axes[-1])
     axes[-1].set_title("Event B")
 
-    plt.tight_layout()
-    fig.savefig(f"{plots_dir}/interpolation.png", dpi=150)
+    fig.suptitle("Latent space interpolation", y=1.02)
+    fig.tight_layout()
+    fig.savefig(f"{plots_dir}/interpolation.png")
     plt.close(fig)
     print(f"Saved interpolation to {plots_dir}/interpolation.png")
 

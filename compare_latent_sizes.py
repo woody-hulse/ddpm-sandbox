@@ -34,6 +34,7 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from plot_style import apply_style, COLORS
 
 from config import Config, default_config, get_config
 from ae import AEContext, reconstruct_ae, save_encoded_dataset as ae_save_encoded
@@ -583,9 +584,12 @@ def generate_z_profiles(
         if not models:
             continue
 
+        apply_style()
+        model_colors = {"AE": COLORS["ae"], "DiffAE": COLORS["diffae"]}
+
         n_cols = 1 + len(models)
         fig, axes = plt.subplots(n_examples, n_cols,
-                                 figsize=(4 * n_cols, 2.5 * n_examples),
+                                 figsize=(3.8 * n_cols, 2.2 * n_examples),
                                  squeeze=False)
 
         for row in range(n_examples):
@@ -594,34 +598,37 @@ def generate_z_profiles(
             y_max = max(z_raw.max() * 1.15, 1)
 
             ax = axes[row, 0]
-            ax.plot(time_axis, z_raw, color="black", linewidth=1.5)
-            ax.fill_between(time_axis, z_raw, alpha=0.12, color="black")
+            ax.plot(time_axis, z_raw, color=COLORS["truth"], linewidth=1.3)
+            ax.fill_between(time_axis, z_raw, alpha=0.10, color=COLORS["truth"])
             if row == 0:
                 ax.set_title("Raw", fontweight="bold")
-            ax.set_ylabel(f"#{row+1}", fontweight="bold", rotation=0, labelpad=25)
+            ax.set_ylabel(f"#{row + 1}", fontweight="bold", rotation=0, labelpad=22)
             ax.set_ylim(0, y_max)
+            ax.set_yticks([])
             if row == n_examples - 1:
                 ax.set_xlabel("Time bin")
 
-            colors = {"AE": "#1f77b4", "DiffAE": "#ff7f0e"}
             for col_off, (mname, rec_data) in enumerate(models.items(), start=1):
                 z_rec = wf_to_z_profile(rec_data[row], n_channels, n_time)
+                mc = model_colors.get(mname, COLORS["model3"])
                 ax = axes[row, col_off]
-                ax.plot(time_axis, z_raw, color="black", linewidth=0.8, alpha=0.35, label="Raw")
-                ax.plot(time_axis, z_rec, color=colors.get(mname, "C2"), linewidth=1.5, label=mname)
-                ax.fill_between(time_axis, z_rec, alpha=0.15, color=colors.get(mname, "C2"))
+                ax.plot(time_axis, z_raw, color=COLORS["truth"], linewidth=0.7,
+                        alpha=0.30, label="Raw")
+                ax.plot(time_axis, z_rec, color=mc, linewidth=1.3, label=mname)
+                ax.fill_between(time_axis, z_rec, alpha=0.12, color=mc)
                 if row == 0:
                     ax.set_title(mname, fontweight="bold")
                 ax.set_ylim(0, y_max)
-                ax.legend(fontsize=7, loc="upper right")
+                ax.set_yticks([])
+                if row == 0:
+                    ax.legend(fontsize=8, loc="upper right", handlelength=1.2)
                 if row == n_examples - 1:
                     ax.set_xlabel("Time bin")
 
-        fig.suptitle(f"Z-Profile Reconstructions  —  latent dim = {ldim}",
-                     fontsize=13, fontweight="bold", y=1.01)
+        fig.suptitle(f"Latent dim = {ldim}", fontsize=11, y=1.01)
         fig.tight_layout()
         path = os.path.join(output_dir, f"z_profiles_z{ldim}.png")
-        fig.savefig(path, dpi=200, bbox_inches="tight")
+        fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved {path}")
 
@@ -648,26 +655,16 @@ def plot_comparison(
         baseline_mean / baseline_std: from raw-waveform MLP
         output_path: where to save the figure
     """
-    plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 11,
-        "axes.labelsize": 13,
-        "axes.titlesize": 14,
-        "legend.fontsize": 11,
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 11,
-        "figure.dpi": 300,
-        "savefig.dpi": 300,
-        "savefig.bbox": "tight",
-    })
+    apply_style()
 
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    fig, ax = plt.subplots(figsize=(6, 4))
 
-    # Baseline
-    ax.axhline(baseline_mean, color="gray", linestyle=":", linewidth=1.8, label="Baseline (raw)", zorder=1)
+    # Baseline band
+    ax.axhline(baseline_mean, color=COLORS["baseline"], linestyle="--", linewidth=1.2,
+               label="Baseline (raw waveforms)", zorder=1)
     ax.axhspan(
         baseline_mean - baseline_std, baseline_mean + baseline_std,
-        color="gray", alpha=0.15, zorder=0,
+        color=COLORS["baseline"], alpha=0.12, zorder=0,
     )
 
     # AE line
@@ -678,8 +675,8 @@ def plot_comparison(
         ae_err = [ae_results[d][1] for d in ae_dims]
         ax.errorbar(
             ae_x, ae_mean, yerr=ae_err,
-            fmt="o-", color="#1f77b4", capsize=4, capthick=1.5,
-            linewidth=2, markersize=6, label="AE", zorder=3,
+            fmt="o-", color=COLORS["ae"], capsize=3.5, capthick=1.2,
+            linewidth=1.8, markersize=5.5, label="AE", zorder=3,
         )
 
     # DiffAE line
@@ -690,8 +687,8 @@ def plot_comparison(
         dae_err = [diffae_results[d][1] for d in dae_dims]
         ax.errorbar(
             dae_x, dae_mean, yerr=dae_err,
-            fmt="s-", color="#ff7f0e", capsize=4, capthick=1.5,
-            linewidth=2, markersize=6, label="DiffAE", zorder=3,
+            fmt="s-", color=COLORS["diffae"], capsize=3.5, capthick=1.2,
+            linewidth=1.8, markersize=5.5, label="DiffAE", zorder=3,
         )
 
     all_dims = sorted(set(ae_dims) | set(dae_dims))
@@ -700,11 +697,9 @@ def plot_comparison(
         ax.set_xticks(tick_pos)
         ax.set_xticklabels([str(d) for d in all_dims])
 
-    ax.set_xlabel(r"Latent dimension")
-    ax.set_ylabel(r"MAE (ns)")
-    ax.legend(loc="best", frameon=True, edgecolor="0.8", fancybox=False)
-    ax.grid(True, which="both", linewidth=0.5, alpha=0.5)
-    ax.set_axisbelow(True)
+    ax.set_xlabel("Latent dimension")
+    ax.set_ylabel("MAE (ns)")
+    ax.legend(loc="upper right")
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
