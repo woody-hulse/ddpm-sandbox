@@ -40,14 +40,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-
-umap_module = None
-try:
-    import umap as umap_module
-    HAS_UMAP = True
-except ImportError:
-    HAS_UMAP = False
+from sklearn.manifold import TSNE
 
 from config import default_config
 from diffae import DiffAEContext
@@ -80,10 +73,6 @@ ANOMALY_COLORS = {t[0]: t[2] for t in ANOMALY_TYPES}
 ANOMALY_FAMILY = {t[0]: t[3] for t in ANOMALY_TYPES}
 SPATIAL_TYPES  = [t[0] for t in ANOMALY_TYPES if t[3] == "spatial"]
 TEMPORAL_TYPES = [t[0] for t in ANOMALY_TYPES if t[3] == "temporal"]
-
-# Marker per family (spatial=circle, temporal=star)
-ANOMALY_MARKER = {k: "o" if ANOMALY_FAMILY[k] == "spatial" else "*"
-                  for k in ANOMALY_LABELS}
 
 PLOT_DPI = 300
 
@@ -294,27 +283,26 @@ def encode_batch(wf_batch: np.ndarray, ctx, batch_size: int = 8) -> np.ndarray:
 def fit_reduce(
     Z_real: np.ndarray,
     Z_protos: np.ndarray,
-    n_components: int = 2,
-    use_umap: bool = True,
+    perplexity: int = 30,
+    seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Fit a 2-D reducer on Z_real, then transform both Z_real and Z_protos.
-    Uses UMAP when available and use_umap=True, otherwise PCA.
+    Embed Z_real with t-SNE, then position Z_protos by fitting a 1-NN
+    look-up into the existing embedding (nearest neighbour in the original
+    space, inherit its 2-D coordinate).  This avoids re-running t-SNE for
+    the prototype points while still placing them correctly relative to the
+    real-event cloud.
     Returns (Z_real_2d, Z_protos_2d).
     """
-    if use_umap and HAS_UMAP:
-        reducer = umap_module.UMAP(
-            n_components=n_components,
-            n_neighbors=30,
-            min_dist=0.1,
-            random_state=42,
-        )
-        Z_real_2d   = reducer.fit_transform(Z_real)
-        Z_protos_2d = reducer.transform(Z_protos)
-    else:
-        pca         = PCA(n_components=n_components, whiten=True)
-        Z_real_2d   = pca.fit_transform(Z_real)
-        Z_protos_2d = pca.transform(Z_protos)
+    tsne = TSNE(n_components=2, perplexity=perplexity,
+                random_state=seed, init="pca", learning_rate="auto")
+    Z_real_2d = tsne.fit_transform(Z_real)
+
+    # Place each prototype at the 2-D position of its nearest real neighbour.
+    from sklearn.neighbors import NearestNeighbors
+    nn = NearestNeighbors(n_neighbors=1).fit(Z_real)
+    _, idx = nn.kneighbors(Z_protos)
+    Z_protos_2d = Z_real_2d[idx[:, 0]]
     return Z_real_2d, Z_protos_2d
 
 
@@ -325,69 +313,31 @@ def fit_reduce(
 def scatter_plot(
     Z_real_2d: np.ndarray,
     Z_protos_2d: np.ndarray,
-    proto_types: list[str],
     title: str,
     subtitle: str,
-    x_label: str,
-    y_label: str,
     path: str,
 ) -> None:
     """
-    Single scatter plot:  grey real-event cloud + labelled anomaly prototypes.
-
-    Z_real_2d   : (N, 2) — background real events
-    Z_protos_2d : (n_types, 2) — one prototype per anomaly type
-    proto_types : list of anomaly type keys, same order as Z_protos_2d rows
+    Grey in-distribution cloud + red anomaly dots (single "Anomaly" legend entry).
     """
-    fig, ax = plt.subplots(figsize=(7, 6))
+    fig, ax = plt.subplots(figsize=(6, 5))
 
-    # Background real events
     ax.scatter(
         Z_real_2d[:, 0], Z_real_2d[:, 1],
-        c="#AAAAAA", s=6, alpha=0.25, linewidths=0,
-        zorder=1, label="Real SS events",
+        c="#888888", s=6, alpha=0.40, linewidths=0,
+        zorder=1, label="In distribution",
+    )
+    ax.scatter(
+        Z_protos_2d[:, 0], Z_protos_2d[:, 1],
+        c="#D6231A", s=60, alpha=1.0, linewidths=0,
+        zorder=3, label="Anomaly",
     )
 
-    # Anomaly prototypes — two passes: first draw markers, then add legend entries
-    for i, atype in enumerate(proto_types):
-        color  = ANOMALY_COLORS[atype]
-        marker = ANOMALY_MARKER[atype]
-        label  = ANOMALY_LABELS[atype]
-        family = ANOMALY_FAMILY[atype]
-        size   = 220 if marker == "*" else 120
-        edge   = "#222222"
-
-        ax.scatter(
-            Z_protos_2d[i, 0], Z_protos_2d[i, 1],
-            c=color, s=size, marker=marker,
-            edgecolors=edge, linewidths=0.6,
-            zorder=5, label=label,
-        )
-
-        # Dashed ring to distinguish spatial (no z-profile change)
-        if family == "spatial":
-            ax.scatter(
-                Z_protos_2d[i, 0], Z_protos_2d[i, 1],
-                facecolors="none", edgecolors=color,
-                s=size * 2.5, linewidths=1.2,
-                zorder=4,
-            )
-
-    ax.set_xlabel(x_label, fontsize=10)
-    ax.set_ylabel(y_label, fontsize=10)
+    ax.set_xlabel("t-SNE 1", fontsize=10)
+    ax.set_ylabel("t-SNE 2", fontsize=10)
     ax.set_title(f"{title}\n{subtitle}", fontsize=11)
-
-    # Split legend: real + spatial + temporal
-    handles, labels = ax.get_legend_handles_labels()
-    legend = ax.legend(
-        handles, labels,
-        fontsize=7.5, markerscale=1.2,
-        loc="best",
-        handlelength=0.8, handletextpad=0.5,
-        borderpad=0.5, labelspacing=0.35,
-        title="● spatial (dashed ring)  ★ temporal",
-        title_fontsize=6.5,
-    )
+    ax.legend(fontsize=9, markerscale=1.4, loc="best",
+              handlelength=0.8, borderpad=0.5)
 
     plt.tight_layout()
     fig.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
@@ -411,14 +361,13 @@ def main():
     parser.add_argument("--diffae-latent-dim", type=int, default=64,
                         help="Latent dimension for the DiffAE model (default 64)")
     parser.add_argument("--output-dir", type=str, default="anomaly_results")
-    parser.add_argument("--seed",       type=int, default=42)
-    parser.add_argument("--no-umap",    action="store_true",
-                        help="Force PCA even if UMAP is available")
+    parser.add_argument("--seed",        type=int, default=42)
+    parser.add_argument("--perplexity",  type=int, default=30,
+                        help="t-SNE perplexity (default 30)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     np.random.seed(args.seed)
-    use_umap = HAS_UMAP and not args.no_umap
 
     cfg = copy.deepcopy(default_config)
 
@@ -569,55 +518,45 @@ def main():
     # -----------------------------------------------------------------------
     # 7. Dimensionally reduce + plot
     # -----------------------------------------------------------------------
-    reducer_name = "UMAP" if use_umap else "PCA"
-    print(f"\nGenerating plots ({reducer_name}) …")
+    print("\nGenerating plots (t-SNE) …")
 
     # --- Plot 1: RQ space ---
     RQ_real_2d, RQ_protos_2d = fit_reduce(
-        RQ_real, RQ_protos, use_umap=use_umap
+        RQ_real, RQ_protos, perplexity=args.perplexity, seed=args.seed
     )
     scatter_plot(
         Z_real_2d   = RQ_real_2d,
         Z_protos_2d = RQ_protos_2d,
-        proto_types = proto_types_list,
         title       = "RQ space",
-        subtitle    = f"{reducer_name} of 8 pulse-shape metrics  ({N} real events)",
-        x_label     = f"{reducer_name} 1",
-        y_label     = f"{reducer_name} 2",
+        subtitle    = f"t-SNE of 8 pulse-shape metrics  ({N} real events)",
         path        = os.path.join(args.output_dir, "scatter_rq.png"),
     )
 
-    # --- Plot 2: AE latent ---
+    # --- Plot 2: GraphAE latent ---
     if Z_ae_real is not None:
         ae_real_2d, ae_protos_2d = fit_reduce(
-            Z_ae_real, Z_ae_protos, use_umap=use_umap
+            Z_ae_real, Z_ae_protos, perplexity=args.perplexity, seed=args.seed
         )
         scatter_plot(
             Z_real_2d   = ae_real_2d,
             Z_protos_2d = ae_protos_2d,
-            proto_types = proto_types_list,
             title       = f"GraphAE latent space  (z={args.ae_latent_dim})",
-            subtitle    = (f"{reducer_name} of {Z_ae_real.shape[1]}-dim encoder output  "
+            subtitle    = (f"t-SNE of {Z_ae_real.shape[1]}-dim encoder output  "
                            f"({N} real events)"),
-            x_label     = f"{reducer_name} 1",
-            y_label     = f"{reducer_name} 2",
             path        = os.path.join(args.output_dir, "scatter_ae.png"),
         )
 
     # --- Plot 3: DiffAE latent ---
     if Z_diffae_real is not None:
         diffae_real_2d, diffae_protos_2d = fit_reduce(
-            Z_diffae_real, Z_diffae_protos, use_umap=use_umap
+            Z_diffae_real, Z_diffae_protos, perplexity=args.perplexity, seed=args.seed
         )
         scatter_plot(
             Z_real_2d   = diffae_real_2d,
             Z_protos_2d = diffae_protos_2d,
-            proto_types = proto_types_list,
             title       = f"DiffAE latent space  (z={args.diffae_latent_dim})",
-            subtitle    = (f"{reducer_name} of {Z_diffae_real.shape[1]}-dim encoder output  "
+            subtitle    = (f"t-SNE of {Z_diffae_real.shape[1]}-dim encoder output  "
                            f"({N} real events)"),
-            x_label     = f"{reducer_name} 1",
-            y_label     = f"{reducer_name} 2",
             path        = os.path.join(args.output_dir, "scatter_diffae.png"),
         )
 
@@ -625,8 +564,6 @@ def main():
     print("  scatter_rq.png     — RQ space (poor separability expected)")
     print("  scatter_ae.png     — GraphAE latent space")
     print("  scatter_diffae.png — DiffAE latent space")
-    if not HAS_UMAP:
-        print("\n  Tip: pip install umap-learn  for UMAP projection (better than PCA)")
 
 
 if __name__ == "__main__":
