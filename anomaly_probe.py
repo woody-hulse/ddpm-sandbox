@@ -49,7 +49,7 @@ except ImportError:
 
 from config import default_config
 from diffae import DiffAEContext
-from ae import AEContext
+from graphae import GraphAEContext
 from compare_rqs import collect_rqs, compute_rqs, wf_to_z_profile
 from plot_style import apply_style
 
@@ -252,21 +252,35 @@ def to_flat(wf_batch: np.ndarray) -> np.ndarray:
 
 @torch.no_grad()
 def encode_batch(wf_batch: np.ndarray, ctx, batch_size: int = 8) -> np.ndarray:
-    """(B, C, T) → (B, latent_dim).  Works with AEContext or DiffAEContext."""
+    """
+    (B, C, T) → (B, latent_dim).
+
+    Accepts either DiffAEContext (has ctx.encoder / ctx.ema_encoder, returns
+    z as first element of a 3-tuple) or GraphAEContext (has ctx.model /
+    ctx.ema_model; uses model.encode which returns (z, pool_indices)).
+    """
     B      = wf_batch.shape[0]
     wf_col = np.transpose(wf_batch, (0, 2, 1)).reshape(B, -1, 1).astype(np.float32)
     wf_col = ctx.data_stats.normalize(wf_col)
 
-    encoder = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
-    encoder.eval()
+    # Resolve the callable and call convention for each context type.
+    is_graphae = isinstance(ctx, GraphAEContext)
+    if is_graphae:
+        net = ctx.ema_model if ctx.ema_model is not None else ctx.model
+    else:
+        net = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
+    net.eval()
 
     all_z = []
     for start in range(0, B, batch_size):
-        end  = min(start + batch_size, B)
-        bs   = end - start
-        x    = torch.from_numpy(wf_col[start:end]).to(ctx.device)
-        xf   = x.view(bs * ctx.n_nodes, 1)
-        z, _, _ = encoder(xf, ctx.A_sparse, ctx.pos, batch_size=bs)
+        end = min(start + batch_size, B)
+        bs  = end - start
+        x   = torch.from_numpy(wf_col[start:end]).to(ctx.device)
+        xf  = x.view(bs * ctx.n_nodes, 1)
+        if is_graphae:
+            z, _ = net.encode(xf, ctx.A_sparse, ctx.pos, batch_size=bs)
+        else:
+            z, _, _ = net(xf, ctx.A_sparse, ctx.pos, batch_size=bs)
         all_z.append(z.cpu().numpy())
     return np.concatenate(all_z, axis=0)
 
@@ -509,16 +523,16 @@ def main():
         print(f"  z shape: {Z_diffae_real.shape}")
 
     # -----------------------------------------------------------------------
-    # 6. Load AE encoder and encode
+    # 6. Load GraphAE encoder and encode
     # -----------------------------------------------------------------------
-    print(f"\nLoading AE encoder (latent_dim={args.ae_latent_dim}) …")
+    print(f"\nLoading GraphAE encoder (latent_dim={args.ae_latent_dim}) …")
     cfg_ae = default_config
     cfg_ae.encoder.latent_dim = args.ae_latent_dim
-    ctx_ae = AEContext.build(cfg_ae, for_training=True, verbose=False,
-                             use_ms_data=False)
+    ctx_ae = GraphAEContext.build(cfg_ae, for_training=True, verbose=False,
+                                  use_ms_data=False)
     ckpt_ae = ctx_ae.latest_checkpoint()
     if ckpt_ae is None:
-        print(f"  WARNING: no AE checkpoint found in {ctx_ae.checkpoint_dir}")
+        print(f"  WARNING: no GraphAE checkpoint found in {ctx_ae.checkpoint_dir}")
         Z_ae_real   = None
         Z_ae_protos = None
     else:
@@ -560,7 +574,7 @@ def main():
             Z_real_2d   = ae_real_2d,
             Z_protos_2d = ae_protos_2d,
             proto_types = proto_types_list,
-            title       = f"AE latent space  (z={args.ae_latent_dim})",
+            title       = f"GraphAE latent space  (z={args.ae_latent_dim})",
             subtitle    = (f"{reducer_name} of {Z_ae_real.shape[1]}-dim encoder output  "
                            f"({N} real events)"),
             x_label     = f"{reducer_name} 1",
@@ -587,7 +601,7 @@ def main():
 
     print(f"\nDone → {args.output_dir}/")
     print("  scatter_rq.png     — RQ space (poor separability expected)")
-    print("  scatter_ae.png     — AE latent space")
+    print("  scatter_ae.png     — GraphAE latent space")
     print("  scatter_diffae.png — DiffAE latent space")
     if not HAS_UMAP:
         print("\n  Tip: pip install umap-learn  for UMAP projection (better than PCA)")
