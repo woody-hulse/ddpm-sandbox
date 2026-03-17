@@ -30,7 +30,6 @@ Usage:
 
 import argparse
 import os
-import sys
 
 import h5py
 import numpy as np
@@ -40,7 +39,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from tqdm import tqdm
 
 umap_module = None
 try:
@@ -49,7 +47,7 @@ try:
 except ImportError:
     HAS_UMAP = False
 
-from config import default_config, Config
+from config import default_config
 from diffae import DiffAEContext
 from ae import AEContext
 from compare_rqs import collect_rqs, compute_rqs, wf_to_z_profile
@@ -391,8 +389,11 @@ def main():
     )
     parser.add_argument("--n-events",   type=int, default=500,
                         help="Number of real SS events for background cloud")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--latent-dim", type=int, default=64)
+    parser.add_argument("--batch-size",      type=int, default=8)
+    parser.add_argument("--ae-latent-dim",   type=int, default=64,
+                        help="Latent dimension for the AE model (default 64)")
+    parser.add_argument("--diffae-latent-dim", type=int, default=64,
+                        help="Latent dimension for the DiffAE model (default 64)")
     parser.add_argument("--output-dir", type=str, default="anomaly_results")
     parser.add_argument("--seed",       type=int, default=42)
     parser.add_argument("--no-umap",    action="store_true",
@@ -423,7 +424,7 @@ def main():
     # Load channel positions from DiffAEContext (needed before building models)
     print("Building contexts to get graph / channel positions …")
     cfg_diffae = default_config
-    cfg_diffae.encoder.latent_dim = args.latent_dim
+    cfg_diffae.encoder.latent_dim = args.diffae_latent_dim
     ctx_diffae = DiffAEContext.build(cfg_diffae, for_training=True,
                                      verbose=False, use_ms_data=False)
     channel_pos = ctx_diffae.loader.channel_positions   # (C, 2)
@@ -492,7 +493,7 @@ def main():
     # -----------------------------------------------------------------------
     # 5. Load DiffAE encoder and encode
     # -----------------------------------------------------------------------
-    print(f"\nLoading DiffAE encoder (latent_dim={args.latent_dim}) …")
+    print(f"\nLoading DiffAE encoder (latent_dim={args.diffae_latent_dim}) …")
     ckpt_diffae = ctx_diffae.latest_checkpoint()
     if ckpt_diffae is None:
         print(f"  WARNING: no DiffAE checkpoint found in {ctx_diffae.checkpoint_dir}")
@@ -510,9 +511,9 @@ def main():
     # -----------------------------------------------------------------------
     # 6. Load AE encoder and encode
     # -----------------------------------------------------------------------
-    print(f"\nLoading AE encoder (latent_dim={args.latent_dim}) …")
+    print(f"\nLoading AE encoder (latent_dim={args.ae_latent_dim}) …")
     cfg_ae = default_config
-    cfg_ae.encoder.latent_dim = args.latent_dim
+    cfg_ae.encoder.latent_dim = args.ae_latent_dim
     ctx_ae = AEContext.build(cfg_ae, for_training=True, verbose=False,
                              use_ms_data=False)
     ckpt_ae = ctx_ae.latest_checkpoint()
@@ -559,7 +560,7 @@ def main():
             Z_real_2d   = ae_real_2d,
             Z_protos_2d = ae_protos_2d,
             proto_types = proto_types_list,
-            title       = f"AE latent space  (z={args.latent_dim})",
+            title       = f"AE latent space  (z={args.ae_latent_dim})",
             subtitle    = (f"{reducer_name} of {Z_ae_real.shape[1]}-dim encoder output  "
                            f"({N} real events)"),
             x_label     = f"{reducer_name} 1",
@@ -576,7 +577,7 @@ def main():
             Z_real_2d   = diffae_real_2d,
             Z_protos_2d = diffae_protos_2d,
             proto_types = proto_types_list,
-            title       = f"DiffAE latent space  (z={args.latent_dim})",
+            title       = f"DiffAE latent space  (z={args.diffae_latent_dim})",
             subtitle    = (f"{reducer_name} of {Z_diffae_real.shape[1]}-dim encoder output  "
                            f"({N} real events)"),
             x_label     = f"{reducer_name} 1",
