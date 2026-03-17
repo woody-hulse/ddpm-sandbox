@@ -541,15 +541,33 @@ def load_diffae(cfg: Config, device: torch.device) -> Optional[DiffAEContext]:
 
 
 def load_graphae(cfg: Config, device: torch.device) -> Optional[GraphAEContext]:
-    ctx = GraphAEContext.build(cfg, for_training=False, verbose=True)
-    ckpt = ctx.latest_checkpoint()
-    if ckpt is None:
-        print("WARNING: no GraphAE checkpoint found — skipping GraphAE.")
-        return None
-    epoch = ctx.load_checkpoint(ckpt, load_optim=False)
-    print(f"  GraphAE: loaded epoch {epoch} from {os.path.basename(ckpt)}")
-    ctx.ema_model.eval()
-    return ctx
+    configured_dim = cfg.encoder.latent_dim
+    candidates = [configured_dim, configured_dim // 2, configured_dim * 2]
+
+    for ldim in candidates:
+        if ldim < 1:
+            continue
+        probe_cfg = get_config(latent_dim=ldim) if ldim != configured_dim else cfg
+        ctx = GraphAEContext.build(probe_cfg, for_training=False, verbose=False)
+        ckpt = ctx.latest_checkpoint()
+        if ckpt is not None:
+            if ldim != configured_dim:
+                print(
+                    f"WARNING: no GraphAE checkpoint for latent_dim={configured_dim}. "
+                    f"Falling back to latent_dim={ldim} "
+                    f"(found {os.path.basename(ckpt)})."
+                )
+            epoch = ctx.load_checkpoint(ckpt, load_optim=False)
+            print(f"  GraphAE: loaded epoch {epoch} from {os.path.basename(ckpt)}"
+                  f"  (latent_dim={ldim})")
+            ctx.ema_model.eval()
+            return ctx
+
+    print(
+        f"WARNING: no GraphAE checkpoint found for latent_dim in "
+        f"{candidates} — skipping GraphAE."
+    )
+    return None
 
 
 # ---------------------------------------------------------------------------
