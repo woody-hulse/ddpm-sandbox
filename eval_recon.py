@@ -316,7 +316,8 @@ def reconstruct_graphae_batch(
     x_norm: torch.Tensor,   # (B, N, 1)
 ) -> np.ndarray:
     """Returns (B, N) denormalised."""
-    rec = reconstruct_graphae(ctx.ema_model, ctx.A_sparse, ctx.pos, x_norm)  # (B, 1, N)
+    model = ctx.ema_model if ctx.ema_model is not None else ctx.model
+    rec = reconstruct_graphae(model, ctx.A_sparse, ctx.pos, x_norm)  # (B, 1, N)
     rec_np = ctx.data_stats.denormalize(rec.cpu().numpy()[:, 0, :])           # (B, N)
     return np.clip(rec_np, 0, None)
 
@@ -563,8 +564,7 @@ def load_graphae(cfg: Config, device: torch.device) -> Optional[GraphAEContext]:
             print(f"  GraphAE: loaded epoch {epoch} from {os.path.basename(ckpt)}"
                   f"  (latent_dim={ldim})")
             model = ctx.ema_model if ctx.ema_model is not None else ctx.model
-            ctx.model = model
-            ctx.model.eval()
+            model.eval()
             return ctx
 
     print(
