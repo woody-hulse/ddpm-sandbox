@@ -481,9 +481,9 @@ def main():
     else:
         print("Mode: loading pre-saved encodings from H5 (color by |delta_mu|).")
         ae_subdir = cfg.paths.ae_subdir.format(latent_dim=ldim)
-        ae_h5 = os.path.join(cfg.paths.checkpoint_dir, ae_subdir, "ae_encoded_ms_latents.h5")
+        ae_h5 = os.path.join(cfg.paths.checkpoint_dir, ae_subdir, cfg.paths.ae_latents_file)
         dae_subdir = cfg.paths.diffae_subdir.format(latent_dim=ldim)
-        dae_h5 = os.path.join(cfg.paths.checkpoint_dir, dae_subdir, "encoded_ms_latents.h5")
+        dae_h5 = os.path.join(cfg.paths.checkpoint_dir, dae_subdir, cfg.paths.diffae_latents_file)
 
         panels = []
         if args.model in ("ae", "both"):

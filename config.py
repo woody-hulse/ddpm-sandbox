@@ -202,6 +202,11 @@ class PathConfig:
     ae_subdir: str = "ae_z{latent_dim}"
     graph_ae_subdir: str = "graph_ae_z{latent_dim}"
 
+    # Encoded latent filenames (written by encode_dataset_every)
+    ae_latents_file:      str = "ae_encoded_ms_latents.h5"
+    graphae_latents_file: str = "graphae_encoded_ms_latents.h5"
+    diffae_latents_file:  str = "encoded_ms_latents.h5"
+
 
 # =============================================================================
 # Complete Configuration

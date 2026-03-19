@@ -492,6 +492,12 @@ def main():
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--perplexity",  type=int, default=30,
                         help="t-SNE perplexity (default 30)")
+    parser.add_argument("--use-cached-latents", action="store_true",
+                        help="Load Z_real from pre-encoded H5 files instead of encoding on-the-fly")
+    parser.add_argument("--ae-latents",     type=str, default=None,
+                        help="Path to GraphAE encoded latents H5 (auto-detected if omitted)")
+    parser.add_argument("--diffae-latents", type=str, default=None,
+                        help="Path to DiffAE encoded latents H5 (auto-detected if omitted)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -595,8 +601,26 @@ def main():
     else:
         ep = ctx_diffae.load_checkpoint(ckpt_diffae, load_optim=False)
         print(f"  Loaded {os.path.basename(ckpt_diffae)} (epoch {ep})")
-        print("  Encoding real events …")
-        Z_diffae_real   = encode_batch(wf_real,   ctx_diffae, args.batch_size)
+
+        # Background cloud: from cached latents or live encoding
+        if args.use_cached_latents:
+            diffae_h5 = args.diffae_latents or os.path.join(
+                ctx_diffae.checkpoint_dir, cfg.paths.diffae_latents_file
+            )
+            if os.path.exists(diffae_h5):
+                with h5py.File(diffae_h5, "r") as f:
+                    all_z = np.array(f["latents"], dtype=np.float32)
+                rng = np.random.default_rng(args.seed)
+                idx = rng.choice(len(all_z), size=min(args.n_events, len(all_z)), replace=False)
+                Z_diffae_real = all_z[idx]
+                print(f"  Loaded Z_real from cache ({diffae_h5}): {Z_diffae_real.shape}")
+            else:
+                print(f"  WARNING: cached latents not found at {diffae_h5}, encoding on-the-fly")
+                Z_diffae_real = encode_batch(wf_real, ctx_diffae, args.batch_size)
+        else:
+            print("  Encoding real events …")
+            Z_diffae_real = encode_batch(wf_real, ctx_diffae, args.batch_size)
+
         print("  Encoding prototypes …")
         Z_diffae_protos = encode_batch(wf_protos, ctx_diffae, args.batch_size)
         print(f"  z shape: {Z_diffae_real.shape}")
@@ -637,8 +661,26 @@ def main():
     else:
         ep = ctx_ae.load_checkpoint(ckpt_ae, load_optim=False)
         print(f"  Loaded {os.path.basename(ckpt_ae)} (epoch {ep})")
-        print("  Encoding real events …")
-        Z_ae_real   = encode_batch(wf_real,   ctx_ae, args.batch_size)
+
+        # Background cloud: from cached latents or live encoding
+        if args.use_cached_latents:
+            ae_h5 = args.ae_latents or os.path.join(
+                ctx_ae.checkpoint_dir, cfg.paths.graphae_latents_file
+            )
+            if os.path.exists(ae_h5):
+                with h5py.File(ae_h5, "r") as f:
+                    all_z = np.array(f["latents"], dtype=np.float32)
+                rng = np.random.default_rng(args.seed + 1)
+                idx = rng.choice(len(all_z), size=min(args.n_events, len(all_z)), replace=False)
+                Z_ae_real = all_z[idx]
+                print(f"  Loaded Z_real from cache ({ae_h5}): {Z_ae_real.shape}")
+            else:
+                print(f"  WARNING: cached latents not found at {ae_h5}, encoding on-the-fly")
+                Z_ae_real = encode_batch(wf_real, ctx_ae, args.batch_size)
+        else:
+            print("  Encoding real events …")
+            Z_ae_real = encode_batch(wf_real, ctx_ae, args.batch_size)
+
         print("  Encoding prototypes …")
         Z_ae_protos = encode_batch(wf_protos, ctx_ae, args.batch_size)
         print(f"  z shape: {Z_ae_real.shape}")

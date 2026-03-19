@@ -373,7 +373,7 @@ def encode_ae_dataset(cfg: Config, ckpt_path: str, n_samples: int = 100_000, ver
     encoder = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
     encoder.eval()
 
-    out_path = os.path.join(ctx.checkpoint_dir, "ae_encoded_ms_latents.h5")
+    out_path = os.path.join(ctx.checkpoint_dir, cfg.paths.ae_latents_file)
     ae_save_encoded(ctx, out_path, encoder=encoder, batch_size=128, n_samples=n_samples, verbose=verbose)
     return out_path
 
@@ -385,7 +385,7 @@ def encode_diffae_dataset(cfg: Config, ckpt_path: str, n_samples: int = 100_000,
     encoder = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
     encoder.eval()
 
-    out_path = os.path.join(ctx.checkpoint_dir, "encoded_ms_latents.h5")
+    out_path = os.path.join(ctx.checkpoint_dir, cfg.paths.diffae_latents_file)
     diffae_save_encoded(ctx, out_path, encoder=encoder, batch_size=128, n_samples=n_samples, verbose=verbose)
     return out_path
 
@@ -496,13 +496,13 @@ def find_diffae_checkpoint(cfg: Config, latent_dim: int) -> Optional[str]:
 
 def find_ae_latents(cfg: Config, latent_dim: int) -> Optional[str]:
     subdir = cfg.paths.ae_subdir.format(latent_dim=latent_dim)
-    path = os.path.join(cfg.paths.checkpoint_dir, subdir, "ae_encoded_ms_latents.h5")
+    path = os.path.join(cfg.paths.checkpoint_dir, subdir, cfg.paths.ae_latents_file)
     return path if os.path.exists(path) else None
 
 
 def find_diffae_latents(cfg: Config, latent_dim: int) -> Optional[str]:
     subdir = cfg.paths.diffae_subdir.format(latent_dim=latent_dim)
-    path = os.path.join(cfg.paths.checkpoint_dir, subdir, "encoded_ms_latents.h5")
+    path = os.path.join(cfg.paths.checkpoint_dir, subdir, cfg.paths.diffae_latents_file)
     return path if os.path.exists(path) else None
 
 

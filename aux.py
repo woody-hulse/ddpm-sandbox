@@ -1587,10 +1587,10 @@ def find_encoded_latents(cfg: Config, model_type: str, latent_dim: int) -> Optio
     """Find pre-encoded latent file for a given model type and latent dim."""
     if model_type == 'diffae':
         subdir = cfg.paths.diffae_subdir.format(latent_dim=latent_dim)
-        filename = "encoded_ms_latents.h5"
+        filename = cfg.paths.diffae_latents_file
     elif model_type == 'ae':
         subdir = cfg.paths.ae_subdir.format(latent_dim=latent_dim)
-        filename = "ae_encoded_ms_latents.h5"
+        filename = cfg.paths.ae_latents_file
     else:
         return None
     
@@ -1663,8 +1663,8 @@ Examples:
     
     if diffae_path is None and ae_path is None:
         print("ERROR: No encoded latent files found!")
-        print(f"  Looked for DiffAE: {cfg.paths.checkpoint_dir}/{cfg.paths.diffae_subdir.format(latent_dim=latent_dim)}/encoded_ms_latents.h5")
-        print(f"  Looked for AE: {cfg.paths.checkpoint_dir}/{cfg.paths.ae_subdir.format(latent_dim=latent_dim)}/ae_encoded_ms_latents.h5")
+        print(f"  Looked for DiffAE: {cfg.paths.checkpoint_dir}/{cfg.paths.diffae_subdir.format(latent_dim=latent_dim)}/{cfg.paths.diffae_latents_file}")
+        print(f"  Looked for AE: {cfg.paths.checkpoint_dir}/{cfg.paths.ae_subdir.format(latent_dim=latent_dim)}/{cfg.paths.ae_latents_file}")
         print("\nTo generate encoded latents, run:")
         print("  python diffae.py   # for DiffAE")
         print("  python ae.py       # for Graph AE")

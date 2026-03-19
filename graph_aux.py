@@ -113,13 +113,13 @@ def find_latest_graphae_ckpt(cfg: Config) -> Optional[str]:
 
 def find_latest_latents_h5(cfg: Config) -> Optional[str]:
     subdir = cfg.paths.graph_ae_subdir.format(latent_dim=cfg.encoder.latent_dim)
-    path = os.path.join(cfg.paths.checkpoint_dir, subdir, "graphae_encoded_ms_latents.h5")
+    path = os.path.join(cfg.paths.checkpoint_dir, subdir, cfg.paths.graphae_latents_file)
     return path if os.path.exists(path) else None
 
 
 def find_diffae_latents_h5(cfg: Config) -> Optional[str]:
     subdir = cfg.paths.diffae_subdir.format(latent_dim=cfg.encoder.latent_dim)
-    path = os.path.join(cfg.paths.checkpoint_dir, subdir, "encoded_ms_latents.h5")
+    path = os.path.join(cfg.paths.checkpoint_dir, subdir, cfg.paths.diffae_latents_file)
     return path if os.path.exists(path) else None
 
 

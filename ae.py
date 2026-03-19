@@ -896,7 +896,7 @@ def train_ae(cfg: Config = default_config):
     B = cfg.training.batch_size
 
     global_step = start_epoch * cfg.training.steps_per_epoch
-    encoded_output_path = os.path.join(ctx.checkpoint_dir, "ae_encoded_ms_latents.h5")
+    encoded_output_path = os.path.join(ctx.checkpoint_dir, cfg.paths.ae_latents_file)
 
     if cfg.training.lopsided_aug:
         print(f"  Lopsided augmentation ON: frac={cfg.training.lopsided_frac}, sigma={cfg.training.lopsided_sigma}")
