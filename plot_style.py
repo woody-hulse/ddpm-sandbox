@@ -52,7 +52,6 @@ def apply_style() -> None:
     """
     matplotlib.rcParams.update({
         # --- typography ---
-        "font.family":        "serif",
         "font.size":          10,
         "axes.labelsize":     11,
         "axes.titlesize":     11,
