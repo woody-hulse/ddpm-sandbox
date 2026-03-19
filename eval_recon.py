@@ -562,7 +562,9 @@ def load_graphae(cfg: Config, device: torch.device) -> Optional[GraphAEContext]:
             epoch = ctx.load_checkpoint(ckpt, load_optim=False)
             print(f"  GraphAE: loaded epoch {epoch} from {os.path.basename(ckpt)}"
                   f"  (latent_dim={ldim})")
-            ctx.ema_model.eval()
+            model = ctx.ema_model if ctx.ema_model is not None else ctx.model
+            ctx.model = model
+            ctx.model.eval()
             return ctx
 
     print(
