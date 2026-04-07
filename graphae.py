@@ -57,7 +57,8 @@ class GraphEncoderBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
+        with torch.amp.autocast('cuda', enabled=False):
+            neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
         h = self.post_agg_norm((1 + self.eps) * h + neighbor_sum)
         h = self.lin1(h)
         h = self.act(h)
@@ -258,7 +259,8 @@ class GraphDecoderBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
+        with torch.amp.autocast('cuda', enabled=False):
+            neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
         h = (1 + self.eps) * h + neighbor_sum
         h = self.lin1(h)
         h = self.act(h)
@@ -684,7 +686,8 @@ class GraphTransposeDecoderBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, adj_t: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        neighbor_sum = torch.sparse.mm(adj_t.float(), h.float()).to(h.dtype)
+        with torch.amp.autocast('cuda', enabled=False):
+            neighbor_sum = torch.sparse.mm(adj_t.float(), h.float()).to(h.dtype)
         h = (1 + self.eps) * h + neighbor_sum
         h = self.lin1(h)
         h = self.act(h)

@@ -14,7 +14,8 @@ class SparseGraphConv(nn.Module):
         self.lin = nn.Linear(in_dim, out_dim, bias=bias)
 
     def forward(self, x: torch.Tensor, adj_hat: torch.Tensor) -> torch.Tensor:
-        z = torch.sparse.mm(adj_hat.float(), x.float()).to(x.dtype)
+        with torch.amp.autocast('cuda', enabled=False):
+            z = torch.sparse.mm(adj_hat.float(), x.float()).to(x.dtype)
         return self.lin(z)
 
 
@@ -77,7 +78,8 @@ class GraphResBlock(nn.Module):
         h = self.norm(x)
         
         # GIN-style message passing: (1 + eps) * self + sum(neighbors)
-        neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
+        with torch.amp.autocast('cuda', enabled=False):
+            neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
         h = (1 + self.eps) * h + neighbor_sum
         
         # Conditioning with bounded scale
@@ -239,7 +241,8 @@ class GraclusPool(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         assign, P_single, adj_coarse, K = self._get(adj_single)
         P_block = build_block_diagonal_rect(P_single, batch_size).to(device=h.device, dtype=h.dtype)
-        h_coarse = torch.sparse.mm(P_block.t().float(), h.float()).to(h.dtype)
+        with torch.amp.autocast('cuda', enabled=False):
+            h_coarse = torch.sparse.mm(P_block.t().float(), h.float()).to(h.dtype)
         return h_coarse, assign, adj_coarse, K
 
 
