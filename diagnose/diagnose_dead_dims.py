@@ -67,23 +67,22 @@ def test_encoder_output_stats(ctx, cfg):
 
 @torch.no_grad()
 def test_latent_proj_jacobian(ctx):
-    """Measure sensitivity of latent_proj output to each z dimension."""
+    """Measure sensitivity of conditioning (z) output to each z dimension."""
     print("\n" + "=" * 60)
-    print("TEST 2: Latent Proj Jacobian (which z dims affect cond?)")
+    print("TEST 2: Latent z Jacobian (which z dims affect cond?)")
     print("=" * 60)
 
-    latent_proj = ctx.latent_proj
     latent_dim = 64
     eps = 0.01
 
     z_base = torch.zeros(1, latent_dim)
-    cond_base = latent_proj(z_base)
+    cond_base = z_base  # z is used directly as conditioning
 
     sensitivities = []
     for d in range(latent_dim):
         z_pert = z_base.clone()
         z_pert[0, d] = eps
-        cond_pert = latent_proj(z_pert)
+        cond_pert = z_pert
         diff = (cond_pert - cond_base).abs().sum().item() / eps
         sensitivities.append(diff)
 
@@ -112,13 +111,11 @@ def test_film_sensitivity(ctx, cfg):
     print("=" * 60)
 
     decoder = ctx.decoder
-    latent_proj = ctx.latent_proj
     latent_dim = 64
 
     z_base = torch.zeros(1, latent_dim)
-    cond_base = latent_proj(z_base)
     t_emb = sinusoidal_embedding(torch.tensor([50]), cfg.conditioning.time_dim)
-    cond_full_base = torch.cat([cond_base, t_emb], dim=-1)
+    cond_full_base = torch.cat([z_base, t_emb], dim=-1)
 
     gamma_base, beta_base = decoder.film(cond_full_base, batch_size=1)
 
@@ -127,8 +124,7 @@ def test_film_sensitivity(ctx, cfg):
     for d in range(latent_dim):
         z_pert = z_base.clone()
         z_pert[0, d] = 0.1
-        cond_pert = latent_proj(z_pert)
-        cond_full_pert = torch.cat([cond_pert, t_emb], dim=-1)
+        cond_full_pert = torch.cat([z_pert, t_emb], dim=-1)
         gamma_pert, beta_pert = decoder.film(cond_full_pert, batch_size=1)
         gamma_diffs.append((gamma_pert - gamma_base).abs().mean().item())
         beta_diffs.append((beta_pert - beta_base).abs().mean().item())
@@ -176,8 +172,7 @@ def test_end_to_end_jacobian(ctx, cfg, batch_np):
     x_t_flat = x_t.view(B * N, C).detach()
 
     z_var = z.detach().clone().requires_grad_(True)
-    cond_base = ctx.latent_proj(z_var)
-    cond_full = torch.cat([cond_base, t_emb], dim=-1)
+    cond_full = torch.cat([z_var, t_emb], dim=-1)
     pred = ctx.decoder(x_t_flat, ctx.A_sparse, cond_full, ctx.pos, batch_size=B)
     pred_2d = pred.view(B, N, C)
 
@@ -225,10 +220,6 @@ def test_z_vs_xt_contribution(ctx, cfg, batch_np):
     z_zero = torch.zeros_like(z_real)
     z_rand = torch.randn_like(z_real) * z_real.std()
 
-    cond_real = ctx.latent_proj(z_real)
-    cond_zero = ctx.latent_proj(z_zero)
-    cond_rand = ctx.latent_proj(z_rand)
-
     for t_val in [10, 50, 100, 200]:
         t_tensor = torch.full((B,), t_val, device=device, dtype=torch.long)
         t_emb = sinusoidal_embedding(t_tensor, cfg.conditioning.time_dim)
@@ -239,9 +230,9 @@ def test_z_vs_xt_contribution(ctx, cfg, batch_np):
         x_t = sqrt_ab * x0 + sqrt_om * noise
         x_t_flat = x_t.view(B * N, C)
 
-        pred_real = ctx.decoder(x_t_flat, ctx.A_sparse, torch.cat([cond_real, t_emb], dim=-1), ctx.pos, batch_size=B)
-        pred_zero = ctx.decoder(x_t_flat, ctx.A_sparse, torch.cat([cond_zero, t_emb], dim=-1), ctx.pos, batch_size=B)
-        pred_rand = ctx.decoder(x_t_flat, ctx.A_sparse, torch.cat([cond_rand, t_emb], dim=-1), ctx.pos, batch_size=B)
+        pred_real = ctx.decoder(x_t_flat, ctx.A_sparse, torch.cat([z_real, t_emb], dim=-1), ctx.pos, batch_size=B)
+        pred_zero = ctx.decoder(x_t_flat, ctx.A_sparse, torch.cat([z_zero, t_emb], dim=-1), ctx.pos, batch_size=B)
+        pred_rand = ctx.decoder(x_t_flat, ctx.A_sparse, torch.cat([z_rand, t_emb], dim=-1), ctx.pos, batch_size=B)
 
         diff_zero = (pred_real - pred_zero).pow(2).mean().item()
         diff_rand = (pred_real - pred_rand).pow(2).mean().item()
@@ -254,26 +245,11 @@ def test_z_vs_xt_contribution(ctx, cfg, batch_np):
 
 @torch.no_grad()
 def test_latent_proj_rank(ctx):
-    """Check effective rank of latent_proj weight matrices."""
+    """latent_proj has been removed; z is used directly as conditioning."""
     print("\n" + "=" * 60)
-    print("TEST 6: Latent Proj Weight Matrix Analysis")
+    print("TEST 6: Latent Proj Weight Matrix Analysis (N/A — latent_proj removed)")
     print("=" * 60)
-
-    for i, m in enumerate(ctx.latent_proj):
-        if isinstance(m, nn.Linear):
-            W = m.weight.data
-            U, S, V = torch.svd(W)
-            S_norm = S / S[0]
-            rank_90 = (S_norm.cumsum(0) / S_norm.sum() < 0.9).sum().item() + 1
-            rank_99 = (S_norm.cumsum(0) / S_norm.sum() < 0.99).sum().item() + 1
-            cond_num = S[0].item() / max(S[-1].item(), 1e-10)
-
-            print(f"  Layer {i}: {W.shape[0]}x{W.shape[1]}")
-            print(f"    Singular values — top5: {S[:5].tolist()}")
-            print(f"    Bottom 5: {S[-5:].tolist()}")
-            print(f"    Rank for 90% energy: {rank_90}/{min(W.shape)}")
-            print(f"    Rank for 99% energy: {rank_99}/{min(W.shape)}")
-            print(f"    Condition number:     {cond_num:.1f}")
+    print("  z is now used directly as conditioning — no projection layer to analyze.")
 
 
 @torch.no_grad()
@@ -338,8 +314,8 @@ def main():
     print(f"  z_var vs proj_sens:        rho={corr_var_proj:.3f}")
 
     if corr_var_proj > 0.7:
-        print("\n  --> CONCLUSION: Dead dims are driven by latent_proj selectivity")
-        print("     (latent_proj ignores certain z dims)")
+        print("\n  --> CONCLUSION: Dead dims are driven by conditioning selectivity")
+        print("     (decoder ignores certain z dims)")
     elif corr_var_e2e > 0.7 and corr_proj_e2e < 0.3:
         print("\n  --> CONCLUSION: Dead dims are driven by decoder ignoring cond dims")
     elif corr_var_e2e < 0.3:

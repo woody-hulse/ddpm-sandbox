@@ -138,7 +138,6 @@ def experiment_partial_noise(ctx, cfg, batch_np, labels, out_dir):
             rec = sample_diffae_partial(
                 encoder=ctx.encoder,
                 decoder=ctx.decoder,
-                latent_proj=ctx.latent_proj,
                 schedule=schedule,
                 A_sparse=ctx.A_sparse,
                 pos=ctx.pos,
@@ -220,11 +219,11 @@ def experiment_conditioning_swap(ctx, cfg, batch_np, labels, out_dir):
     n_nodes = ctx.n_nodes
 
     rec_left_zleft = sample_from_latent(
-        ctx.decoder, ctx.latent_proj, schedule, A, pos,
+        ctx.decoder, schedule, A, pos,
         cfg.conditioning.time_dim, z_left, n_nodes, cfg.diffusion.parametrization,
     )
     rec_left_zright = sample_from_latent(
-        ctx.decoder, ctx.latent_proj, schedule, A, pos,
+        ctx.decoder, schedule, A, pos,
         cfg.conditioning.time_dim, z_right, n_nodes, cfg.diffusion.parametrization,
     )
 
@@ -306,7 +305,6 @@ def experiment_p2_analysis(ctx, cfg, batch_np, labels, out_dir):
 
     x0_flat = x0.view(B * N_nodes, C)
     z, _, _ = ctx.encoder(x0_flat, A, pos, batch_size=B)
-    cond_base = ctx.latent_proj(z)
 
     T = schedule['betas'].shape[0]
     snr_all = schedule['snr'].cpu().numpy()
@@ -323,7 +321,7 @@ def experiment_p2_analysis(ctx, cfg, batch_np, labels, out_dir):
         for t_val in t_sample:
             t_tensor = torch.full((B,), t_val, device=device, dtype=torch.long)
             t_emb = sinusoidal_embedding(t_tensor, cfg.conditioning.time_dim)
-            cond_full = torch.cat([cond_base, t_emb], dim=-1)
+            cond_full = torch.cat([z, t_emb], dim=-1)
 
             sqrt_ab = schedule['sqrt_alphas_cumprod'][t_val].view(1, 1, 1)
             sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t_val].view(1, 1, 1)
@@ -434,10 +432,6 @@ def main():
         ctx.decoder.load_state_dict(chk["ema_decoder"])
     else:
         ctx.decoder.load_state_dict(chk["decoder"])
-    if "ema_latent_proj" in chk:
-        ctx.latent_proj.load_state_dict(chk["ema_latent_proj"])
-    else:
-        ctx.latent_proj.load_state_dict(chk["latent_proj"])
     if "data_stats" in chk:
         ctx.data_stats.mean = chk["data_stats"]["mean"]
         ctx.data_stats.std = chk["data_stats"]["std"]
@@ -446,7 +440,6 @@ def main():
 
     ctx.encoder.eval()
     ctx.decoder.eval()
-    ctx.latent_proj.eval()
 
     print(f"\nPreparing {args.n_events} lopsided events ({args.n_events // 2} left, {args.n_events // 2} right)...")
     batch_np, labels = prepare_lopsided_batch(ctx, cfg, args.n_events)

@@ -19,6 +19,9 @@ from data import Graph, visualize_event, visualize_event_z, SparseGraph
 from lz_data_loader import TritiumSSDataLoader
 from config import Config, default_config, print_config
 
+# ddpm_sparse uses its own physics-cond projection dimension (not from DiffAE's latent_proj)
+_COND_PROJ_DIM: int = 64
+
 from models.graph_unet import GraphDDPMUNet
 from diffusion.schedule import build_cosine_schedule, sinusoidal_embedding
 from utils.visualization import build_xy_adjacency_radius
@@ -75,12 +78,12 @@ class ModelContext:
         cond_proj = nn.Sequential(
             nn.Linear(cfg.conditioning.cond_in_dim, 128),
             nn.SiLU(),
-            nn.Linear(128, cfg.conditioning.cond_proj_dim)
+            nn.Linear(128, _COND_PROJ_DIM)
         ).to(device)
 
         core = GraphDDPMUNet(
             in_dim=cfg.model.in_dim,
-            cond_dim=cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim,
+            cond_dim=_COND_PROJ_DIM + cfg.conditioning.time_dim,
             hidden_dim=cfg.model.hidden_dim,
             depth=cfg.model.depth,
             blocks_per_stage=cfg.model.blocks_per_stage,
@@ -318,7 +321,7 @@ def train(cfg: Config = default_config):
     core.train()
     test_B = 2
     test_x = torch.randn(test_B * n_nodes, 1, device=device_t)
-    test_cond = torch.randn(test_B, cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim, device=device_t)
+    test_cond = torch.randn(test_B, _COND_PROJ_DIM + cfg.conditioning.time_dim, device=device_t)
     test_out = core(test_x, A_sparse, test_cond, pos, batch_size=test_B)
     test_loss = test_out.sum()
     test_loss.backward()

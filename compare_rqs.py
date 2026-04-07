@@ -406,7 +406,6 @@ def main():
 
     cfg = default_config
     cfg.encoder.hidden_dim = max(cfg.encoder.hidden_dim, cfg.encoder.latent_dim)
-    cfg.conditioning.cond_proj_dim = max(cfg.conditioning.cond_proj_dim, cfg.encoder.latent_dim)
     device = torch.device(cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f"Device: {device}")
     print(f"Samples: {args.n_samples}")
@@ -437,10 +436,8 @@ def main():
             diffae_ctx.load_checkpoint(diffae_ckpt, load_optim=False)
             diffae_ctx.encoder = diffae_ctx.ema_encoder if diffae_ctx.ema_encoder is not None else diffae_ctx.encoder
             diffae_ctx.decoder = diffae_ctx.ema_decoder if diffae_ctx.ema_decoder is not None else diffae_ctx.decoder
-            diffae_ctx.latent_proj = diffae_ctx.ema_latent_proj if diffae_ctx.ema_latent_proj is not None else diffae_ctx.latent_proj
             diffae_ctx.encoder.eval()
             diffae_ctx.decoder.eval()
-            diffae_ctx.latent_proj.eval()
             has_diffae = True
             print(f"DiffAE loaded from {diffae_ckpt} (EMA weights)")
         else:
@@ -496,7 +493,6 @@ def main():
             rec = sample_diffae(
                 encoder=diffae_ctx.encoder,
                 decoder=diffae_ctx.decoder,
-                latent_proj=diffae_ctx.latent_proj,
                 schedule=diffae_ctx.schedule,
                 A_sparse=diffae_ctx.A_sparse,
                 pos=diffae_ctx.pos,

@@ -295,11 +295,10 @@ def reconstruct_diffae_batch(
     cfg: Config,
 ) -> np.ndarray:
     """Single stochastic reconstruction. Returns (B, C, T) denormalised."""
-    assert ctx.ema_encoder is not None and ctx.ema_decoder is not None and ctx.ema_latent_proj is not None
+    assert ctx.ema_encoder is not None and ctx.ema_decoder is not None
     rec = sample_diffae(
         encoder=ctx.ema_encoder,
         decoder=ctx.ema_decoder,
-        latent_proj=ctx.ema_latent_proj,
         schedule=schedule,
         A_sparse=ctx.A_sparse,
         pos=ctx.pos,
@@ -425,9 +424,13 @@ def plot_results(
         "ssim": "SSIM", "pearson_r": "Pearson r",
     }
     for ax, k in zip(axes_flat, metric_keys):
+        all_vals = np.concatenate([per_sample[m][k] for m in models])
+        all_vals = all_vals[np.isfinite(all_vals)]
+        lo, hi = np.percentile(all_vals, 0.5), np.percentile(all_vals, 99.5)
+        shared_bins = np.linspace(lo, hi, 51)
         for m in models:
             arr = per_sample[m][k]
-            ax.hist(arr, bins=50, alpha=0.60, color=col[m], density=True,
+            ax.hist(arr, bins=shared_bins, alpha=0.60, color=col[m], density=True,
                     label=m, edgecolor='none')
         ax.set_title(metric_labels.get(k, k))
         ax.set_xlabel("Value")
@@ -472,17 +475,23 @@ def plot_results(
         "centroid_x": "Centroid x (mm)",
         "centroid_y": "Centroid y (mm)",
     }
+    # Pre-compute per-model marginals once so we can derive shared bins per key
+    rec_margs = {m: physics_marginals(rec_2d_dict[m], channel_positions, ns_per_bin)
+                 for m in models}
     fig, axes = plt.subplots(1, len(marginal_keys),
                              figsize=(4.2 * len(marginal_keys), 3.8))
     if len(marginal_keys) == 1:
         axes = [axes]
     for ax, key in zip(axes, marginal_keys):
-        ax.hist(true_marg[key], bins=50, alpha=0.50, color=COLORS["truth"],
+        all_vals = np.concatenate([true_marg[key]] + [rec_margs[m][key] for m in models])
+        all_vals = all_vals[np.isfinite(all_vals)]
+        lo, hi = np.percentile(all_vals, 0.5), np.percentile(all_vals, 99.5)
+        shared_bins = np.linspace(lo, hi, 51)
+        ax.hist(true_marg[key], bins=shared_bins, alpha=0.50, color=COLORS["truth"],
                 density=True, label="Truth", edgecolor='none')
         for m in models:
-            rec_marg = physics_marginals(rec_2d_dict[m], channel_positions, ns_per_bin)
             w1 = dist[m].get(f"W1_{key}", float("nan"))
-            ax.hist(rec_marg[key], bins=50, alpha=0.45, color=col[m], density=True,
+            ax.hist(rec_margs[m][key], bins=shared_bins, alpha=0.45, color=col[m], density=True,
                     label=f"{m}  (W₁={w1:.2f})", edgecolor='none')
         ax.set_xlabel(marg_labels.get(key, key))
         ax.set_ylabel("Density")
@@ -536,10 +545,9 @@ def load_diffae(cfg: Config, device: torch.device) -> Optional[DiffAEContext]:
         return None
     epoch = ctx.load_checkpoint(ckpt, load_optim=False)
     print(f"  DiffAE: loaded epoch {epoch} from {os.path.basename(ckpt)}")
-    assert ctx.ema_encoder is not None and ctx.ema_decoder is not None and ctx.ema_latent_proj is not None
+    assert ctx.ema_encoder is not None and ctx.ema_decoder is not None
     ctx.ema_encoder.eval()
     ctx.ema_decoder.eval()
-    ctx.ema_latent_proj.eval()
     return ctx
 
 

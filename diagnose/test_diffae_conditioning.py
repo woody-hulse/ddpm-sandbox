@@ -108,22 +108,21 @@ def test_decoder_conditioning_sensitivity():
         ctx.load_checkpoint(latest_ckpt, load_optim=False)
     
     ctx.decoder.eval()
-    ctx.latent_proj.eval()
-    
+
     with torch.no_grad():
         B = 4
         x_noise = torch.randn(B * ctx.n_nodes, 1, device=ctx.device)
-        
+
         z_random1 = torch.randn(B, cfg.encoder.latent_dim, device=ctx.device)
         z_random2 = torch.randn(B, cfg.encoder.latent_dim, device=ctx.device)
         z_zeros = torch.zeros(B, cfg.encoder.latent_dim, device=ctx.device)
-        
+
         t = torch.full((B,), 50, device=ctx.device, dtype=torch.long)
         t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-        
-        cond1 = torch.cat([ctx.latent_proj(z_random1), t_emb], dim=-1)
-        cond2 = torch.cat([ctx.latent_proj(z_random2), t_emb], dim=-1)
-        cond_zeros = torch.cat([ctx.latent_proj(z_zeros), t_emb], dim=-1)
+
+        cond1 = torch.cat([z_random1, t_emb], dim=-1)
+        cond2 = torch.cat([z_random2, t_emb], dim=-1)
+        cond_zeros = torch.cat([z_zeros, t_emb], dim=-1)
         
         out1 = ctx.decoder(x_noise, ctx.A_sparse, cond1, ctx.pos, batch_size=B)
         out2 = ctx.decoder(x_noise, ctx.A_sparse, cond2, ctx.pos, batch_size=B)
@@ -164,23 +163,21 @@ def test_gradient_flow():
     
     ctx.encoder.train()
     ctx.decoder.train()
-    ctx.latent_proj.train()
-    
+
     B = 2
     batch_np, *_ = ctx.loader.get_batch(B)
     x0 = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
     x0_flat = x0.view(B * ctx.n_nodes, 1)
     
     z, _, _ = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
-    cond_base = ctx.latent_proj(z)
-    
+
     print(f"\nLatent z requires_grad: {z.requires_grad}")
     print(f"Latent z shape: {z.shape}")
     print(f"Latent z stats: mean={z.mean().item():.4f}, std={z.std().item():.4f}")
-    
+
     t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=ctx.device, dtype=torch.long)
     t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-    cond_full = torch.cat([cond_base, t_emb], dim=-1)
+    cond_full = torch.cat([z, t_emb], dim=-1)
     
     sqrt_ab = ctx.schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
     sqrt_om = ctx.schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
@@ -201,15 +198,13 @@ def test_gradient_flow():
     
     encoder_grad_norm = sum(p.grad.norm().item() for p in ctx.encoder.parameters() if p.grad is not None)
     decoder_grad_norm = sum(p.grad.norm().item() for p in ctx.decoder.parameters() if p.grad is not None)
-    latent_proj_grad_norm = sum(p.grad.norm().item() for p in ctx.latent_proj.parameters() if p.grad is not None)
-    
+
     encoder_params_with_grad = sum(1 for p in ctx.encoder.parameters() if p.grad is not None)
     encoder_total_params = sum(1 for p in ctx.encoder.parameters())
-    
+
     print(f"\nGradient norms:")
     print(f"  Encoder: {encoder_grad_norm:.6f} ({encoder_params_with_grad}/{encoder_total_params} params with grad)")
     print(f"  Decoder: {decoder_grad_norm:.6f}")
-    print(f"  Latent proj: {latent_proj_grad_norm:.6f}")
     
     to_latent = ctx.encoder.to_latent if hasattr(ctx.encoder, 'to_latent') else None
     if to_latent is not None:
@@ -230,52 +225,46 @@ def test_gradient_flow():
 
 
 def test_latent_proj_output():
-    """Test 4: Check the latent projection output."""
+    """Test 4: Check the latent z output used for conditioning."""
     print("\n" + "=" * 60)
-    print("TEST 4: Latent projection analysis")
+    print("TEST 4: Latent z conditioning analysis")
     print("=" * 60)
-    
+
     cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=False)
-    
+
     latest_ckpt = ctx.latest_checkpoint()
     if latest_ckpt:
         ctx.load_checkpoint(latest_ckpt, load_optim=False)
-    
+
     with torch.no_grad():
         batch_np, *_ = ctx.loader.get_batch(8)
         x = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
         x_flat = x.view(8 * ctx.n_nodes, 1)
-        
+
         z, _, _ = ctx.encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=8)
-        cond_proj = ctx.latent_proj(z)
-        
+
         print(f"\nLatent z:")
         print(f"  Shape: {z.shape}")
         print(f"  Mean: {z.mean().item():.6f}, Std: {z.std().item():.6f}")
         print(f"  Per-dim std: {z.std(dim=0).mean().item():.6f}")
-        
-        print(f"\nProjected conditioning:")
-        print(f"  Shape: {cond_proj.shape}")
-        print(f"  Mean: {cond_proj.mean().item():.6f}, Std: {cond_proj.std().item():.6f}")
-        print(f"  Per-dim std: {cond_proj.std(dim=0).mean().item():.6f}")
-        
+
         t_emb = sinusoidal_embedding(torch.zeros(8, dtype=torch.long, device=ctx.device), cfg.conditioning.time_dim)
         print(f"\nTime embedding (t=0):")
         print(f"  Shape: {t_emb.shape}")
         print(f"  Mean: {t_emb.mean().item():.6f}, Std: {t_emb.std().item():.6f}")
-        
-        cond_full = torch.cat([cond_proj, t_emb], dim=-1)
-        print(f"\nFull conditioning (cond_proj + t_emb):")
+
+        cond_full = torch.cat([z, t_emb], dim=-1)
+        print(f"\nFull conditioning (z + t_emb):")
         print(f"  Shape: {cond_full.shape}")
-        print(f"  Latent portion std: {cond_full[:, :cfg.conditioning.cond_proj_dim].std().item():.6f}")
-        print(f"  Time portion std: {cond_full[:, cfg.conditioning.cond_proj_dim:].std().item():.6f}")
-        
-        if cond_proj.std().item() < t_emb.std().item() * 0.1:
-            print("\n*** WARNING: Latent projection has much lower variance than time embedding! ***")
+        print(f"  Latent portion std: {cond_full[:, :cfg.encoder.latent_dim].std().item():.6f}")
+        print(f"  Time portion std: {cond_full[:, cfg.encoder.latent_dim:].std().item():.6f}")
+
+        if z.std().item() < t_emb.std().item() * 0.1:
+            print("\n*** WARNING: Latent z has much lower variance than time embedding! ***")
             print("*** The decoder might be ignoring the latent and just using time! ***")
-    
-    return z, cond_proj
+
+    return z, z
 
 
 def test_reconstruction_correlation():
@@ -308,7 +297,6 @@ def test_reconstruction_correlation():
         samples = sample_diffae(
             encoder=ctx.encoder,
             decoder=ctx.decoder,
-            latent_proj=ctx.latent_proj,
             schedule=ctx.schedule,
             A_sparse=ctx.A_sparse,
             pos=ctx.pos,
@@ -353,30 +341,29 @@ def test_conditioning_ablation():
     
     ctx.encoder.eval()
     ctx.decoder.eval()
-    ctx.latent_proj.eval()
-    
+
     with torch.no_grad():
         B = 4
         batch_np, *_ = ctx.loader.get_batch(B)
         x0 = torch.from_numpy(ctx.data_stats.normalize(batch_np).astype(np.float32)).to(ctx.device)
         x0_flat = x0.view(B * ctx.n_nodes, 1)
-        
+
         z_real, _, _ = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
-        
+
         z_random = torch.randn_like(z_real)
         z_random = z_random * z_real.std() + z_real.mean()
-        
+
         t = torch.full((B,), 10, device=ctx.device, dtype=torch.long)
         t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
         sqrt_ab = ctx.schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
         sqrt_om = ctx.schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
-        
+
         noise = torch.randn_like(x0)
         x_t = sqrt_ab * x0 + sqrt_om * noise
         x_t_flat = x_t.view(B * ctx.n_nodes, 1)
-        
-        cond_real = torch.cat([ctx.latent_proj(z_real), t_emb], dim=-1)
-        cond_random = torch.cat([ctx.latent_proj(z_random), t_emb], dim=-1)
+
+        cond_real = torch.cat([z_real, t_emb], dim=-1)
+        cond_random = torch.cat([z_random, t_emb], dim=-1)
         
         pred_real = ctx.decoder(x_t_flat, ctx.A_sparse, cond_real, ctx.pos, batch_size=B)
         pred_random = ctx.decoder(x_t_flat, ctx.A_sparse, cond_random, ctx.pos, batch_size=B)
@@ -421,15 +408,14 @@ def test_film_modulation():
         ctx.load_checkpoint(latest_ckpt, load_optim=False)
     
     ctx.decoder.eval()
-    ctx.latent_proj.eval()
-    
+
     with torch.no_grad():
         B = 4
-        
+
         z_random = torch.randn(B, cfg.encoder.latent_dim, device=ctx.device)
         t = torch.full((B,), 50, device=ctx.device, dtype=torch.long)
         t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-        cond = torch.cat([ctx.latent_proj(z_random), t_emb], dim=-1)
+        cond = torch.cat([z_random, t_emb], dim=-1)
         
         gammas, betas = ctx.decoder.film(cond, batch_size=B)
         
@@ -462,25 +448,17 @@ def test_film_modulation():
 
 
 def test_ema_consistency():
-    """Test 8: Check if there's an EMA mismatch with latent_proj."""
+    """Test 8: Check EMA model consistency."""
     print("\n" + "=" * 60)
     print("TEST 8: EMA consistency check")
     print("=" * 60)
-    
+
     cfg = get_test_config()
     ctx = DiffAEContext.build(cfg, for_training=True, verbose=False)
-    
-    print("\nChecking if latent_proj has EMA tracking...")
+
+    print("\nChecking EMA model availability...")
     print(f"  ctx.ema_encoder exists: {ctx.ema_encoder is not None}")
     print(f"  ctx.ema_decoder exists: {ctx.ema_decoder is not None}")
-    
-    has_ema_latent_proj = hasattr(ctx, 'ema_latent_proj') and ctx.ema_latent_proj is not None
-    print(f"  ema_latent_proj exists: {has_ema_latent_proj}")
-    
-    if not has_ema_latent_proj:
-        print("\n*** NOTE: latent_proj does NOT have EMA tracking! ***")
-        print("*** During visualization, ema_encoder and ema_decoder are used ***")
-        print("*** but the regular latent_proj is used. This could cause mismatch! ***")
 
 
 def test_input_vs_conditioning_scale():
@@ -503,10 +481,9 @@ def test_input_vs_conditioning_scale():
         x0_flat = x0.view(B * ctx.n_nodes, 1)
         
         z, _, _ = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
-        cond_proj = ctx.latent_proj(z)
         t = torch.full((B,), 100, device=ctx.device, dtype=torch.long)
         t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-        cond_full = torch.cat([cond_proj, t_emb], dim=-1)
+        cond_full = torch.cat([z, t_emb], dim=-1)
         
         h_input = ctx.decoder.in_proj(x0_flat)
         

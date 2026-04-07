@@ -99,8 +99,6 @@ def _build_encoder_ctx(model_type: str, cfg):
             if key in enc_sd:
                 cfg.encoder.hidden_dim = enc_sd[key].shape[0]
                 break
-        if "cond_proj.0.weight" in chk.get("ddpm", {}):
-            cfg.conditioning.cond_proj_dim = chk["ddpm"]["cond_proj.0.weight"].shape[0]
         ctx = DiffAEContext.build(cfg, for_training=True, verbose=False)
 
     ctx.load_checkpoint(ckpt_path, load_optim=False)

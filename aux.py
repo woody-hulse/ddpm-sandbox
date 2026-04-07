@@ -1014,7 +1014,6 @@ def plot_results(results: Dict[str, AuxTrainingResult], output_dir: str):
 def _get_diffae_recon_batch(
     encoder: nn.Module,
     decoder: nn.Module,
-    latent_proj: nn.Module,
     schedule: dict,
     data_stats: DiffAEDataStats,
     A_sparse: torch.Tensor,
@@ -1025,6 +1024,7 @@ def _get_diffae_recon_batch(
     n_channels: int,
     n_time: int,
     parametrization: str = 'v',
+    latent_proj: Optional[nn.Module] = None,  # kept for backward compat, ignored
 ) -> np.ndarray:
     """Run DiffAE encode + decode for one batch; return (B, C, T) numpy."""
     B = wf.shape[0]
@@ -1035,7 +1035,6 @@ def _get_diffae_recon_batch(
     samples = sample_diffae(
         encoder=encoder,
         decoder=decoder,
-        latent_proj=latent_proj,
         schedule=schedule,
         A_sparse=A_sparse,
         pos=pos,
@@ -1061,7 +1060,6 @@ def plot_reconstruction_overlays(
     ae: Optional[nn.Module] = None,
     diffae_encoder: Optional[nn.Module] = None,
     diffae_decoder: Optional[nn.Module] = None,
-    diffae_latent_proj: Optional[nn.Module] = None,
     diffae_schedule: Optional[dict] = None,
     diffae_data_stats: Optional[DiffAEDataStats] = None,
     A_sparse: Optional[torch.Tensor] = None,
@@ -1073,7 +1071,7 @@ def plot_reconstruction_overlays(
     os.makedirs(output_dir, exist_ok=True)
     has_ae = ae is not None and A_sparse is not None and pos is not None
     has_diffae = all([
-        diffae_encoder, diffae_decoder, diffae_latent_proj,
+        diffae_encoder, diffae_decoder,
         diffae_schedule, diffae_data_stats, A_sparse is not None, pos is not None,
     ])
     if not has_ae and not has_diffae:
@@ -1101,7 +1099,7 @@ def plot_reconstruction_overlays(
                 diffae_encoder.eval()
                 diffae_decoder.eval()
                 diffae_recon_np = _get_diffae_recon_batch(
-                    diffae_encoder, diffae_decoder, diffae_latent_proj,
+                    diffae_encoder, diffae_decoder,
                     diffae_schedule, diffae_data_stats, A_sparse, pos,
                     diffae_time_dim, wf, device, n_channels, n_time, parametrization,
                 )

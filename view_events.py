@@ -36,7 +36,6 @@ def load_events(cfg: Config, indices: np.ndarray) -> np.ndarray:
 
 
 def load_ae(cfg: Config):
-    cfg.conditioning.cond_proj_dim = max(cfg.conditioning.cond_proj_dim, cfg.encoder.latent_dim)
     ctx = AEContext.build(cfg, for_training=True, verbose=False)
     ckpt = ctx.latest_checkpoint()
     if ckpt is None:
@@ -51,7 +50,6 @@ def load_ae(cfg: Config):
 
 
 def load_diffae(cfg: Config):
-    cfg.conditioning.cond_proj_dim = max(cfg.conditioning.cond_proj_dim, cfg.encoder.latent_dim)
     ctx = DiffAEContext.build(cfg, for_training=True, verbose=False)
     ckpt = ctx.latest_checkpoint()
     if ckpt is None:
@@ -59,12 +57,10 @@ def load_diffae(cfg: Config):
     ctx.load_checkpoint(ckpt, load_optim=False)
     enc = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
     dec = ctx.ema_decoder if ctx.ema_decoder is not None else ctx.decoder
-    lp = ctx.ema_latent_proj if ctx.ema_latent_proj is not None else ctx.latent_proj
     enc.eval()
     dec.eval()
-    lp.eval()
     print(f"DiffAE loaded from {ckpt}")
-    return ctx, enc, dec, lp
+    return ctx, enc, dec
 
 
 @torch.no_grad()
@@ -78,12 +74,12 @@ def reconstruct_with_ae(ctx, enc, dec, wf_raw: np.ndarray) -> np.ndarray:
 
 
 @torch.no_grad()
-def reconstruct_with_diffae(ctx, enc, dec, lp, cfg, wf_raw: np.ndarray) -> np.ndarray:
+def reconstruct_with_diffae(ctx, enc, dec, cfg, wf_raw: np.ndarray) -> np.ndarray:
     """Reconstruct raw waveforms with DiffAE. Input/output: (B, N, 1) unnormalized."""
     wf_norm = ctx.data_stats.normalize(wf_raw)
     x = torch.from_numpy(wf_norm.astype(np.float32)).to(ctx.device)
     rec = sample_diffae(
-        enc, dec, lp, ctx.schedule, ctx.A_sparse, ctx.pos,
+        enc, dec, ctx.schedule, ctx.A_sparse, ctx.pos,
         cfg.conditioning.time_dim, x,
         parametrization=cfg.diffusion.parametrization,
     )
@@ -168,8 +164,8 @@ def cmd_compress(args):
 
     if model_arg in ("diffae", "both"):
         try:
-            dae_ctx, dae_enc, dae_dec, dae_lp = load_diffae(cfg)
-            dae_rec = reconstruct_with_diffae(dae_ctx, dae_enc, dae_dec, dae_lp, cfg, wf_single)
+            dae_ctx, dae_enc, dae_dec = load_diffae(cfg)
+            dae_rec = reconstruct_with_diffae(dae_ctx, dae_enc, dae_dec, cfg, wf_single)
             z_dae = wf_to_z_profile(dae_rec[0], n_channels, n_time)
             models_to_plot.append(("DiffAE", z_dae, "#ff7f0e"))
         except Exception as e:

@@ -328,11 +328,6 @@ class GraphDDPMUNet(nn.Module):
         )
         self.pos_drop = nn.Dropout(pos_dropout)
         
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
         self.node_cond_mlp = nn.Sequential(
             nn.Linear(self.node_cond_in_dim + self.pos_dim, hidden_dim),
             nn.SiLU(),
@@ -375,9 +370,6 @@ class GraphDDPMUNet(nn.Module):
                 nn.init.uniform_(m.bias, -bound, bound)
         init_linear(self.in_proj)
         for m in self.pos_mlp:
-            if isinstance(m, nn.Linear):
-                init_linear(m)
-        for m in self.cond_mlp:
             if isinstance(m, nn.Linear):
                 init_linear(m)
         for m in self.node_cond_mlp:
@@ -442,10 +434,6 @@ class GraphDDPMUNet(nn.Module):
         pos_tiled = pos.repeat(batch_size, 1)
         pos_emb = self.pos_mlp(pos_tiled.to(x0.dtype))
         h = h + self.pos_drop(pos_emb)
-
-        cond_emb = self.cond_mlp(cond)  # (B, hidden_dim)
-        cond_emb_expanded = cond_emb.repeat_interleave(N_single, dim=0)  # (B*N, hidden_dim)
-        h = h + cond_emb_expanded
 
         if node_cond_input is None:
             node_cond_input = cond

@@ -67,11 +67,10 @@ class EncoderConfig:
 @dataclass
 class ConditioningConfig:
     """Conditioning network parameters for DiffAE.
-    
+
     Controls how latent codes condition the diffusion process.
     """
     cond_in_dim: int = 5            # Raw condition input dimension
-    cond_proj_dim: int = 64         # Projected condition dimension
     time_dim: int = 64              # Sinusoidal time embedding dimension
 
 
@@ -138,8 +137,9 @@ class TrainingConfig:
     # Optimization
     epochs: int = 20_000            # Total training epochs
     batch_size: int = 4             # Batch size
-    steps_per_epoch: int = 64       # Gradient steps per epoch
     lr: float = 1e-3                # Learning rate
+    lr_schedule: str = "cosine"     # LR schedule: "constant" or "cosine"
+    warmup_epochs: int = 500        # Linear warmup epochs (0 = no warmup)
     weight_decay: float = 0         # AdamW weight decay
     ema_decay: float = 0.999        # Exponential moving average decay
     grad_clip: float = 5.0          # Gradient clipping norm

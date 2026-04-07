@@ -99,31 +99,36 @@ def _infer_graphae_cfg(ckpt_path: str) -> Tuple[int, int]:
     return latent_dim, hidden_dim
 
 
-def _infer_diffae_cfg(ckpt_path: str) -> Tuple[str, str, int, int]:
+def _infer_diffae_cfg(ckpt_path: str) -> Tuple[str, str, int]:
     """
-    Return (encoder_type, decoder_type, latent_dim, cond_proj_dim) from a DiffAE checkpoint.
-
-    latent_proj layout:
-        0.weight shape [cond_proj_dim*2, latent_dim]
-        2.weight shape [cond_proj_dim,   cond_proj_dim*2]
+    Return (encoder_type, decoder_type, latent_dim) from a DiffAE checkpoint.
+    latent_dim is inferred from the encoder's to_latent layer or first encoder weight.
     """
     chk = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-    # latent_proj → latent_dim and cond_proj_dim
-    lp = chk.get("ema_latent_proj") or chk["latent_proj"]
-    w0 = lp["0.weight"]
-    latent_dim    = int(w0.shape[1])
-    cond_proj_dim = int(w0.shape[0]) // 2
-
-    # encoder type
+    # encoder type and latent_dim
     enc = chk.get("ema_encoder") or chk["encoder"]
     encoder_type = _enc_type_from_keys(list(enc.keys()))
+
+    # Infer latent_dim from encoder weights
+    latent_dim = None
+    for key in ("to_latent.weight", "to_mu.weight"):
+        if key in enc:
+            latent_dim = int(enc[key].shape[0])
+            break
+    if latent_dim is None:
+        # Fall back: look for old latent_proj in checkpoint
+        lp = chk.get("ema_latent_proj") or chk.get("latent_proj")
+        if lp and "0.weight" in lp:
+            latent_dim = int(lp["0.weight"].shape[1])
+    if latent_dim is None:
+        raise ValueError(f"Could not infer latent_dim from checkpoint {ckpt_path}")
 
     # decoder type
     dec = chk.get("ema_decoder") or chk["decoder"]
     decoder_type = _dec_type_from_keys(list(dec.keys()))
 
-    return encoder_type, decoder_type, latent_dim, cond_proj_dim
+    return encoder_type, decoder_type, latent_dim
 
 
 # -------------------------------------------------------------------------
@@ -270,20 +275,17 @@ def main():
         print(f"DiffAE : no checkpoint in {diffae_dir} — skipping")
     else:
         try:
-            enc_type, dec_type, latent_dim, cond_proj_dim = _infer_diffae_cfg(diffae_ckpt)
+            enc_type, dec_type, latent_dim = _infer_diffae_cfg(diffae_ckpt)
             diffae_cfg = get_config(encoder_type=enc_type, decoder_type=dec_type, latent_dim=latent_dim)
-            diffae_cfg.encoder.hidden_dim       = max(diffae_cfg.encoder.hidden_dim, latent_dim)
-            diffae_cfg.conditioning.cond_proj_dim = cond_proj_dim
-            print(f"DiffAE : {diffae_ckpt}  (enc={enc_type}, dec={dec_type}, z={latent_dim}, cond={cond_proj_dim})")
+            diffae_cfg.encoder.hidden_dim = max(diffae_cfg.encoder.hidden_dim, latent_dim)
+            print(f"DiffAE : {diffae_ckpt}  (enc={enc_type}, dec={dec_type}, z={latent_dim})")
 
             diffae_ctx = DiffAEContext.build(diffae_cfg, for_training=False, verbose=False, use_ms_data=True)
             diffae_ctx.load_checkpoint(diffae_ckpt, load_optim=False)
-            diffae_ctx.encoder     = diffae_ctx.ema_encoder     if diffae_ctx.ema_encoder     is not None else diffae_ctx.encoder
-            diffae_ctx.decoder     = diffae_ctx.ema_decoder     if diffae_ctx.ema_decoder     is not None else diffae_ctx.decoder
-            diffae_ctx.latent_proj = diffae_ctx.ema_latent_proj if diffae_ctx.ema_latent_proj is not None else diffae_ctx.latent_proj
+            diffae_ctx.encoder = diffae_ctx.ema_encoder if diffae_ctx.ema_encoder is not None else diffae_ctx.encoder
+            diffae_ctx.decoder = diffae_ctx.ema_decoder if diffae_ctx.ema_decoder is not None else diffae_ctx.decoder
             diffae_ctx.encoder.eval()
             diffae_ctx.decoder.eval()
-            diffae_ctx.latent_proj.eval()
             has_diffae = True
         except Exception as e:
             print(f"DiffAE : could not load — {e}")
@@ -332,7 +334,6 @@ def main():
             rec      = sample_diffae(
                 encoder         = diffae_ctx.encoder,
                 decoder         = diffae_ctx.decoder,
-                latent_proj     = diffae_ctx.latent_proj,
                 schedule        = diffae_ctx.schedule,
                 A_sparse        = diffae_ctx.A_sparse,
                 pos             = diffae_ctx.pos,

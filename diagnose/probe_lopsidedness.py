@@ -31,8 +31,7 @@ def load_diffae_model(cfg):
     if ckpt_path is None:
         raise FileNotFoundError("No DiffAE checkpoint found")
     chk = torch.load(ckpt_path, map_location=ctx.device, weights_only=False)
-    for key, target in [("ema_encoder", ctx.encoder), ("ema_decoder", ctx.decoder),
-                        ("ema_latent_proj", ctx.latent_proj)]:
+    for key, target in [("ema_encoder", ctx.encoder), ("ema_decoder", ctx.decoder)]:
         if key in chk:
             target.load_state_dict(chk[key], strict=False)
         else:
@@ -43,7 +42,6 @@ def load_diffae_model(cfg):
     epoch = int(chk.get("epoch", 0))
     ctx.encoder.eval()
     ctx.decoder.eval()
-    ctx.latent_proj.eval()
     print(f"Loaded epoch {epoch} from {ckpt_path}")
     return ctx
 
@@ -209,14 +207,13 @@ def finetune_diffae(ctx, cfg, epochs: int, steps_per_epoch: int, batch_size: int
     print("=" * 60)
 
     optimizer = torch.optim.AdamW(
-        list(ctx.encoder.parameters()) + list(ctx.decoder.parameters()) + list(ctx.latent_proj.parameters()),
+        list(ctx.encoder.parameters()) + list(ctx.decoder.parameters()),
         lr=lr, betas=(0.9, 0.999), weight_decay=cfg.training.weight_decay
     )
 
     schedule = ctx.schedule
     ctx.encoder.train()
     ctx.decoder.train()
-    ctx.latent_proj.train()
     for ep in range(epochs):
         loss_acc = 0.0
         kl_acc = 0.0
@@ -231,12 +228,11 @@ def finetune_diffae(ctx, cfg, epochs: int, steps_per_epoch: int, batch_size: int
             B, N, C = x0.shape
 
             z, mu, logvar = ctx.encoder(x0.view(B * N, C), ctx.A_sparse, ctx.pos, batch_size=B)
-            cond_base = ctx.latent_proj(z)
 
             t_min = int(getattr(cfg.diffusion, 't_min_frac', 0.0) * cfg.diffusion.timesteps)
             t = torch.randint(t_min, cfg.diffusion.timesteps, (B,), device=ctx.device, dtype=torch.long)
             t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-            cond_full = torch.cat([cond_base, t_emb], dim=-1)
+            cond_full = torch.cat([z, t_emb], dim=-1)
 
             sqrt_ab = schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
             sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
@@ -265,7 +261,7 @@ def finetune_diffae(ctx, cfg, epochs: int, steps_per_epoch: int, batch_size: int
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(ctx.encoder.parameters()) + list(ctx.decoder.parameters()) + list(ctx.latent_proj.parameters()),
+                list(ctx.encoder.parameters()) + list(ctx.decoder.parameters()),
                 max_norm=cfg.training.grad_clip
             )
             optimizer.step()
@@ -278,7 +274,6 @@ def finetune_diffae(ctx, cfg, epochs: int, steps_per_epoch: int, batch_size: int
 
     ctx.encoder.eval()
     ctx.decoder.eval()
-    ctx.latent_proj.eval()
 
 
 @torch.no_grad()
@@ -300,7 +295,6 @@ def save_autoencoding_plots(diffae_ctx, ae_ctx, cfg, out_dir: str, n_events: int
     rec_diffae = sample_diffae(
         encoder=diffae_ctx.encoder,
         decoder=diffae_ctx.decoder,
-        latent_proj=diffae_ctx.latent_proj,
         schedule=diffae_ctx.schedule,
         A_sparse=diffae_ctx.A_sparse,
         pos=diffae_ctx.pos,
@@ -420,10 +414,7 @@ def test_conditioning_sensitivity(ctx, cfg, batch_np):
     x0_flat = x0.view(B * N, C)
 
     z, _, _ = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
-    cond_base = ctx.latent_proj(z)
-
     z_random = torch.randn_like(z)
-    cond_random = ctx.latent_proj(z_random)
 
     t_vals = [0, 10, 25, 50, 100, 150, 200, 249]
     print(f"  {'t':>5s}  {'pred_diff':>12s}  {'pred_mag':>12s}  {'ratio':>10s}")
@@ -438,8 +429,8 @@ def test_conditioning_sensitivity(ctx, cfg, batch_np):
         x_t = sqrt_ab * x0 + sqrt_om * noise
         x_t_flat = x_t.view(B * N, C)
 
-        cond_real = torch.cat([cond_base, t_emb], dim=-1)
-        cond_rand = torch.cat([cond_random, t_emb], dim=-1)
+        cond_real = torch.cat([z, t_emb], dim=-1)
+        cond_rand = torch.cat([z_random, t_emb], dim=-1)
 
         pred_real = ctx.decoder(x_t_flat, ctx.A_sparse, cond_real, ctx.pos, batch_size=B)
         pred_rand = ctx.decoder(x_t_flat, ctx.A_sparse, cond_rand, ctx.pos, batch_size=B)
@@ -474,12 +465,11 @@ def test_per_node_variance(ctx, cfg, batch_np, labels):
     x0_flat = x0.view(B * N, C)
 
     z, _, _ = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
-    cond_base = ctx.latent_proj(z)
 
     for t_val in [10, 50, 100]:
         t_tensor = torch.full((B,), t_val, device=device, dtype=torch.long)
         t_emb = sinusoidal_embedding(t_tensor, cfg.conditioning.time_dim)
-        cond_full = torch.cat([cond_base, t_emb], dim=-1)
+        cond_full = torch.cat([z, t_emb], dim=-1)
 
         preds = []
         for _ in range(5):
@@ -533,7 +523,6 @@ def test_mse_decomposition(ctx, cfg, batch_np, labels):
     x0_flat = x0.view(B * N, C)
 
     z, _, _ = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
-    cond_base = ctx.latent_proj(z)
 
     left_mask = torch.tensor(labels[:32] == 0, dtype=torch.bool)
 
@@ -542,7 +531,7 @@ def test_mse_decomposition(ctx, cfg, batch_np, labels):
     for t_val in [5, 10, 25, 50, 100, 200, 249]:
         t_tensor = torch.full((B,), t_val, device=device, dtype=torch.long)
         t_emb = sinusoidal_embedding(t_tensor, cfg.conditioning.time_dim)
-        cond_full = torch.cat([cond_base, t_emb], dim=-1)
+        cond_full = torch.cat([z, t_emb], dim=-1)
 
         sqrt_ab = schedule['sqrt_alphas_cumprod'][t_val]
         sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t_val]

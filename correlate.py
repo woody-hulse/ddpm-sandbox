@@ -24,15 +24,16 @@ sns.set_palette("husl")
 
 def load_checkpoint(cfg: Config, device: torch.device) -> Tuple[nn.Module, nn.Module, dict]:
     """Load trained DDPM model from checkpoint."""
+    _cond_proj_dim = 64  # local physics conditioning projection dimension
     cond_proj = nn.Sequential(
         nn.Linear(cfg.conditioning.cond_in_dim, 64),
         nn.SiLU(),
-        nn.Linear(64, cfg.conditioning.cond_proj_dim)
+        nn.Linear(64, _cond_proj_dim)
     ).to(device)
 
     core = GraphDDPMUNet(
         in_dim=cfg.model.in_dim,
-        cond_dim=cfg.conditioning.cond_proj_dim + cfg.conditioning.time_dim,
+        cond_dim=_cond_proj_dim + cfg.conditioning.time_dim,
         hidden_dim=cfg.model.hidden_dim,
         depth=cfg.model.depth,
         blocks_per_stage=cfg.model.blocks_per_stage,

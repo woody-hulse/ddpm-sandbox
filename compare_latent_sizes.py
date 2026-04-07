@@ -101,7 +101,7 @@ def train_ae_early_stop(
         ctx.encoder.train()
         ctx.decoder.train()
         epoch_loss = 0.0
-        n_steps = cfg.training.steps_per_epoch
+        n_steps = ctx.loader.n_samples // cfg.training.batch_size
 
         pbar = tqdm(
             range(n_steps),
@@ -229,14 +229,13 @@ def train_diffae_early_stop(
     while epoch < max_epoch:
         ctx.encoder.train()
         ctx.decoder.train()
-        ctx.latent_proj.train()
         if use_regressive and ctx.regressive_decoder is not None:
             ctx.regressive_decoder.train()
 
         epoch_loss = 0.0
         epoch_reg = 0.0
         epoch_kl = 0.0
-        n_steps = cfg.training.steps_per_epoch
+        n_steps = ctx.loader.n_samples // cfg.training.batch_size
 
         pbar = tqdm(
             range(n_steps),
@@ -254,11 +253,10 @@ def train_diffae_early_stop(
             x0_flat = x0.view(B * ctx.n_nodes, 1)
 
             z, mu, logvar = ctx.encoder(x0_flat, ctx.A_sparse, ctx.pos, batch_size=B)
-            cond_base = ctx.latent_proj(z)
 
             t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=ctx.device, dtype=torch.long)
             t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-            cond_full = torch.cat([cond_base, t_emb], dim=-1)
+            cond_full = torch.cat([z, t_emb], dim=-1)
 
             sqrt_ab = schedule["sqrt_alphas_cumprod"][t].view(B, 1, 1)
             sqrt_om = schedule["sqrt_one_minus_alphas_cumprod"][t].view(B, 1, 1)
@@ -305,7 +303,6 @@ def train_diffae_early_stop(
             clip_params = (
                 list(ctx.encoder.parameters())
                 + list(ctx.decoder.parameters())
-                + list(ctx.latent_proj.parameters())
             )
             if use_regressive and ctx.regressive_decoder is not None:
                 clip_params += list(ctx.regressive_decoder.parameters())
@@ -316,8 +313,6 @@ def train_diffae_early_stop(
                 for p_ema, p in zip(ctx.ema_encoder.parameters(), ctx.encoder.parameters()):
                     p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
                 for p_ema, p in zip(ctx.ema_decoder.parameters(), ctx.decoder.parameters()):
-                    p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
-                for p_ema, p in zip(ctx.ema_latent_proj.parameters(), ctx.latent_proj.parameters()):
                     p_ema.data.mul_(cfg.training.ema_decay).add_(p.data, alpha=1.0 - cfg.training.ema_decay)
                 if use_regressive and ctx.ema_regressive_decoder is not None:
                     for p_ema, p in zip(ctx.ema_regressive_decoder.parameters(), ctx.regressive_decoder.parameters()):
@@ -562,12 +557,11 @@ def generate_z_profiles(
                 ctx.load_checkpoint(dae_ckpt, load_optim=False)
                 enc = ctx.ema_encoder if ctx.ema_encoder is not None else ctx.encoder
                 dec = ctx.ema_decoder if ctx.ema_decoder is not None else ctx.decoder
-                lp = ctx.ema_latent_proj if ctx.ema_latent_proj is not None else ctx.latent_proj
-                enc.eval(); dec.eval(); lp.eval()
+                enc.eval(); dec.eval()
                 wf_norm = ctx.data_stats.normalize(batch_np)
                 x_ref = torch.from_numpy(wf_norm.astype(np.float32)).to(ctx.device)
                 rec = sample_diffae(
-                    enc, dec, lp, ctx.schedule, ctx.A_sparse, ctx.pos,
+                    enc, dec, ctx.schedule, ctx.A_sparse, ctx.pos,
                     cfg.conditioning.time_dim, x_ref,
                     parametrization=cfg.diffusion.parametrization,
                 )
