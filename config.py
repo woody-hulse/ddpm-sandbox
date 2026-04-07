@@ -143,6 +143,7 @@ class TrainingConfig:
     weight_decay: float = 0         # AdamW weight decay
     ema_decay: float = 0.999        # Exponential moving average decay
     grad_clip: float = 5.0          # Gradient clipping norm
+    use_amp: bool = True            # Mixed precision (bfloat16) — halves activation memory
 
     # AE-specific regularization (applies in train_ae)
     ae_denoising: bool = False      # Optional denoising mode (corrupt input, reconstruct clean)

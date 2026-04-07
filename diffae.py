@@ -785,60 +785,62 @@ def train_diffae(cfg: Config = default_config):
             x0 = torch.from_numpy(batch_np.astype(np.float32)).to(device_t)  # (B, N, 1)
             x0_flat = x0.view(B * n_nodes, 1)
 
-            z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B)
+            amp_dtype = torch.bfloat16 if cfg.training.use_amp and device_t.type == 'cuda' else torch.float32
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=cfg.training.use_amp and device_t.type == 'cuda'):
+                z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B)
 
-            if step == 0 and epoch % 50 == 0:
-                with torch.no_grad():
-                    z_std = z.std().item()
-                    z_sim = 0.0
-                    if B > 1:
-                        z_norm = z / (z.norm(dim=1, keepdim=True) + 1e-8)
-                        z_sim = (z_norm @ z_norm.T).fill_diagonal_(0).abs().mean().item()
-                    print(f"\n  [Monitor] Latent z: std={z_std:.4f}, within-batch similarity={z_sim:.4f}")
-                    if z_sim > 0.95:
-                        print(f"  [WARNING] Latent similarity is very high - encoder may be collapsing!")
+                if step == 0 and epoch % 50 == 0:
+                    with torch.no_grad():
+                        z_std = z.float().std().item()
+                        z_sim = 0.0
+                        if B > 1:
+                            z_norm = z.float() / (z.float().norm(dim=1, keepdim=True) + 1e-8)
+                            z_sim = (z_norm @ z_norm.T).fill_diagonal_(0).abs().mean().item()
+                        print(f"\n  [Monitor] Latent z: std={z_std:.4f}, within-batch similarity={z_sim:.4f}")
+                        if z_sim > 0.95:
+                            print(f"  [WARNING] Latent similarity is very high - encoder may be collapsing!")
 
-            t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=device_t, dtype=torch.long)
-            t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
-            cond_full = torch.cat([z, t_emb], dim=-1)
+                t = torch.randint(0, cfg.diffusion.timesteps, (B,), device=device_t, dtype=torch.long)
+                t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
+                cond_full = torch.cat([z, t_emb], dim=-1)
 
-            sqrt_ab = schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
-            sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
-            snr_t = schedule['snr'][t].view(B)
+                sqrt_ab = schedule['sqrt_alphas_cumprod'][t].view(B, 1, 1)
+                sqrt_om = schedule['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
+                snr_t = schedule['snr'][t].view(B)
 
-            noise = torch.randn_like(x0)
-            x_t = sqrt_ab * x0 + sqrt_om * noise
-            x_t_flat = x_t.view(B * n_nodes, 1)
+                noise = torch.randn_like(x0)
+                x_t = sqrt_ab * x0 + sqrt_om * noise
+                x_t_flat = x_t.view(B * n_nodes, 1)
 
-            pred_flat = decoder(x_t_flat, A_sparse, cond_full, pos, batch_size=B)
-            pred = pred_flat.view(B, n_nodes, 1)
+                pred_flat = decoder(x_t_flat, A_sparse, cond_full, pos, batch_size=B)
+                pred = pred_flat.view(B, n_nodes, 1)
 
-            if cfg.diffusion.parametrization == "eps":
-                target = noise
-            elif cfg.diffusion.parametrization == "v":
-                target = sqrt_ab * noise - sqrt_om * x0
-            else:
-                raise ValueError("parametrization must be 'eps' or 'v'")
+                if cfg.diffusion.parametrization == "eps":
+                    target = noise
+                elif cfg.diffusion.parametrization == "v":
+                    target = sqrt_ab * noise - sqrt_om * x0
+                else:
+                    raise ValueError("parametrization must be 'eps' or 'v'")
 
-            mse_per_sample = F.mse_loss(pred, target, reduction='none').mean(dim=(1, 2))
+                mse_per_sample = F.mse_loss(pred, target, reduction='none').mean(dim=(1, 2))
 
-            if cfg.diffusion.p2_gamma > 0.0:
-                weight = torch.pow(cfg.diffusion.p2_k + snr_t, -cfg.diffusion.p2_gamma)
-                mse_per_sample = mse_per_sample * weight
+                if cfg.diffusion.p2_gamma > 0.0:
+                    weight = torch.pow(cfg.diffusion.p2_k + snr_t, -cfg.diffusion.p2_gamma)
+                    mse_per_sample = mse_per_sample * weight
 
-            loss = mse_per_sample.mean()
+                loss = mse_per_sample.mean()
 
-            if use_regressive:
-                reg_flat = regressive_decoder(z, A_sparse, pos, batch_size=B)
-                reg_pred = reg_flat.view(B, n_nodes, 1)
-                reg_loss = F.mse_loss(reg_pred, x0, reduction='mean')
-                loss = loss + cfg.encoder.regressive_head_weight * reg_loss
-                epoch_reg_loss += reg_loss.item()
+                if use_regressive:
+                    reg_flat = regressive_decoder(z, A_sparse, pos, batch_size=B)
+                    reg_pred = reg_flat.view(B, n_nodes, 1)
+                    reg_loss = F.mse_loss(reg_pred, x0, reduction='mean')
+                    loss = loss + cfg.encoder.regressive_head_weight * reg_loss
+                    epoch_reg_loss += reg_loss.item()
 
-            if cfg.encoder.use_stochastic and mu is not None and logvar is not None:
-                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = loss + cfg.encoder.kl_weight * kl_loss
-                epoch_kl += kl_loss.item()
+                if cfg.encoder.use_stochastic and mu is not None and logvar is not None:
+                    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                    loss = loss + cfg.encoder.kl_weight * kl_loss
+                    epoch_kl += kl_loss.item()
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"  WARNING: NaN/Inf loss at step {step}! Skipping...")
