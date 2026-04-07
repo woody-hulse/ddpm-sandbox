@@ -296,26 +296,7 @@ class DiffAEContext:
         return int(chk.get("epoch", 0))
 
     def find_best_checkpoint(self) -> Optional[str]:
-        """Find the best available checkpoint, preferring same latent_dim but falling back to others."""
-        same_latent = self.latest_checkpoint()
-        if same_latent is not None:
-            return same_latent
-
-        parent_dir = os.path.dirname(self.checkpoint_dir)
-        if not os.path.isdir(parent_dir):
-            return None
-
-        all_ckpts = []
-        for subdir in os.listdir(parent_dir):
-            if subdir.startswith("diffae_z"):
-                subdir_path = os.path.join(parent_dir, subdir)
-                ckpt_files = sorted(glob.glob(os.path.join(subdir_path, "diffae_epoch_*.pt")))
-                if ckpt_files:
-                    all_ckpts.append(ckpt_files[-1])
-
-        if all_ckpts:
-            return max(all_ckpts, key=os.path.getmtime)
-        return None
+        return self.latest_checkpoint()
 
     def load_checkpoint_partial(self, path: str, verbose: bool = True) -> Tuple[int, bool]:
         """
