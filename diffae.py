@@ -882,8 +882,9 @@ def train_diffae(cfg: Config = default_config):
 
         if cfg.training.encode_dataset_every > 0 and (epoch + 1) % cfg.training.encode_dataset_every == 0:
             ema_encoder.eval()
-            save_encoded_dataset(ctx, encoded_output_path, encoder=ema_encoder, batch_size=B * 4, n_samples=cfg.training.encode_n_samples)
+            save_encoded_dataset(ctx, encoded_output_path, encoder=ema_encoder, batch_size=B, n_samples=cfg.training.encode_n_samples)
             encoder.train()
+            torch.cuda.empty_cache()
 
         if cfg.visualize and (epoch % cfg.training.visualize_every == 0 or epoch == cfg.training.epochs - 1):
             ema_encoder.eval()
@@ -970,6 +971,10 @@ def train_diffae(cfg: Config = default_config):
                 fig.tight_layout()
                 fig.savefig(f"{plots_dir}/event_{idx}_cross_sections.png")
                 plt.close(fig)
+
+            encoder.train()
+            decoder.train()
+            torch.cuda.empty_cache()
 
 
 def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
