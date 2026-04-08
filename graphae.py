@@ -14,6 +14,8 @@ import glob
 import math
 import os
 import sys
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -24,6 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from matplotlib import pyplot as plt
 from tqdm import tqdm
+
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 
 from ae import DiffAEDataStats, apply_lopsided_augmentation
 from config import Config, default_config, get_config, print_config
@@ -566,14 +570,16 @@ class GraphAEEncoder(nn.Module):
 
         pool_indices: List[Tuple[torch.Tensor, int, int]] = []
         for d in range(self.depth):
-            h_cur = self.stages[d](h_cur, adj_cur)
+            # Checkpoint each stage: recomputes activations during backward instead
+            # of storing ~6 GB of (B*N, H) intermediates per block.
+            h_cur = grad_ckpt(self.stages[d], h_cur, adj_cur, use_reentrant=False)
             total_before = batch_size * nodes_per_graph
             npg_before = nodes_per_graph
             h_cur, keep_idx, nodes_per_graph = self.pools[d](h_cur, adj_cur, nodes_per_graph)
             adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel()).to(dtype=h_cur.dtype)
             pool_indices.append((keep_idx, total_before, npg_before))
 
-        h_cur = self.final_stage(h_cur, adj_cur)
+        h_cur = grad_ckpt(self.final_stage, h_cur, adj_cur, use_reentrant=False)
 
         h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
         h_mean = h_graph.mean(dim=1)

@@ -132,10 +132,9 @@ class SAGPool(nn.Module):
         assert 0.0 < ratio <= 1.0
         self.ratio = ratio
         self.norm = nn.LayerNorm(hidden_dim)
-        self.edge_proj = nn.Linear(3, hidden_dim)
-        self.score_linear = nn.Linear(hidden_dim * 3, 1)
-        nn.init.xavier_uniform_(self.edge_proj.weight, gain=1.0)
-        nn.init.zeros_(self.edge_proj.bias)
+        # Scoring uses a single sparse.mm (sum aggregation) — memory-efficient;
+        # full multi-agg is reserved for the GNN message-passing blocks.
+        self.score_linear = nn.Linear(hidden_dim, 1)
         nn.init.xavier_uniform_(self.score_linear.weight, gain=0.5)
         nn.init.zeros_(self.score_linear.bias)
 
@@ -161,15 +160,12 @@ class SAGPool(nn.Module):
         batch_size = total_nodes // nodes_per_graph
         k_per_graph = max(1, int(math.ceil(self.ratio * nodes_per_graph)))
 
-        # Multi-aggregator scoring with chunked edge features
+        # Sum-aggregation scoring — single sparse.mm, no (E,H) materialization
         h = self.norm(x)
-        agg = sparse_multi_agg(
-            adj, h,
-            edge_weight=self.edge_proj.weight,
-            edge_bias=self.edge_proj.bias,
-            pos_cur=pos_cur,
-        )                                                  # (B*N, 3H)
-        s = self.score_linear(agg).squeeze(-1)            # (B*N,)
+        adj_f = adj.float() if adj.dtype != torch.float32 else adj
+        with torch.amp.autocast('cuda', enabled=False):
+            agg = torch.sparse.mm(adj_f, h.float()).to(h.dtype)  # (B*N, H)
+        s = self.score_linear(agg).squeeze(-1)             # (B*N,)
 
         # Top-k selection per graph
         s_view = s.view(batch_size, nodes_per_graph)
