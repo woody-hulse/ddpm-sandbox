@@ -545,13 +545,13 @@ class GraphAEEncoder(nn.Module):
         adj: torch.Tensor,
         pos: torch.Tensor,
         batch_size: int = 1
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int, torch.Tensor]]]:
         """
         Encode input events to latent representations.
 
         Returns:
             z: Latent representation (B, latent_dim)
-            pool_indices: List of (keep_idx, total_before, nodes_per_graph_before) for decoder
+            pool_indices: List of (keep_idx, total_before, npg_before, adj_after) for decoder
         """
         N_single = adj.size(0)
         total_nodes = x.size(0)
@@ -568,7 +568,7 @@ class GraphAEEncoder(nn.Module):
         h_cur = h
         nodes_per_graph = N_single
 
-        pool_indices: List[Tuple[torch.Tensor, int, int]] = []
+        pool_indices: List[Tuple[torch.Tensor, int, int, torch.Tensor]] = []
         for d in range(self.depth):
             # Checkpoint each stage: recomputes activations during backward instead
             # of storing ~6 GB of (B*N, H) intermediates per block.
@@ -577,7 +577,7 @@ class GraphAEEncoder(nn.Module):
             npg_before = nodes_per_graph
             h_cur, keep_idx, nodes_per_graph = self.pools[d](h_cur, adj_cur, nodes_per_graph)
             adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel()).to(dtype=h_cur.dtype)
-            pool_indices.append((keep_idx, total_before, npg_before))
+            pool_indices.append((keep_idx, total_before, npg_before, adj_cur))
 
         h_cur = grad_ckpt(self.final_stage, h_cur, adj_cur, use_reentrant=False)
 
@@ -834,28 +834,35 @@ class GraphTransposeDecoder(nn.Module):
         z: torch.Tensor,
         adj: torch.Tensor,
         pos: torch.Tensor,
-        pool_indices: List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]],
+        pool_indices: List[Tuple[torch.Tensor, int, int, torch.Tensor]],
         batch_size: int = 1,
     ) -> torch.Tensor:
+        # pool_indices[d] = (keep_idx, total_before, npg_before, adj_after)
+        #   keep_idx:    (B*k,) global indices of kept nodes at level d
+        #   total_before: B*N nodes before pooling at level d
+        #   npg_before:  N nodes per graph before pooling at level d
+        #   adj_after:   block-diagonal adj AFTER pooling at level d (= adj at level d+1)
         B = batch_size
         if len(pool_indices) != self.depth:
             raise ValueError(f"Expected {self.depth} pool levels, got {len(pool_indices)}")
 
         # Broadcast latent to coarsest nodes
-        _, K_coarsest, _, adj_single_coarsest = pool_indices[-1]
+        keep_idx_last, _, _, adj_coarsest = pool_indices[-1]
+        k_coarsest = keep_idx_last.numel() // B
         h = self.latent_proj(z)  # (B, hidden_dim)
-        h = h.unsqueeze(1).expand(-1, K_coarsest, -1).reshape(B * K_coarsest, self.hidden_dim)
-        adj_cur = self._get_block_adj(adj_single_coarsest, B).to(device=z.device, dtype=z.dtype)
+        h = h.unsqueeze(1).expand(-1, k_coarsest, -1).reshape(B * k_coarsest, self.hidden_dim)
+        adj_cur = adj_coarsest.to(device=z.device, dtype=z.dtype)
         h = self.bottleneck(h, self._transpose_adj(adj_cur))
 
         for d in reversed(range(self.depth)):
-            assign, K_coarse, adj_single_fine, _ = pool_indices[d]
-            # Prolongation: gather coarse features to fine nodes
-            assign_exp = assign.unsqueeze(0).expand(B, -1)  # (B, N_fine)
-            offsets = torch.arange(B, device=z.device).unsqueeze(1) * K_coarse
-            global_assign = (assign_exp + offsets).reshape(-1)  # (B*N_fine,)
-            h = h[global_assign]  # (B*N_fine, hidden_dim)
-            adj_cur = self._get_block_adj(adj_single_fine, B).to(device=z.device, dtype=z.dtype)
+            keep_idx, total_before, _, _ = pool_indices[d]
+            # Prolongation: scatter coarse features back to fine-level positions
+            h = _unpool_like(h, keep_idx, total_before)
+            # Adjacency at fine level d: adj_after from level d-1, or original block adj
+            if d > 0:
+                adj_cur = pool_indices[d - 1][3].to(device=z.device, dtype=z.dtype)
+            else:
+                adj_cur = self._get_block_adj(adj, B).to(device=z.device, dtype=z.dtype)
             h = self.stages[d](h, self._transpose_adj(adj_cur))
 
         pos_tiled = pos.repeat(B, 1)
