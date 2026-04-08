@@ -6,6 +6,9 @@ which condition the diffusion process for reconstruction.
 """
 import os
 import sys
+
+# Prevent CUDA OOM from memory fragmentation. Must be set before any CUDA init.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import glob
 import math
 from dataclasses import dataclass
@@ -750,6 +753,13 @@ def train_diffae(cfg: Config = default_config):
         decoder.train()
         if use_regressive:
             regressive_decoder.train()
+
+        if device_t.type == 'cuda':
+            torch.cuda.synchronize()
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"  [Mem] Epoch {epoch+1} start: allocated={mem_alloc:.2f} GiB, reserved={mem_reserved:.2f} GiB")
+
         epoch_loss = 0.0
         epoch_kl = 0.0
         epoch_reg_loss = 0.0

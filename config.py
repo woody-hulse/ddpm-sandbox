@@ -191,8 +191,8 @@ class PathConfig:
     Checkpoint/plot subdirs use {latent_dim} placeholder for organization.
     """
     # Input data
-    tritium_h5: str = "data/tritium_ss_42.h5"
-    channel_positions: str = "data/pmt_xy_42.h5"
+    tritium_h5: str = "data/tritium_ss.h5"
+    channel_positions: str = "data/pmt_xy.h5"
     
     # Output directories
     checkpoint_dir: str = "checkpoints"

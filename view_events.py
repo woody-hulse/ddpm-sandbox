@@ -23,6 +23,7 @@ from config import Config, default_config, get_config
 from ae import AEContext, reconstruct_ae
 from diffae import DiffAEContext, sample_diffae, apply_lopsided_augmentation
 from compare_rqs import wf_to_z_profile
+from lz_data_loader import TritiumSSDataLoader
 
 
 def load_events(cfg: Config, indices: np.ndarray) -> np.ndarray:
@@ -132,6 +133,59 @@ def cmd_view(args):
     print(f"Saved {out}")
 
 
+def cmd_view_ss(args):
+    cfg = default_config
+    np.random.seed(args.seed)
+    loader = TritiumSSDataLoader(cfg.paths.tritium_h5, cfg.paths.channel_positions)
+    idx = np.random.randint(0, loader.n_samples, size=args.n)
+    uniq_idx, inverse = np.unique(idx, return_inverse=True)
+    import h5py
+    with h5py.File(cfg.paths.tritium_h5, 'r') as f:
+        wf = f['waveforms'][uniq_idx][inverse]   # (n, n_channels, n_time)
+        xc = f['xc'][uniq_idx][inverse].astype(np.float32)
+        yc = f['yc'][uniq_idx][inverse].astype(np.float32)
+        dt = f['dt'][uniq_idx][inverse].astype(np.float32)
+    pmt_pos = loader.channel_positions           # (n_channels, 2)
+    n_time = loader.n_time_points
+
+    fig, axes = plt.subplots(args.n, 2, figsize=(12, 3.5 * args.n), squeeze=False)
+
+    for i in range(args.n):
+        ax_xy, ax_t = axes[i]
+
+        charge = wf[i].sum(axis=1)              # (n_channels,)
+        sc = ax_xy.scatter(
+            pmt_pos[:, 0], pmt_pos[:, 1],
+            c=charge, cmap="viridis", s=80, edgecolors="k", linewidths=0.3,
+        )
+        ax_xy.scatter([xc[i]], [yc[i]], marker="x", color="red", s=80,
+                      linewidths=1.5, label=f"({xc[i]:.1f}, {yc[i]:.1f}) cm")
+        ax_xy.set_title(f"Event {i+1}  PMT hit map", fontsize=9)
+        ax_xy.set_xlabel("x (cm)")
+        ax_xy.set_ylabel("y (cm)")
+        ax_xy.set_aspect("equal")
+        ax_xy.legend(fontsize=7)
+        plt.colorbar(sc, ax=ax_xy, label="Charge (AU)")
+
+        summed = wf[i].sum(axis=0)              # (n_time,)
+        t_axis = np.arange(n_time)
+        ax_t.plot(t_axis, summed, linewidth=0.8, color="steelblue")
+        ax_t.axvline(dt[i], color="red", linestyle="--", linewidth=0.8,
+                     label=f"dt={dt[i]:.0f} bins")
+        ax_t.set_title(f"Event {i+1}  summed waveform", fontsize=9)
+        ax_t.set_xlabel("Time bin")
+        ax_t.set_ylabel("Amplitude (AU)")
+        ax_t.legend(fontsize=7)
+
+    fig.suptitle(f"Tritium SS events  (seed={args.seed})", fontweight="bold")
+    fig.tight_layout()
+    out = os.path.join(args.output_dir, f"view_ss_events_seed{args.seed}.png")
+    os.makedirs(args.output_dir, exist_ok=True)
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
 def cmd_compress(args):
     cfg = get_config(latent_dim=args.latent_dim)
     np.random.seed(args.seed)
@@ -213,6 +267,7 @@ def cmd_compress(args):
 def main():
     parser = argparse.ArgumentParser(description="View or compress/reconstruct events")
     parser.add_argument("--view", action="store_true", help="Plot random MS events")
+    parser.add_argument("--ss", action="store_true", help="Plot SS events from the tritium dataset (PMT hit map + summed waveform)")
     parser.add_argument("--compress", type=int, default=None, metavar="IDX",
                         help="Compress and reconstruct event at this index")
     parser.add_argument("--model", type=str, default="both", choices=["ae", "diffae", "both"],
@@ -231,11 +286,14 @@ def main():
     if args.latent_dim is None:
         args.latent_dim = default_config.encoder.latent_dim
 
-    if not args.view and args.compress is None:
-        parser.error("Specify --view or --compress IDX")
+    if not args.view and not args.ss and args.compress is None:
+        parser.error("Specify --view, --ss, or --compress IDX")
 
     if args.view:
         cmd_view(args)
+
+    if args.ss:
+        cmd_view_ss(args)
 
     if args.compress is not None:
         cmd_compress(args)
