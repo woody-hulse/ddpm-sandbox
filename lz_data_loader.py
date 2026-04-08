@@ -185,14 +185,49 @@ def _layer_radial_adjacency(xy: np.ndarray, r_within: float) -> np.ndarray:
     A = np.maximum(A, A.T)
     return A
 
+
+def _compute_edge_weights(
+    rows: np.ndarray, cols: np.ndarray,
+    pos_xyz: np.ndarray,
+    sigma_xy: float, sigma_z: float,
+) -> np.ndarray:
+    """Gaussian distance weights for edges: exp(-d_xy²/(2σ_xy²) - d_z²/(2σ_z²))."""
+    diff = pos_xyz[rows] - pos_xyz[cols]           # (E, 3)
+    d_xy2 = diff[:, 0] ** 2 + diff[:, 1] ** 2
+    d_z2  = diff[:, 2] ** 2
+    w = np.exp(-d_xy2 / (2 * sigma_xy ** 2) - d_z2 / (2 * sigma_z ** 2))
+    return w.astype(np.float32)
+
+
+def compute_spatial_laplacian_pe(xy: np.ndarray, radius: float, k: int = 16) -> np.ndarray:
+    """
+    Compute k non-trivial eigenvectors of the normalized spatial graph Laplacian.
+
+    Returns (L, k) array to be tiled across time bins.
+    The spatial graph is tiny (L ≈ 250 nodes), so dense eigh is fine.
+    """
+    L = xy.shape[0]
+    k = min(k, L - 2)  # can't exceed L-1 non-trivial eigenvectors
+
+    A = _layer_radial_adjacency(xy, radius)        # (L, L) binary, no self-loops
+    degree = A.sum(axis=1)                          # (L,)
+    d_inv_sqrt = np.where(degree > 0, 1.0 / np.sqrt(degree), 0.0)
+    # Normalized Laplacian: L_sym = I - D^{-1/2} A D^{-1/2}
+    L_sym = np.eye(L) - (d_inv_sqrt[:, None] * A * d_inv_sqrt[None, :])
+    eigenvalues, eigenvectors = np.linalg.eigh(L_sym)
+    # Skip first eigenvector (constant, λ≈0), take next k
+    lpe = eigenvectors[:, 1:k + 1].astype(np.float32)
+    return lpe
+
 def create_3d_adjacency_matrix_sparse_(
     channel_positions: np.ndarray,
     num_layers: int,
     r_within: float,
     positions_xy_profile: np.ndarray,
     z_hops: int = 2,
-    self_loops : bool = True,
-    z_spacing: float = 10.0
+    self_loops: bool = True,
+    z_spacing: float = 10.0,
+    weighted: bool = False,
 ) -> SparseGraph:
     num_layer_nodes = len(channel_positions)
     L, T, N = num_layer_nodes, num_layers, num_layer_nodes * num_layers
@@ -239,6 +274,10 @@ def create_3d_adjacency_matrix_sparse_(
         rows_list.append(diag)
         cols_list.append(diag)
 
+    # Positions in (N,3): tile xy per layer, pair with z
+    xy_tiled = np.tile(xy_profile.astype(np.float32, copy=False), (T, 1))
+    pos_xyz = np.concatenate([xy_tiled, positions_z.reshape(-1, 1)], axis=1).astype(np.float32, copy=False)
+
     if len(rows_list) == 0:
         idx_t = torch.empty((2, 0), dtype=torch.long)
         val_t = torch.empty((0,), dtype=torch.float32)
@@ -246,16 +285,17 @@ def create_3d_adjacency_matrix_sparse_(
         rows_all = np.concatenate(rows_list)
         cols_all = np.concatenate(cols_list)
         idx = np.vstack([rows_all, cols_all])
-        val = np.ones(idx.shape[1], dtype=np.float32)
+        if weighted:
+            sigma_xy = r_within / 2.0
+            sigma_z  = max(z_hops * z_spacing / 2.0, 1e-6)
+            val = _compute_edge_weights(rows_all, cols_all, pos_xyz, sigma_xy, sigma_z)
+        else:
+            val = np.ones(idx.shape[1], dtype=np.float32)
         idx_t = torch.from_numpy(idx)
         val_t = torch.from_numpy(val)
     A_sparse = torch.sparse_coo_tensor(idx_t, val_t, (N, N)).coalesce()
 
-    # Positions in (N,3): tile xy per layer, pair with z
-    xy_tiled = np.tile(xy_profile.astype(np.float32, copy=False), (T, 1))
-    pos_xyz = np.concatenate([xy_tiled, positions_z.reshape(-1, 1)], axis=1).astype(np.float32, copy=False)
     pos_xyz_t = torch.from_numpy(pos_xyz)
-
     return SparseGraph(adjacency=A_sparse, positions_xyz=pos_xyz_t)
 
 
@@ -585,8 +625,11 @@ class TritiumSSDataLoader:
             z = (z / max(T - 1, 1)) * 2.0 - 1.0
         return np.concatenate([xy, z], axis=1)
 
-    def load_adjacency_sparse(self, z_sep: float = 10.0, radius: float = 20.0, weighted: bool = False, z_hops: int = 4) -> torch.Tensor:
-        return create_3d_adjacency_matrix_sparse_(
+    def load_adjacency_sparse(
+        self, z_sep: float = 10.0, radius: float = 20.0,
+        weighted: bool = False, z_hops: int = 4, lpe_dim: int = 0,
+    ):
+        graph = create_3d_adjacency_matrix_sparse_(
             self.channel_positions,
             num_layers=self.n_time_points,
             r_within=radius,
@@ -594,8 +637,13 @@ class TritiumSSDataLoader:
             z_hops=z_hops,
             self_loops=True,
             z_spacing=z_sep,
+            weighted=weighted,
         )
-        # return create_3d_adjacency_matrix_sparse(self.channel_positions, num_layers=self.n_time_points, z_sep=z_sep, radius=radius, weighted=weighted).coalesce()
+        if lpe_dim > 0:
+            lpe_spatial = compute_spatial_laplacian_pe(self.channel_positions, radius, k=lpe_dim)
+            lpe_tiled   = np.tile(lpe_spatial, (self.n_time_points, 1))  # (N, lpe_dim)
+            graph.lpe   = torch.from_numpy(lpe_tiled)
+        return graph
 
     def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         idx = np.random.randint(0, self.n_samples, size=batch_size, dtype=np.int64)
@@ -671,8 +719,13 @@ class OnlineMSBatcher:
         self.n_time_points = self.ss_loader.n_time_points
         self.channel_positions = self.ss_loader.channel_positions
 
-    def load_adjacency_sparse(self, z_sep: float = 10.0, radius: float = 20.0, weighted: bool = False, z_hops: int = 4):
-        return self.ss_loader.load_adjacency_sparse(z_sep=z_sep, radius=radius, weighted=weighted, z_hops=z_hops)
+    def load_adjacency_sparse(
+        self, z_sep: float = 10.0, radius: float = 20.0,
+        weighted: bool = False, z_hops: int = 4, lpe_dim: int = 0,
+    ):
+        return self.ss_loader.load_adjacency_sparse(
+            z_sep=z_sep, radius=radius, weighted=weighted, z_hops=z_hops, lpe_dim=lpe_dim,
+        )
 
     def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Get a batch of MS events generated on-the-fly.

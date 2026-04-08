@@ -96,10 +96,13 @@ class DiffAEContext:
         graph = loader.load_adjacency_sparse(
             z_sep=cfg.graph.z_sep,
             radius=cfg.graph.radius,
-            z_hops=cfg.graph.z_hops
+            z_hops=cfg.graph.z_hops,
+            weighted=cfg.graph.weighted_edges,
+            lpe_dim=cfg.graph.lpe_dim,
         )
         A_sparse = graph.adjacency.to(device)
-        pos = graph.positions_xyz.to(device)
+        pos     = graph.positions_xyz.to(device)
+        lpe     = graph.lpe.to(device) if graph.lpe is not None else None
         n_channels = loader.n_channels
         n_time_points = loader.n_time_points
         n_nodes = n_channels * n_time_points
@@ -144,6 +147,7 @@ class DiffAEContext:
                 dropout=cfg.encoder.dropout,
                 pos_dim=cfg.model.pos_dim,
                 use_stochastic=cfg.encoder.use_stochastic,
+                lpe_dim=cfg.graph.lpe_dim,
             ).to(device)
 
         decoder = GraphDDPMUNet(
@@ -778,7 +782,7 @@ def train_diffae(cfg: Config = default_config):
 
             amp_dtype = torch.bfloat16 if cfg.training.use_amp and device_t.type == 'cuda' else torch.float32
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=cfg.training.use_amp and device_t.type == 'cuda'):
-                z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B)
+                z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B, lpe=lpe)
 
                 if step == 0 and epoch % 50 == 0:
                     with torch.no_grad():

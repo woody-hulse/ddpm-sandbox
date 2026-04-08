@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.sparse_ops import to_coalesced_coo, subgraph_coo, to_binary
+from utils.sparse_ops import sparse_multi_agg, to_coalesced_coo, subgraph_coo, to_binary
 
 
 class SparseGraphConv(nn.Module):
@@ -50,19 +50,24 @@ class GraphResBlock(nn.Module):
     def __init__(self, hidden_dim: int, cond_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
+        self.edge_proj = nn.Linear(3, hidden_dim)
+        self.agg_proj = nn.Linear(hidden_dim * 3, hidden_dim, bias=False)
         self.lin1 = nn.Linear(hidden_dim, hidden_dim)
         self.lin2 = nn.Linear(hidden_dim, hidden_dim)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
-        
+
         # GIN learnable epsilon for self-weight
         self.eps = nn.Parameter(torch.tensor(eps_init))
-        
+
         # Conditioning projection for scale and shift
         self.cond_proj = nn.Linear(cond_dim, hidden_dim * 2)
         self.node_cond_proj = nn.Linear(hidden_dim, hidden_dim * 2)
-        
+
         # Initialize for stable but expressive training
+        nn.init.xavier_uniform_(self.edge_proj.weight, gain=1.0)
+        nn.init.zeros_(self.edge_proj.bias)
+        nn.init.xavier_uniform_(self.agg_proj.weight, gain=1.0)
         nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
         nn.init.zeros_(self.lin1.bias)
         nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
@@ -73,14 +78,21 @@ class GraphResBlock(nn.Module):
         nn.init.zeros_(self.node_cond_proj.bias)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor,
-                node_cond: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+                node_cond: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor,
+                pos_cur: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Normalize input for stability
         h = self.norm(x)
-        
-        # GIN-style message passing: (1 + eps) * self + sum(neighbors)
-        with torch.amp.autocast('cuda', enabled=False):
-            neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
-        h = (1 + self.eps) * h + neighbor_sum
+
+        # Compute per-edge direction embeddings if positions provided
+        edge_emb = None
+        if pos_cur is not None:
+            idx = adj.coalesce().indices()
+            delta = (pos_cur[idx[1]] - pos_cur[idx[0]]).to(h.dtype)
+            edge_emb = self.edge_proj(delta)
+
+        # Multi-aggregator message passing: mean, max, std → project to hidden_dim
+        agg = self.agg_proj(sparse_multi_agg(adj, h, edge_emb))   # (N, 3H) → (N, H)
+        h = (1 + self.eps) * h + agg
         
         # Conditioning with bounded scale
         cond_out = self.cond_proj(cond)
@@ -106,36 +118,76 @@ class GraphResBlock(nn.Module):
         return x + h  # Full residual
 
 
-class TopKPool(nn.Module):
+class SAGPool(nn.Module):
+    """
+    Self-Attention Graph Pooling.
+
+    Scores each node using one GNN aggregation step (neighborhood-aware),
+    selects the top-k scoring nodes, and gates their features by sigmoid(score).
+    Operates on a batched block-diagonal adjacency — fully GPU-native.
+
+    Strictly more expressive than TopK because the score for each node
+    incorporates its neighbors' features rather than its own features alone.
+    """
     def __init__(self, hidden_dim: int, ratio: float = 0.5):
         super().__init__()
         assert 0.0 < ratio <= 1.0
         self.ratio = ratio
         self.norm = nn.LayerNorm(hidden_dim)
-        self.scorer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-        nn.init.constant_(self.scorer[-1].bias, 1.0)
-        nn.init.xavier_uniform_(self.scorer[-1].weight)
+        self.edge_proj = nn.Linear(3, hidden_dim)
+        self.score_linear = nn.Linear(hidden_dim * 3, 1)
+        nn.init.xavier_uniform_(self.edge_proj.weight, gain=1.0)
+        nn.init.zeros_(self.edge_proj.bias)
+        nn.init.xavier_uniform_(self.score_linear.weight, gain=0.5)
+        nn.init.zeros_(self.score_linear.bias)
 
-    def forward(self, x: torch.Tensor, nodes_per_graph: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        nodes_per_graph: int,
+        pos_cur: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Args:
+            x:               (B*N, hidden_dim) node features
+            adj:             (B*N, B*N) block-diagonal sparse adjacency
+            nodes_per_graph: N nodes per graph before pooling
+            pos_cur:         (B*N, 3) optional node positions for edge features
+        Returns:
+            x_pool:      (B*k, hidden_dim) pooled + score-gated features
+            keep_idx:    (B*k,) global indices of retained nodes
+            k_per_graph: k
+        """
         total_nodes = x.size(0)
         batch_size = total_nodes // nodes_per_graph
         k_per_graph = max(1, int(math.ceil(self.ratio * nodes_per_graph)))
-        
-        s = self.scorer(self.norm(x)).squeeze(-1)  # (total_nodes,)
-        s = s.view(batch_size, nodes_per_graph)
-        
-        topk_local = torch.topk(s, k=k_per_graph, dim=1, largest=True, sorted=True)
-        local_indices = topk_local.indices  # (B, k_per_graph)
-        
-        batch_offsets = torch.arange(batch_size, device=x.device).unsqueeze(1) * nodes_per_graph
-        global_indices = (local_indices + batch_offsets).view(-1)
-        
-        x_pool = x[global_indices]
-        return x_pool, global_indices, k_per_graph
+
+        # Multi-aggregator scoring with optional directional edge features
+        h = self.norm(x)
+        edge_emb = None
+        if pos_cur is not None:
+            idx = adj.coalesce().indices()
+            delta = (pos_cur[idx[1]] - pos_cur[idx[0]]).to(h.dtype)
+            edge_emb = self.edge_proj(delta)
+        agg = sparse_multi_agg(adj, h, edge_emb)         # (B*N, 3H)
+        s = self.score_linear(agg).squeeze(-1)            # (B*N,)
+
+        # Top-k selection per graph
+        s_view = s.view(batch_size, nodes_per_graph)
+        local_indices = torch.topk(
+            s_view, k=k_per_graph, dim=1, largest=True, sorted=True,
+        ).indices                                        # (B, k)
+        batch_offsets = (
+            torch.arange(batch_size, device=x.device).unsqueeze(1) * nodes_per_graph
+        )
+        keep_idx = (local_indices + batch_offsets).view(-1)  # (B*k,)
+
+        # Gate features by sigmoid score — high-scoring nodes pass through strongly
+        gates = torch.sigmoid(s[keep_idx]).unsqueeze(-1)     # (B*k, 1)
+        x_pool = x[keep_idx] * gates
+
+        return x_pool, keep_idx, k_per_graph
 
 
 def _unpool_like(x_small: torch.Tensor, keep_idx: torch.Tensor, N: int) -> torch.Tensor:
@@ -255,7 +307,8 @@ class GraphUNetStage(nn.Module):
     def forward(self, x: torch.Tensor, adj_hat: torch.Tensor, cond_expanded: torch.Tensor,
                 node_cond_expanded: torch.Tensor,
                 gammas: torch.Tensor, betas: torch.Tensor, gamma_offset: int,
-                batch_size: int) -> Tuple[torch.Tensor, int]:
+                batch_size: int,
+                pos_cur: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, int]:
         i = gamma_offset
         for blk in self.blocks:
             g = gammas[:, i, :]  # (B, hidden_dim)
@@ -263,7 +316,7 @@ class GraphUNetStage(nn.Module):
             nodes_per_graph = x.size(0) // batch_size
             g_expanded = g.repeat_interleave(nodes_per_graph, dim=0)  # (B*N, hidden_dim)
             bt_expanded = bt.repeat_interleave(nodes_per_graph, dim=0)
-            x = blk(x, adj_hat, cond_expanded, node_cond_expanded, g_expanded, bt_expanded)
+            x = blk(x, adj_hat, cond_expanded, node_cond_expanded, g_expanded, bt_expanded, pos_cur)
             i += 1
         return x, i
 
@@ -344,7 +397,7 @@ class GraphDDPMUNet(nn.Module):
         self.enc_stages = nn.ModuleList(
             [GraphUNetStage(hidden_dim, cond_dim=cond_dim, blocks_per_stage=blocks_per_stage, dropout=dropout) for _ in range(depth)]
         )
-        self.pools = nn.ModuleList([TopKPool(hidden_dim, ratio=pool_ratio) for _ in range(depth)])
+        self.pools = nn.ModuleList([SAGPool(hidden_dim, ratio=pool_ratio) for _ in range(depth)])
 
         self.bottleneck = GraphUNetStage(hidden_dim, cond_dim=cond_dim, blocks_per_stage=blocks_per_stage, dropout=dropout)
 
@@ -445,36 +498,40 @@ class GraphDDPMUNet(nn.Module):
 
         nodes_per_graph = N_single
 
-        skips: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]] = []
+        skips: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, torch.Tensor]] = []
         adjs: List[torch.Tensor] = []
         h_cur, adj_cur = h, adj0
+        pos_cur = pos_tiled  # (B*N, 3) — tracks positions of active nodes
 
         for d in range(self.depth):
             cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-            h_cur, g_ptr = self.enc_stages[d](h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size)
+            h_cur, g_ptr = self.enc_stages[d](h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size, pos_cur=pos_cur)
             h_skip = h_cur
             node_cond_skip = node_cond_cur
-            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, nodes_per_graph)
+            pos_skip = pos_cur  # save pre-pool positions for decoder
+            h_pool, keep_idx, k_per_graph = self.pools[d](h_cur, adj_cur, nodes_per_graph, pos_cur)
             node_cond_pool = node_cond_cur[keep_idx]
             K = h_pool.size(0)
             adj_next = to_binary(subgraph_coo(adj_cur, keep_idx, K))
-            skips.append((h_skip, node_cond_skip, keep_idx, h_cur.size(0), nodes_per_graph))
+            skips.append((h_skip, node_cond_skip, keep_idx, h_cur.size(0), nodes_per_graph, pos_skip))
             adjs.append(adj_cur)
             h_cur, node_cond_cur, adj_cur, nodes_per_graph = h_pool, node_cond_pool, adj_next, k_per_graph
+            pos_cur = pos_cur[keep_idx]  # keep positions of surviving nodes
 
         cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-        h_cur, g_ptr = self.bottleneck(h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size)
+        h_cur, g_ptr = self.bottleneck(h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size, pos_cur=pos_cur)
 
         for d in reversed(range(self.depth)):
-            h_skip, node_cond_skip, keep_idx, N_prev, npg_prev = skips[d]
+            h_skip, node_cond_skip, keep_idx, N_prev, npg_prev, pos_skip = skips[d]
             h_up = _unpool_like(h_cur, keep_idx, N_prev)
             node_cond_up = _unpool_like(node_cond_cur, keep_idx, N_prev)
             h_cur = h_up + self.skip_scale * h_skip
             node_cond_cur = node_cond_up + self.skip_scale * node_cond_skip
             adj_prev = adjs[d]
             nodes_per_graph = npg_prev
+            pos_cur = pos_skip  # restore pre-pool positions
             cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-            h_cur, g_ptr = self.dec_stages[d](h_cur, adj_prev, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size)
+            h_cur, g_ptr = self.dec_stages[d](h_cur, adj_prev, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size, pos_cur=pos_cur)
 
         h_cur = F.silu(self.out_norm(h_cur))
         y = self.out_proj(h_cur)

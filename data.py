@@ -17,8 +17,9 @@ class Graph:
 
 @dataclass
 class SparseGraph:
-    adjacency: torch.Tensor  # (N, N)
-    positions_xyz: torch.Tensor  # (N, 3)
+    adjacency: torch.Tensor       # (N, N) sparse COO
+    positions_xyz: torch.Tensor   # (N, 3)
+    lpe: Optional[torch.Tensor] = None  # (N, lpe_dim) Laplacian positional encoding
 
 
 def graph_to_sparse_graph(graph: Graph) -> SparseGraph:

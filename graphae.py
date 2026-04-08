@@ -29,8 +29,8 @@ from ae import DiffAEDataStats, apply_lopsided_augmentation
 from config import Config, default_config, get_config, print_config
 from data import Graph, SparseGraph, visualize_event, visualize_event_z
 from lz_data_loader import OnlineMSBatcher, TritiumSSDataLoader
-from models.graph_unet import GraclusPool, _unpool_like, build_block_diagonal_adj
-from utils.sparse_ops import subgraph_coo, to_binary, to_coalesced_coo
+from models.graph_unet import SAGPool, build_block_diagonal_adj, _unpool_like
+from utils.sparse_ops import sparse_multi_agg, subgraph_coo, to_binary, to_coalesced_coo
 from utils.visualization import build_xy_adjacency_radius
 
 
@@ -44,22 +44,37 @@ class GraphEncoderBlock(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.post_agg_norm = nn.LayerNorm(hidden_dim)
         ffn_dim = hidden_dim * 2
+        self.edge_proj = nn.Linear(3, hidden_dim)          # (dx,dy,dz) → H
+        self.agg_proj = nn.Linear(hidden_dim * 3, hidden_dim, bias=False)
         self.lin1 = nn.Linear(hidden_dim, ffn_dim)
         self.lin2 = nn.Linear(ffn_dim, hidden_dim)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.eps = nn.Parameter(torch.tensor(eps_init))
 
+        nn.init.xavier_uniform_(self.edge_proj.weight, gain=1.0)
+        nn.init.zeros_(self.edge_proj.bias)
+        nn.init.xavier_uniform_(self.agg_proj.weight, gain=1.0)
         nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
         nn.init.zeros_(self.lin1.bias)
         nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
         nn.init.zeros_(self.lin2.bias)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        pos_cur: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         h = self.norm(x)
-        with torch.amp.autocast('cuda', enabled=False):
-            neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
-        h = self.post_agg_norm((1 + self.eps) * h + neighbor_sum)
+        # Compute per-edge embeddings from (dx, dy, dz) if positions provided
+        edge_emb = None
+        if pos_cur is not None:
+            idx = adj.coalesce().indices()
+            delta = (pos_cur[idx[1]] - pos_cur[idx[0]]).to(h.dtype)  # (E, 3)
+            edge_emb = self.edge_proj(delta)                           # (E, H)
+        agg = self.agg_proj(sparse_multi_agg(adj, h, edge_emb))       # (N, 3H) → (N, H)
+        h = self.post_agg_norm((1 + self.eps) * h + agg)
         h = self.lin1(h)
         h = self.act(h)
         h = self.lin2(h)
@@ -75,9 +90,14 @@ class GraphEncoderStage(nn.Module):
             for _ in range(blocks_per_stage)
         ])
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        pos_cur: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         for blk in self.blocks:
-            x = blk(x, adj)
+            x = blk(x, adj, pos_cur)
         return x
 
 
@@ -99,6 +119,7 @@ class GraphEncoder(nn.Module):
         dropout: float = 0.0,
         pos_dim: int = 3,
         use_stochastic: bool = False,
+        lpe_dim: int = 0,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -107,6 +128,7 @@ class GraphEncoder(nn.Module):
         self.depth = depth
         self.pool_ratio = pool_ratio
         self.use_stochastic = use_stochastic
+        self.lpe_dim = lpe_dim
 
         self.in_proj = nn.Linear(in_dim, hidden_dim)
 
@@ -116,30 +138,38 @@ class GraphEncoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self.lpe_proj = nn.Linear(lpe_dim, hidden_dim) if lpe_dim > 0 else None
+
         self.stages = nn.ModuleList([
             GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
             for _ in range(depth)
         ])
-        self.pool = GraclusPool()
+        self.pools = nn.ModuleList([
+            SAGPool(hidden_dim, ratio=pool_ratio) for _ in range(depth)
+        ])
 
         self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
 
-        self.readout_norm = nn.LayerNorm(hidden_dim)
+        # One LayerNorm per scale level: depth pooling levels + final stage
+        self.scale_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(depth + 1)
+        ])
 
+        agg_dim = hidden_dim * 3 * (depth + 1)  # mean+std+max from each scale
         if use_stochastic:
             self.to_mu = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Linear(agg_dim, hidden_dim),
                 nn.SiLU(),
                 nn.Linear(hidden_dim, latent_dim),
             )
             self.to_logvar = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Linear(agg_dim, hidden_dim),
                 nn.SiLU(),
                 nn.Linear(hidden_dim, latent_dim),
             )
         else:
             self.to_latent = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Linear(agg_dim, hidden_dim),
                 nn.SiLU(),
                 nn.Linear(hidden_dim, latent_dim),
             )
@@ -168,8 +198,7 @@ class GraphEncoder(nn.Module):
         key = (adj.device, adj.size(), adj._nnz(), batch_size)
         if key in self._cached_block_adj:
             return self._cached_block_adj[key]
-        adj_binary = to_binary(adj)
-        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        block_adj = build_block_diagonal_adj(adj, batch_size)
         self._cached_block_adj[key] = block_adj
         return block_adj
 
@@ -178,7 +207,8 @@ class GraphEncoder(nn.Module):
         x: torch.Tensor,
         adj: torch.Tensor,
         pos: torch.Tensor,
-        batch_size: int = 1
+        batch_size: int = 1,
+        lpe: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Encode input events to latent representations.
@@ -205,25 +235,29 @@ class GraphEncoder(nn.Module):
         pos_normalized = (pos_tiled - pos_tiled.mean(dim=0, keepdim=True)) / (pos_tiled.std(dim=0, keepdim=True) + 1e-8)
         pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
         h = h + pos_emb
+        if lpe is not None and self.lpe_proj is not None:
+            h = h + self.lpe_proj(lpe.repeat(batch_size, 1).to(x.dtype))
 
-        adj_single = adj
         h_cur, adj_cur = h, adj0
+        pos_cur = pos_tiled  # track active-node positions through pooling
         nodes_per_graph = N_single
+        scale_readouts: List[torch.Tensor] = []
 
         for d in range(self.depth):
-            h_cur = self.stages[d](h_cur, adj_cur)
-            h_cur, _assign, adj_single_coarse, K = self.pool(h_cur, adj_single, batch_size)
-            adj_single = adj_single_coarse
-            adj_cur = self._get_block_adj(adj_single, batch_size).to(device=h_cur.device, dtype=h_cur.dtype)
-            nodes_per_graph = K
+            h_cur = self.stages[d](h_cur, adj_cur, pos_cur)
+            h_cur, keep_idx, nodes_per_graph = self.pools[d](h_cur, adj_cur, nodes_per_graph, pos_cur)
+            adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel()).to(dtype=h_cur.dtype)
+            pos_cur = pos_cur[keep_idx]  # keep positions for surviving nodes
+            # Readout at this scale: mean, std, max over nodes
+            h_n = self.scale_norms[d](h_cur).view(batch_size, nodes_per_graph, self.hidden_dim)
+            scale_readouts.append(torch.cat([h_n.mean(1), h_n.std(1) + 1e-6, h_n.max(1).values], dim=-1))
 
-        h_cur = self.final_stage(h_cur, adj_cur)
-        h_cur = self.readout_norm(h_cur)
+        h_cur = self.final_stage(h_cur, adj_cur, pos_cur)
+        # Readout at final (coarsest) scale
+        h_n = self.scale_norms[self.depth](h_cur).view(batch_size, nodes_per_graph, self.hidden_dim)
+        scale_readouts.append(torch.cat([h_n.mean(1), h_n.std(1) + 1e-6, h_n.max(1).values], dim=-1))
 
-        h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
-        h_mean = h_graph.mean(dim=1)
-        h_std = h_graph.std(dim=1) + 1e-6
-        h_agg = torch.cat([h_mean, h_std], dim=-1)  # (B, hidden_dim * 2)
+        h_agg = torch.cat(scale_readouts, dim=-1)  # (B, hidden_dim * 2 * (depth + 1))
 
         if self.use_stochastic:
             mu = self.to_mu(h_agg)
@@ -246,12 +280,14 @@ class GraphDecoderBlock(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.0, eps_init: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
+        self.agg_proj = nn.Linear(hidden_dim * 3, hidden_dim, bias=False)
         self.lin1 = nn.Linear(hidden_dim, hidden_dim)
         self.lin2 = nn.Linear(hidden_dim, hidden_dim)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.eps = nn.Parameter(torch.tensor(eps_init))
 
+        nn.init.xavier_uniform_(self.agg_proj.weight, gain=1.0)
         nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
         nn.init.zeros_(self.lin1.bias)
         nn.init.xavier_uniform_(self.lin2.weight, gain=0.5)
@@ -259,9 +295,8 @@ class GraphDecoderBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        with torch.amp.autocast('cuda', enabled=False):
-            neighbor_sum = torch.sparse.mm(adj.float(), h.float()).to(h.dtype)
-        h = (1 + self.eps) * h + neighbor_sum
+        agg = self.agg_proj(sparse_multi_agg(adj, h))   # (N, 3H) → (N, H)
+        h = (1 + self.eps) * h + agg
         h = self.lin1(h)
         h = self.act(h)
         h = self.lin2(h)
@@ -471,7 +506,9 @@ class GraphAEEncoder(nn.Module):
             GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
             for _ in range(depth)
         ])
-        self.pool = GraclusPool()
+        self.pools = nn.ModuleList([
+            SAGPool(hidden_dim, ratio=pool_ratio) for _ in range(depth)
+        ])
 
         self.final_stage = GraphEncoderStage(hidden_dim, blocks_per_stage, dropout)
 
@@ -495,8 +532,7 @@ class GraphAEEncoder(nn.Module):
         key = (adj.device, adj.size(), adj._nnz(), batch_size)
         if key in self._cached_block_adj:
             return self._cached_block_adj[key]
-        adj_binary = to_binary(adj)
-        block_adj = build_block_diagonal_adj(adj_binary, batch_size)
+        block_adj = build_block_diagonal_adj(adj, batch_size)
         self._cached_block_adj[key] = block_adj
         return block_adj
 
@@ -506,19 +542,19 @@ class GraphAEEncoder(nn.Module):
         adj: torch.Tensor,
         pos: torch.Tensor,
         batch_size: int = 1
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, int, int]]]:
         """
         Encode input events to latent representations.
 
         Returns:
             z: Latent representation (B, latent_dim)
-            pool_indices: List of (assign, K, adj_single_fine, adj_single_coarse) for decoder
+            pool_indices: List of (keep_idx, total_before, nodes_per_graph_before) for decoder
         """
         N_single = adj.size(0)
         total_nodes = x.size(0)
         assert total_nodes == batch_size * N_single
 
-        adj0 = self._get_block_adj(adj, batch_size).to(device=x.device, dtype=x.dtype)
+        adj_cur = self._get_block_adj(adj, batch_size).to(device=x.device, dtype=x.dtype)
 
         h = self.in_proj(x)
         pos_tiled = pos.repeat(batch_size, 1)
@@ -526,19 +562,17 @@ class GraphAEEncoder(nn.Module):
         pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
         h = h + pos_emb
 
-        adj_single = adj
-        h_cur, adj_cur = h, adj0
+        h_cur = h
         nodes_per_graph = N_single
 
-        pool_indices: List[Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]] = []
+        pool_indices: List[Tuple[torch.Tensor, int, int]] = []
         for d in range(self.depth):
             h_cur = self.stages[d](h_cur, adj_cur)
-            adj_single_fine = adj_single
-            h_cur, assign, adj_single_coarse, K = self.pool(h_cur, adj_single, batch_size)
-            pool_indices.append((assign, K, adj_single_fine, adj_single_coarse))
-            adj_single = adj_single_coarse
-            adj_cur = self._get_block_adj(adj_single, batch_size).to(device=h_cur.device, dtype=h_cur.dtype)
-            nodes_per_graph = K
+            total_before = batch_size * nodes_per_graph
+            npg_before = nodes_per_graph
+            h_cur, keep_idx, nodes_per_graph = self.pools[d](h_cur, adj_cur, nodes_per_graph)
+            adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel()).to(dtype=h_cur.dtype)
+            pool_indices.append((keep_idx, total_before, npg_before))
 
         h_cur = self.final_stage(h_cur, adj_cur)
 
@@ -1159,6 +1193,7 @@ def train_graphae(cfg: Config = default_config):
     pos = ctx.pos
     n_nodes = ctx.n_nodes
     B = cfg.training.batch_size
+    steps_per_epoch = tr.n_samples // B
 
     start_epoch = 0
     if cfg.resume:
@@ -1178,7 +1213,7 @@ def train_graphae(cfg: Config = default_config):
         epoch_loss = 0.0
         epoch_z_std = 0.0
         pbar = tqdm(
-            range(cfg.training.steps_per_epoch),
+            range(steps_per_epoch),
             desc=f"Epoch {epoch+1}/{cfg.training.epochs}",
             ncols=120,
             file=sys.stdout,

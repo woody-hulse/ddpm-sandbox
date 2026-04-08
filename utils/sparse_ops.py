@@ -1,6 +1,63 @@
 import torch
 
 
+def sparse_multi_agg(
+    adj: torch.Tensor,
+    h: torch.Tensor,
+    edge_emb: "torch.Tensor | None" = None,
+) -> torch.Tensor:
+    """
+    Compute mean, max, and std neighborhood aggregations over a sparse adjacency.
+
+    Optionally adds per-edge embeddings to source messages before aggregation,
+    allowing directional / distance information to modulate each message.
+
+    Runs in float32 internally for numerical stability, returns in h.dtype.
+
+    Args:
+        adj:      (N, N) sparse COO adjacency (block-diagonal for batched graphs)
+        h:        (N, H) node features
+        edge_emb: (E, H) optional per-edge embeddings added to source messages
+    Returns:
+        (N, 3*H) concatenation of [mean_agg, max_agg, std_agg]
+    """
+    adj = adj.coalesce()
+    rows = adj.indices()[0]   # target nodes (aggregate INTO row i FROM col j)
+    cols = adj.indices()[1]   # source nodes
+    N, H = h.size()
+    dtype = h.dtype
+    h_f = h.float() if h.dtype != torch.float32 else h
+
+    # Degree per target node
+    deg = torch.zeros(N, 1, device=h.device, dtype=torch.float32)
+    deg.scatter_add_(0, rows.unsqueeze(1), torch.ones(rows.size(0), 1, device=h.device))
+    deg.clamp_(min=1.0)
+
+    row_idx = rows.unsqueeze(1).expand(-1, H)   # (E, H)
+    h_src = h_f[cols]                            # (E, H) source features
+
+    # Add per-edge embeddings to source messages if provided
+    if edge_emb is not None:
+        h_src = h_src + (edge_emb.float() if edge_emb.dtype != torch.float32 else edge_emb)
+
+    # Mean: sum / degree
+    sum_agg = torch.zeros(N, H, device=h.device, dtype=torch.float32)
+    sum_agg.scatter_add_(0, row_idx, h_src)
+    mean_agg = sum_agg / deg
+
+    # Max: amax over neighbors; isolated nodes default to 0
+    max_agg = torch.full((N, H), float('-inf'), device=h.device, dtype=torch.float32)
+    max_agg.scatter_reduce_(0, row_idx, h_src, reduce='amax', include_self=True)
+    max_agg = torch.where(max_agg.isinf(), torch.zeros_like(max_agg), max_agg)
+
+    # Std: sqrt(E[x²] - E[x]²)
+    sq_agg = torch.zeros(N, H, device=h.device, dtype=torch.float32)
+    sq_agg.scatter_add_(0, row_idx, h_src ** 2)
+    std_agg = ((sq_agg / deg) - mean_agg ** 2).clamp_(min=0).sqrt_()
+
+    return torch.cat([mean_agg, max_agg, std_agg], dim=-1).to(dtype)
+
+
 def to_coalesced_coo(adj: torch.Tensor) -> torch.Tensor:
     if adj.layout == torch.sparse_csr:
         adj = adj.to_sparse_coo()

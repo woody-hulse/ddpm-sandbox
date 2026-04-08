@@ -96,12 +96,14 @@ class DiffusionConfig:
 @dataclass 
 class GraphConfig:
     """Graph construction parameters for 3D spatio-temporal graphs.
-    
+
     Defines how nodes (channel × time) are connected.
     """
     radius: float = 16.0            # Spatial radius for within-layer adjacency (cm)
     z_sep: float = 20.0             # Z-spacing between time layers
     z_hops: int = 4                 # Cross-layer connectivity distance
+    weighted_edges: bool = True     # Gaussian distance-weighted edges (vs binary)
+    lpe_dim: int = 16               # Laplacian positional encoding dimension (0 = disabled)
 
 
 # =============================================================================
