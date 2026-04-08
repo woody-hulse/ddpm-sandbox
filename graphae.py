@@ -48,7 +48,8 @@ class GraphEncoderBlock(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.post_agg_norm = nn.LayerNorm(hidden_dim)
         ffn_dim = hidden_dim * 2
-        self.edge_proj = nn.Linear(3, hidden_dim)          # (dx,dy,dz) → H
+        # Encoder uses no-edge aggregation (sparse.mm path, O(N) memory).
+        # Edge features are reserved for the diffusion decoder.
         self.agg_proj = nn.Linear(hidden_dim * 3, hidden_dim, bias=False)
         self.lin1 = nn.Linear(hidden_dim, ffn_dim)
         self.lin2 = nn.Linear(ffn_dim, hidden_dim)
@@ -56,8 +57,6 @@ class GraphEncoderBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.eps = nn.Parameter(torch.tensor(eps_init))
 
-        nn.init.xavier_uniform_(self.edge_proj.weight, gain=1.0)
-        nn.init.zeros_(self.edge_proj.bias)
         nn.init.xavier_uniform_(self.agg_proj.weight, gain=1.0)
         nn.init.xavier_uniform_(self.lin1.weight, gain=1.0)
         nn.init.zeros_(self.lin1.bias)
@@ -71,12 +70,10 @@ class GraphEncoderBlock(nn.Module):
         pos_cur: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         h = self.norm(x)
-        agg = self.agg_proj(sparse_multi_agg(
-            adj, h,
-            edge_weight=self.edge_proj.weight,
-            edge_bias=self.edge_proj.bias,
-            pos_cur=pos_cur,
-        ))                                                             # (N, 3H) → (N, H)
+        # No edge features in encoder — sparse.mm path avoids all O(E×H) tensors.
+        # Directional edges are used in the diffusion decoder where spatial
+        # reconstruction matters; here mean/max/std aggregation is sufficient.
+        agg = self.agg_proj(sparse_multi_agg(adj, h))                 # (N, 3H) → (N, H)
         h = self.post_agg_norm((1 + self.eps) * h + agg)
         h = self.lin1(h)
         h = self.act(h)

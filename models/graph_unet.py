@@ -4,8 +4,14 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 
 from utils.sparse_ops import sparse_multi_agg, to_coalesced_coo, subgraph_coo, to_binary
+
+
+def _unet_stage_fn(stage, g_ptr, batch_size, h, adj, cond_exp, node_cond, gammas, betas, pos_cur):
+    """Thin wrapper for grad_ckpt: captures non-tensor args by value, passes tensors as args."""
+    return stage(h, adj, cond_exp, node_cond, gammas, betas, g_ptr, batch_size, pos_cur=pos_cur)
 
 
 class SparseGraphConv(nn.Module):
@@ -499,7 +505,11 @@ class GraphDDPMUNet(nn.Module):
 
         for d in range(self.depth):
             cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-            h_cur, g_ptr = self.enc_stages[d](h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size, pos_cur=pos_cur)
+            h_cur, g_ptr = grad_ckpt(
+                _unet_stage_fn, self.enc_stages[d], g_ptr, batch_size,
+                h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, pos_cur,
+                use_reentrant=False,
+            )
             h_skip = h_cur
             node_cond_skip = node_cond_cur
             pos_skip = pos_cur  # save pre-pool positions for decoder
@@ -513,7 +523,11 @@ class GraphDDPMUNet(nn.Module):
             pos_cur = pos_cur[keep_idx]  # keep positions of surviving nodes
 
         cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-        h_cur, g_ptr = self.bottleneck(h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size, pos_cur=pos_cur)
+        h_cur, g_ptr = grad_ckpt(
+            _unet_stage_fn, self.bottleneck, g_ptr, batch_size,
+            h_cur, adj_cur, cond_exp_cur, node_cond_cur, gammas, betas, pos_cur,
+            use_reentrant=False,
+        )
 
         for d in reversed(range(self.depth)):
             h_skip, node_cond_skip, keep_idx, N_prev, npg_prev, pos_skip = skips[d]
@@ -525,7 +539,11 @@ class GraphDDPMUNet(nn.Module):
             nodes_per_graph = npg_prev
             pos_cur = pos_skip  # restore pre-pool positions
             cond_exp_cur = cond.repeat_interleave(nodes_per_graph, dim=0)
-            h_cur, g_ptr = self.dec_stages[d](h_cur, adj_prev, cond_exp_cur, node_cond_cur, gammas, betas, g_ptr, batch_size, pos_cur=pos_cur)
+            h_cur, g_ptr = grad_ckpt(
+                _unet_stage_fn, self.dec_stages[d], g_ptr, batch_size,
+                h_cur, adj_prev, cond_exp_cur, node_cond_cur, gammas, betas, pos_cur,
+                use_reentrant=False,
+            )
 
         h_cur = F.silu(self.out_norm(h_cur))
         y = self.out_proj(h_cur)
