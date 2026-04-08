@@ -104,6 +104,7 @@ class DiffAEContext:
         A_sparse = graph.adjacency.to(device)
         pos     = graph.positions_xyz.to(device)
         lpe     = graph.lpe.to(device) if graph.lpe is not None else None
+        actual_lpe_dim = int(lpe.size(1)) if lpe is not None else 0
         n_channels = loader.n_channels
         n_time_points = loader.n_time_points
         n_nodes = n_channels * n_time_points
@@ -148,7 +149,7 @@ class DiffAEContext:
                 dropout=cfg.encoder.dropout,
                 pos_dim=cfg.model.pos_dim,
                 use_stochastic=cfg.encoder.use_stochastic,
-                lpe_dim=cfg.graph.lpe_dim,
+                lpe_dim=actual_lpe_dim,
             ).to(device)
 
         decoder = GraphDDPMUNet(

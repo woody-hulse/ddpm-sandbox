@@ -237,7 +237,17 @@ class GraphEncoder(nn.Module):
         pos_emb = self.pos_mlp(pos_normalized.to(x.dtype))
         h = h + pos_emb
         if lpe is not None and self.lpe_proj is not None:
-            h = h + self.lpe_proj(lpe.repeat(batch_size, 1).to(x.dtype))
+            if lpe.dim() != 2:
+                raise ValueError(f"`lpe` must be rank-2, got shape {tuple(lpe.shape)}")
+            if lpe.size(1) == 0:
+                pass
+            elif lpe.size(1) != self.lpe_proj.in_features:
+                raise ValueError(
+                    f"LPE feature mismatch: graph provides {lpe.size(1)} dims but encoder expects "
+                    f"{self.lpe_proj.in_features}"
+                )
+            else:
+                h = h + self.lpe_proj(lpe.repeat(batch_size, 1).to(x.dtype))
 
         h_cur, adj_cur = h, adj0
         pos_cur = pos_tiled  # track active-node positions through pooling
@@ -251,12 +261,12 @@ class GraphEncoder(nn.Module):
             pos_cur = pos_cur[keep_idx]  # keep positions for surviving nodes
             # Readout at this scale: mean, std, max over nodes
             h_n = self.scale_norms[d](h_cur).view(batch_size, nodes_per_graph, self.hidden_dim)
-            scale_readouts.append(torch.cat([h_n.mean(1), h_n.std(1) + 1e-6, h_n.max(1).values], dim=-1))
+            scale_readouts.append(torch.cat([h_n.mean(1), h_n.std(1, correction=0) + 1e-6, h_n.max(1).values], dim=-1))
 
         h_cur = self.final_stage(h_cur, adj_cur, pos_cur)
         # Readout at final (coarsest) scale
         h_n = self.scale_norms[self.depth](h_cur).view(batch_size, nodes_per_graph, self.hidden_dim)
-        scale_readouts.append(torch.cat([h_n.mean(1), h_n.std(1) + 1e-6, h_n.max(1).values], dim=-1))
+        scale_readouts.append(torch.cat([h_n.mean(1), h_n.std(1, correction=0) + 1e-6, h_n.max(1).values], dim=-1))
 
         h_agg = torch.cat(scale_readouts, dim=-1)  # (B, hidden_dim * 2 * (depth + 1))
 
@@ -582,7 +592,7 @@ class GraphAEEncoder(nn.Module):
 
         h_graph = h_cur.view(batch_size, nodes_per_graph, self.hidden_dim)
         h_mean = h_graph.mean(dim=1)
-        h_std = h_graph.std(dim=1) + 1e-6
+        h_std = h_graph.std(dim=1, correction=0) + 1e-6
         h_agg = torch.cat([h_mean, h_std], dim=-1)
         z = self.to_latent(h_agg)
         return z, pool_indices

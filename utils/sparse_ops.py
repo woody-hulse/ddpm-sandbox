@@ -6,6 +6,7 @@ import torch
 # At E=11.7M edges: each chunk uses E * _CHUNK_H * 4 bytes for h_chunk
 # and E * _CHUNK_H * 8 bytes for the index → ~750 MB total at chunk=8.
 _CHUNK_H = 8
+_STD_EPS = 1e-6
 
 
 def _autocast_disabled(device_type: str):
@@ -70,15 +71,20 @@ def sparse_multi_agg(
             mean_agg = sum_agg / deg
 
             sq_agg = torch.sparse.mm(adj_f, h_f ** 2)        # (N, H)  h²: (N,H), not (E,H)
-            std_agg = ((sq_agg / deg) - mean_agg ** 2).clamp_(min=0).sqrt_()
+            var_agg = torch.clamp((sq_agg / deg) - mean_agg ** 2, min=0)
+            std_agg = torch.sqrt(var_agg + _STD_EPS)
 
-        # Max: chunked scatter to bound peak memory to ~750 MB per chunk
-        max_agg = torch.full((N, H), float('-inf'), device=h.device, dtype=torch.float32)
-        for s in range(0, H, _CHUNK_H):
-            e = min(s + _CHUNK_H, H)
-            chunk = h_f[cols, s:e]                        # (E, cs)
-            idx = rows.unsqueeze(1).expand(-1, e - s)     # (E, cs)
-            max_agg[:, s:e].scatter_reduce_(0, idx, chunk, reduce='amax', include_self=True)
+            # Max: chunked scatter to bound peak memory to ~750 MB per chunk.
+            # Use out-of-place chunk reductions to keep autograd versioning stable.
+            max_chunks = []
+            for s in range(0, H, _CHUNK_H):
+                e = min(s + _CHUNK_H, H)
+                chunk = h_f[cols, s:e]                         # (E, cs)
+                idx = rows.unsqueeze(1).expand(-1, e - s)      # (E, cs)
+                max_chunk = torch.full((N, e - s), float('-inf'), device=h.device, dtype=torch.float32)
+                max_chunk = max_chunk.scatter_reduce(0, idx, chunk, reduce='amax', include_self=True)
+                max_chunks.append(max_chunk)
+            max_agg = torch.cat(max_chunks, dim=1)
         max_agg = torch.where(max_agg.isinf(), torch.zeros_like(max_agg), max_agg)
 
     else:
@@ -89,7 +95,7 @@ def sparse_multi_agg(
             ew = edge_weight.float()                           # (H, 3)
 
             mean_agg = torch.zeros(N, H, device=h.device, dtype=torch.float32)
-            max_agg  = torch.full((N, H), float('-inf'), device=h.device, dtype=torch.float32)
+            max_chunks = []
             sq_sum   = torch.zeros(N, H, device=h.device, dtype=torch.float32)
 
             for s in range(0, H, _CHUNK_H):
@@ -101,12 +107,16 @@ def sparse_multi_agg(
                 h_chunk = h_f[cols, s:e] + e_chunk            # (E, cs)
                 idx = rows.unsqueeze(1).expand(-1, e - s)     # (E, cs)
                 mean_agg[:, s:e].scatter_add_(0, idx, h_chunk)
-                max_agg[:, s:e].scatter_reduce_(0, idx, h_chunk, reduce='amax', include_self=True)
+                max_chunk = torch.full((N, e - s), float('-inf'), device=h.device, dtype=torch.float32)
+                max_chunk = max_chunk.scatter_reduce(0, idx, h_chunk, reduce='amax', include_self=True)
+                max_chunks.append(max_chunk)
                 sq_sum[:, s:e].scatter_add_(0, idx, h_chunk ** 2)
 
             mean_agg = mean_agg / deg
+            max_agg = torch.cat(max_chunks, dim=1)
             max_agg = torch.where(max_agg.isinf(), torch.zeros_like(max_agg), max_agg)
-            std_agg = ((sq_sum / deg) - mean_agg ** 2).clamp_(min=0).sqrt_()
+            var_agg = torch.clamp((sq_sum / deg) - mean_agg ** 2, min=0)
+            std_agg = torch.sqrt(var_agg + _STD_EPS)
 
     return torch.cat([mean_agg, max_agg, std_agg], dim=-1).to(dtype)
 

@@ -208,10 +208,13 @@ def compute_spatial_laplacian_pe(xy: np.ndarray, radius: float, k: int = 16) -> 
     """
     L = xy.shape[0]
     k = min(k, L - 2)  # can't exceed L-1 non-trivial eigenvectors
+    if L < 3 or k <= 0:
+        return np.zeros((L, 0), dtype=np.float32)
 
     A = _layer_radial_adjacency(xy, radius)        # (L, L) binary, no self-loops
     degree = A.sum(axis=1)                          # (L,)
-    d_inv_sqrt = np.where(degree > 0, 1.0 / np.sqrt(degree), 0.0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        d_inv_sqrt = np.where(degree > 0, 1.0 / np.sqrt(degree), 0.0)
     # Normalized Laplacian: L_sym = I - D^{-1/2} A D^{-1/2}
     L_sym = np.eye(L) - (d_inv_sqrt[:, None] * A * d_inv_sqrt[None, :])
     eigenvalues, eigenvectors = np.linalg.eigh(L_sym)
@@ -641,8 +644,11 @@ class TritiumSSDataLoader:
         )
         if lpe_dim > 0:
             lpe_spatial = compute_spatial_laplacian_pe(self.channel_positions, radius, k=lpe_dim)
-            lpe_tiled   = np.tile(lpe_spatial, (self.n_time_points, 1))  # (N, lpe_dim)
-            graph.lpe   = torch.from_numpy(lpe_tiled)
+            if lpe_spatial.shape[1] > 0:
+                lpe_tiled = np.tile(lpe_spatial, (self.n_time_points, 1))
+                graph.lpe = torch.from_numpy(lpe_tiled)
+            else:
+                graph.lpe = None
         return graph
 
     def get_batch(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
