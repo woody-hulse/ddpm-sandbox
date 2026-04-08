@@ -83,15 +83,13 @@ class GraphResBlock(nn.Module):
         # Normalize input for stability
         h = self.norm(x)
 
-        # Compute per-edge direction embeddings if positions provided
-        edge_emb = None
-        if pos_cur is not None:
-            idx = adj.coalesce().indices()
-            delta = (pos_cur[idx[1]] - pos_cur[idx[0]]).to(h.dtype)
-            edge_emb = self.edge_proj(delta)
-
-        # Multi-aggregator message passing: mean, max, std → project to hidden_dim
-        agg = self.agg_proj(sparse_multi_agg(adj, h, edge_emb))   # (N, 3H) → (N, H)
+        # Multi-aggregator message passing with chunked edge features
+        agg = self.agg_proj(sparse_multi_agg(
+            adj, h,
+            edge_weight=self.edge_proj.weight,
+            edge_bias=self.edge_proj.bias,
+            pos_cur=pos_cur,
+        ))                                                            # (N, 3H) → (N, H)
         h = (1 + self.eps) * h + agg
         
         # Conditioning with bounded scale
@@ -163,14 +161,14 @@ class SAGPool(nn.Module):
         batch_size = total_nodes // nodes_per_graph
         k_per_graph = max(1, int(math.ceil(self.ratio * nodes_per_graph)))
 
-        # Multi-aggregator scoring with optional directional edge features
+        # Multi-aggregator scoring with chunked edge features
         h = self.norm(x)
-        edge_emb = None
-        if pos_cur is not None:
-            idx = adj.coalesce().indices()
-            delta = (pos_cur[idx[1]] - pos_cur[idx[0]]).to(h.dtype)
-            edge_emb = self.edge_proj(delta)
-        agg = sparse_multi_agg(adj, h, edge_emb)         # (B*N, 3H)
+        agg = sparse_multi_agg(
+            adj, h,
+            edge_weight=self.edge_proj.weight,
+            edge_bias=self.edge_proj.bias,
+            pos_cur=pos_cur,
+        )                                                  # (B*N, 3H)
         s = self.score_linear(agg).squeeze(-1)            # (B*N,)
 
         # Top-k selection per graph

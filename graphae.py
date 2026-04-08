@@ -67,13 +67,12 @@ class GraphEncoderBlock(nn.Module):
         pos_cur: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         h = self.norm(x)
-        # Compute per-edge embeddings from (dx, dy, dz) if positions provided
-        edge_emb = None
-        if pos_cur is not None:
-            idx = adj.coalesce().indices()
-            delta = (pos_cur[idx[1]] - pos_cur[idx[0]]).to(h.dtype)  # (E, 3)
-            edge_emb = self.edge_proj(delta)                           # (E, H)
-        agg = self.agg_proj(sparse_multi_agg(adj, h, edge_emb))       # (N, 3H) → (N, H)
+        agg = self.agg_proj(sparse_multi_agg(
+            adj, h,
+            edge_weight=self.edge_proj.weight,
+            edge_bias=self.edge_proj.bias,
+            pos_cur=pos_cur,
+        ))                                                             # (N, 3H) → (N, H)
         h = self.post_agg_norm((1 + self.eps) * h + agg)
         h = self.lin1(h)
         h = self.act(h)
@@ -295,7 +294,7 @@ class GraphDecoderBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        agg = self.agg_proj(sparse_multi_agg(adj, h))   # (N, 3H) → (N, H)
+        agg = self.agg_proj(sparse_multi_agg(adj, h))    # (N, 3H) → (N, H)
         h = (1 + self.eps) * h + agg
         h = self.lin1(h)
         h = self.act(h)

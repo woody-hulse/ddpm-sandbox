@@ -1,59 +1,102 @@
 import torch
 
+# Feature-dimension chunk size for scatter operations.
+# At E=11.7M edges: each chunk uses E * _CHUNK_H * 4 bytes for h_chunk
+# and E * _CHUNK_H * 8 bytes for the index → ~750 MB total at chunk=8.
+_CHUNK_H = 8
+
 
 def sparse_multi_agg(
     adj: torch.Tensor,
     h: torch.Tensor,
-    edge_emb: "torch.Tensor | None" = None,
+    edge_weight: "torch.Tensor | None" = None,
+    edge_bias: "torch.Tensor | None" = None,
+    pos_cur: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """
     Compute mean, max, and std neighborhood aggregations over a sparse adjacency.
 
-    Optionally adds per-edge embeddings to source messages before aggregation,
-    allowing directional / distance information to modulate each message.
+    Two paths depending on whether directional edge features are needed:
+
+    • No edges (edge_weight is None or pos_cur is None):
+        Uses torch.sparse.mm for mean + std — never materialises an (E, H) tensor.
+        Max is computed via chunked scatter_reduce over _CHUNK_H features at a time.
+
+    • With edges (edge_weight and pos_cur provided):
+        Computes edge projections in _CHUNK_H-wide feature chunks to avoid
+        ever holding the full (E, H) edge-embedding tensor in memory.
+        edge_weight / edge_bias should be the .weight / .bias of the caller's
+        nn.Linear(3, H) edge_proj layer.
 
     Runs in float32 internally for numerical stability, returns in h.dtype.
 
     Args:
-        adj:      (N, N) sparse COO adjacency (block-diagonal for batched graphs)
-        h:        (N, H) node features
-        edge_emb: (E, H) optional per-edge embeddings added to source messages
+        adj:         (N, N) sparse COO adjacency (block-diagonal for batched graphs)
+        h:           (N, H) node features
+        edge_weight: (H, 3) weight matrix of edge_proj Linear, or None
+        edge_bias:   (H,)   bias of edge_proj Linear, or None
+        pos_cur:     (N, 3) node positions for delta computation, or None
     Returns:
         (N, 3*H) concatenation of [mean_agg, max_agg, std_agg]
     """
     adj = adj.coalesce()
-    rows = adj.indices()[0]   # target nodes (aggregate INTO row i FROM col j)
-    cols = adj.indices()[1]   # source nodes
+    rows = adj.indices()[0]
+    cols = adj.indices()[1]
     N, H = h.size()
     dtype = h.dtype
     h_f = h.float() if h.dtype != torch.float32 else h
 
-    # Degree per target node
+    # Degree per target node — (N, 1), used for mean and std
     deg = torch.zeros(N, 1, device=h.device, dtype=torch.float32)
     deg.scatter_add_(0, rows.unsqueeze(1), torch.ones(rows.size(0), 1, device=h.device))
     deg.clamp_(min=1.0)
 
-    row_idx = rows.unsqueeze(1).expand(-1, H)   # (E, H)
-    h_src = h_f[cols]                            # (E, H) source features
+    use_edges = (edge_weight is not None) and (pos_cur is not None)
 
-    # Add per-edge embeddings to source messages if provided
-    if edge_emb is not None:
-        h_src = h_src + (edge_emb.float() if edge_emb.dtype != torch.float32 else edge_emb)
+    if not use_edges:
+        # ── Memory-efficient path ──────────────────────────────────────────────
+        # sparse.mm never materialises the (E, H) source-feature tensor.
+        adj_f = adj.float() if adj.dtype != torch.float32 else adj
+        sum_agg = torch.sparse.mm(adj_f, h_f)            # (N, H)
+        mean_agg = sum_agg / deg
 
-    # Mean: sum / degree
-    sum_agg = torch.zeros(N, H, device=h.device, dtype=torch.float32)
-    sum_agg.scatter_add_(0, row_idx, h_src)
-    mean_agg = sum_agg / deg
+        sq_agg = torch.sparse.mm(adj_f, h_f ** 2)        # (N, H)  h²: (N,H), not (E,H)
+        std_agg = ((sq_agg / deg) - mean_agg ** 2).clamp_(min=0).sqrt_()
 
-    # Max: amax over neighbors; isolated nodes default to 0
-    max_agg = torch.full((N, H), float('-inf'), device=h.device, dtype=torch.float32)
-    max_agg.scatter_reduce_(0, row_idx, h_src, reduce='amax', include_self=True)
-    max_agg = torch.where(max_agg.isinf(), torch.zeros_like(max_agg), max_agg)
+        # Max: chunked scatter to bound peak memory to ~750 MB per chunk
+        max_agg = torch.full((N, H), float('-inf'), device=h.device, dtype=torch.float32)
+        for s in range(0, H, _CHUNK_H):
+            e = min(s + _CHUNK_H, H)
+            chunk = h_f[cols, s:e]                        # (E, cs)
+            idx = rows.unsqueeze(1).expand(-1, e - s)     # (E, cs)
+            max_agg[:, s:e].scatter_reduce_(0, idx, chunk, reduce='amax', include_self=True)
+        max_agg = torch.where(max_agg.isinf(), torch.zeros_like(max_agg), max_agg)
 
-    # Std: sqrt(E[x²] - E[x]²)
-    sq_agg = torch.zeros(N, H, device=h.device, dtype=torch.float32)
-    sq_agg.scatter_add_(0, row_idx, h_src ** 2)
-    std_agg = ((sq_agg / deg) - mean_agg ** 2).clamp_(min=0).sqrt_()
+    else:
+        # ── Edge-modulated path (chunked) ─────────────────────────────────────
+        # Compute (pos[cols] - pos[rows]) once: (E, 3) — tiny (~140 MB at E=11.7M)
+        delta = (pos_cur[cols] - pos_cur[rows]).float()   # (E, 3)
+        ew = edge_weight.float()                           # (H, 3)
+
+        mean_agg = torch.zeros(N, H, device=h.device, dtype=torch.float32)
+        max_agg  = torch.full((N, H), float('-inf'), device=h.device, dtype=torch.float32)
+        sq_sum   = torch.zeros(N, H, device=h.device, dtype=torch.float32)
+
+        for s in range(0, H, _CHUNK_H):
+            e = min(s + _CHUNK_H, H)
+            # Edge projection for this chunk: (E, cs) — never holds full (E, H)
+            e_chunk = delta @ ew[s:e].T                   # (E, cs)
+            if edge_bias is not None:
+                e_chunk = e_chunk + edge_bias[s:e].float()
+            h_chunk = h_f[cols, s:e] + e_chunk            # (E, cs)
+            idx = rows.unsqueeze(1).expand(-1, e - s)     # (E, cs)
+            mean_agg[:, s:e].scatter_add_(0, idx, h_chunk)
+            max_agg[:, s:e].scatter_reduce_(0, idx, h_chunk, reduce='amax', include_self=True)
+            sq_sum[:, s:e].scatter_add_(0, idx, h_chunk ** 2)
+
+        mean_agg = mean_agg / deg
+        max_agg = torch.where(max_agg.isinf(), torch.zeros_like(max_agg), max_agg)
+        std_agg = ((sq_sum / deg) - mean_agg ** 2).clamp_(min=0).sqrt_()
 
     return torch.cat([mean_agg, max_agg, std_agg], dim=-1).to(dtype)
 
