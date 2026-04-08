@@ -29,10 +29,10 @@ class ModelConfig:
     """
     in_dim: int = 1                 # Input feature dimension per node
     out_dim: int = 1                # Output feature dimension per node
-    hidden_dim: int = 64            # Hidden dimension in graph convolutions
+    hidden_dim: int = 32            # Hidden dimension in graph convolutions
     depth: int = 3                  # Number of pooling/unpooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
-    pool_ratio: float = 0.7         # Fraction of nodes to keep per pooling
+    pool_ratio: float = 0.5         # Fraction of nodes to keep per pooling
     dropout: float = 0.0            # Dropout rate
     pos_dim: int = 3                # Position embedding dimension (x, y, z)
     pos_dropout: float = 0.0        # Dropout on position embeddings
@@ -49,7 +49,7 @@ class EncoderConfig:
     decoder_type applies only to AE: "graph", "cnn", or "mlp".
     """
     latent_dim: int = 64            # Latent representation dimension
-    hidden_dim: int = 64            # Hidden dimension in encoder layers
+    hidden_dim: int = 32            # Hidden dimension in encoder layers
     depth: int = 4                  # Number of pooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.5         # Pooling ratio per stage
@@ -99,9 +99,9 @@ class GraphConfig:
 
     Defines how nodes (channel × time) are connected.
     """
-    radius: float = 16.0            # Spatial radius for within-layer adjacency (cm)
+    radius: float = 12.0            # Spatial radius for within-layer adjacency (cm)
     z_sep: float = 20.0             # Z-spacing between time layers
-    z_hops: int = 4                 # Cross-layer connectivity distance
+    z_hops: int = 3                 # Cross-layer connectivity distance
     weighted_edges: bool = True     # Gaussian distance-weighted edges (vs binary)
     lpe_dim: int = 16               # Laplacian positional encoding dimension (0 = disabled)
 
