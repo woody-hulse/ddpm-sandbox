@@ -31,7 +31,7 @@ from lz_data_loader import TritiumSSDataLoader, OnlineMSBatcher
 from config import Config, default_config, get_config, print_config
 
 from models.graph_unet import (
-    GraphDDPMUNet, GraphResBlock, TopKPool, FiLMFromCond,
+    GraphDDPMUNet, GraphResBlock, FiLMFromCond,
     build_block_diagonal_adj, _unpool_like
 )
 from diffusion.schedule import build_cosine_schedule, sinusoidal_embedding
@@ -57,6 +57,7 @@ class DiffAEContext:
     graph: SparseGraph
     A_sparse: torch.Tensor
     pos: torch.Tensor
+    lpe: Optional[torch.Tensor]
     n_channels: int
     n_time_points: int
     n_nodes: int
@@ -230,6 +231,7 @@ class DiffAEContext:
             graph=graph,
             A_sparse=A_sparse,
             pos=pos,
+            lpe=lpe,
             n_channels=n_channels,
             n_time_points=n_time_points,
             n_nodes=n_nodes,
@@ -694,6 +696,7 @@ def train_diffae(cfg: Config = default_config):
     data_stats = ctx.data_stats
     A_sparse = ctx.A_sparse
     pos = ctx.pos
+    lpe = ctx.lpe
     n_nodes = ctx.n_nodes
     n_channels = ctx.n_channels
     n_time_points = ctx.n_time_points
@@ -728,6 +731,7 @@ def train_diffae(cfg: Config = default_config):
 
     for g in optim.param_groups:
         g["lr"] = cfg.training.lr
+        g.setdefault("initial_lr", cfg.training.lr)
 
     # LR scheduler (warmup + optional cosine decay)
     _total = cfg.training.epochs
