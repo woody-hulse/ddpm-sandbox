@@ -785,6 +785,8 @@ def train_diffae(cfg: Config = default_config):
             x0_flat = x0.view(B * n_nodes, 1)
 
             amp_dtype = torch.bfloat16 if cfg.training.use_amp and device_t.type == 'cuda' else torch.float32
+            optim.zero_grad(set_to_none=True)
+
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=cfg.training.use_amp and device_t.type == 'cuda'):
                 z, mu, logvar = encoder(x0_flat, A_sparse, pos, batch_size=B, lpe=lpe)
 
@@ -829,13 +831,6 @@ def train_diffae(cfg: Config = default_config):
 
                 loss = mse_per_sample.mean()
 
-                if use_regressive:
-                    reg_flat = regressive_decoder(z, A_sparse, pos, batch_size=B)
-                    reg_pred = reg_flat.view(B, n_nodes, 1)
-                    reg_loss = F.mse_loss(reg_pred, x0, reduction='mean')
-                    loss = loss + cfg.encoder.regressive_head_weight * reg_loss
-                    epoch_reg_loss += reg_loss.item()
-
                 if cfg.encoder.use_stochastic and mu is not None and logvar is not None:
                     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                     loss = loss + cfg.encoder.kl_weight * kl_loss
@@ -846,10 +841,27 @@ def train_diffae(cfg: Config = default_config):
                 optim.zero_grad(set_to_none=True)
                 continue
 
-            epoch_loss += float(loss.item())
-
-            optim.zero_grad(set_to_none=True)
             loss.backward()
+
+            reg_term_value = 0.0
+            if use_regressive:
+                # Run the regressive head in a second pass so its graph decoder
+                # does not stack on top of the full diffusion-decoder graph.
+                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=cfg.training.use_amp and device_t.type == 'cuda'):
+                    z_reg, _, _ = encoder(x0_flat, A_sparse, pos, batch_size=B, lpe=lpe)
+                    reg_flat = regressive_decoder(z_reg, A_sparse, pos, batch_size=B)
+                    reg_pred = reg_flat.view(B, n_nodes, 1)
+                    reg_loss = F.mse_loss(reg_pred, x0, reduction='mean')
+                    reg_term = cfg.encoder.regressive_head_weight * reg_loss
+
+                if torch.isnan(reg_term) or torch.isinf(reg_term):
+                    print(f"  WARNING: NaN/Inf regressive loss at step {step}! Skipping regressive backward...")
+                else:
+                    reg_term.backward()
+                    reg_term_value = float(reg_term.item())
+                    epoch_reg_loss += float(reg_loss.item())
+
+            epoch_loss += float(loss.item()) + reg_term_value
 
             clip_params = list(encoder.parameters()) + list(decoder.parameters())
             if use_regressive:

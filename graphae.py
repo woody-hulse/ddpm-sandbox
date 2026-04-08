@@ -693,7 +693,7 @@ class SimpleGraphDecoder(nn.Module):
 
         # Graph message passing stages
         for stage in self.stages:
-            h = stage(h, adj0)
+            h = grad_ckpt(stage, h, adj0, use_reentrant=False)
 
         h = F.silu(self.out_norm(h))
         out = self.out_proj(h)
