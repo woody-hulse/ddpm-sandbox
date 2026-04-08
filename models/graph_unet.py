@@ -480,7 +480,8 @@ class GraphDDPMUNet(nn.Module):
         if pos.dim() != 2 or pos.size(0) != N_single or pos.size(1) != self.pos_dim:
             raise ValueError(f"`pos` must be shape ({N_single},{self.pos_dim}), got {tuple(pos.shape)}")
 
-        adj0 = self._get_block_adj(adj, batch_size).to(device=x0.device, dtype=x0.dtype)
+        # Keep adj in float32 — sparse.mm doesn't support BFloat16 on CUDA.
+        adj0 = self._get_block_adj(adj, batch_size).to(device=x0.device)
 
         gammas, betas = self.film(cond, batch_size=batch_size)  # (B, num_layers, hidden_dim)
         g_ptr = 0

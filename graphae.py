@@ -228,7 +228,8 @@ class GraphEncoder(nn.Module):
         total_nodes = x.size(0)
         assert total_nodes == batch_size * N_single
 
-        adj0 = self._get_block_adj(adj, batch_size).to(device=x.device, dtype=x.dtype)
+        # Keep adj in float32 — sparse.mm doesn't support BFloat16 on CUDA.
+        adj0 = self._get_block_adj(adj, batch_size).to(device=x.device)
 
         h = self.in_proj(x)
         pos_tiled = pos.repeat(batch_size, 1)
@@ -246,7 +247,7 @@ class GraphEncoder(nn.Module):
         for d in range(self.depth):
             h_cur = self.stages[d](h_cur, adj_cur, pos_cur)
             h_cur, keep_idx, nodes_per_graph = self.pools[d](h_cur, adj_cur, nodes_per_graph, pos_cur)
-            adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel()).to(dtype=h_cur.dtype)
+            adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel())  # stays float32
             pos_cur = pos_cur[keep_idx]  # keep positions for surviving nodes
             # Readout at this scale: mean, std, max over nodes
             h_n = self.scale_norms[d](h_cur).view(batch_size, nodes_per_graph, self.hidden_dim)
@@ -554,7 +555,8 @@ class GraphAEEncoder(nn.Module):
         total_nodes = x.size(0)
         assert total_nodes == batch_size * N_single
 
-        adj_cur = self._get_block_adj(adj, batch_size).to(device=x.device, dtype=x.dtype)
+        # Keep adj in float32 — sparse.mm doesn't support BFloat16 on CUDA.
+        adj_cur = self._get_block_adj(adj, batch_size).to(device=x.device)
 
         h = self.in_proj(x)
         pos_tiled = pos.repeat(batch_size, 1)
@@ -573,7 +575,7 @@ class GraphAEEncoder(nn.Module):
             total_before = batch_size * nodes_per_graph
             npg_before = nodes_per_graph
             h_cur, keep_idx, nodes_per_graph = self.pools[d](h_cur, adj_cur, nodes_per_graph)
-            adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel()).to(dtype=h_cur.dtype)
+            adj_cur = subgraph_coo(adj_cur, keep_idx, keep_idx.numel())  # stays float32
             pool_indices.append((keep_idx, total_before, npg_before, adj_cur))
 
         h_cur = grad_ckpt(self.final_stage, h_cur, adj_cur, use_reentrant=False)
