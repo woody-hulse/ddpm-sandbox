@@ -58,6 +58,7 @@ DataLoaderType = Union[TritiumSSDataLoader, OnlineMSBatcher]
 @dataclass
 class PyramidLevel:
     adj: torch.Tensor
+    row_sum: torch.Tensor
     pos: torch.Tensor
     lpe: Optional[torch.Tensor]
     fine_to_coarse: Optional[torch.Tensor]
@@ -466,6 +467,7 @@ def build_graph_pyramid(
             mapping = _build_temporal_mapping(n_channels, cur_time, pool_ratio)
 
         norm_adj = _normalize_scipy_adj(cur_adj)
+        row_sum = np.asarray(norm_adj.sum(axis=1)).ravel().astype(np.float32, copy=False)
         fine_to_coarse_t = None
         coarse_counts_t = None
         next_adj = None
@@ -487,6 +489,7 @@ def build_graph_pyramid(
         levels.append(
             PyramidLevel(
                 adj=_from_scipy_sparse(norm_adj, device),
+                row_sum=torch.from_numpy(row_sum).to(device),
                 pos=torch.from_numpy(_normalize_positions(cur_pos, pos_dim)).to(device),
                 lpe=None if cur_lpe is None else torch.from_numpy(cur_lpe).to(device),
                 fine_to_coarse=fine_to_coarse_t,
@@ -533,6 +536,20 @@ def sparse_batch_mm(adj: torch.Tensor, x: torch.Tensor, batch_size: int) -> torc
     return y_mat.reshape(n_out, batch_size, h_dim).permute(1, 0, 2).reshape(batch_size * n_out, h_dim)
 
 
+def _expand_row_sum(row_sum: torch.Tensor, batch_size: int, dtype: torch.dtype) -> torch.Tensor:
+    return row_sum.to(dtype).unsqueeze(0).expand(batch_size, -1).reshape(batch_size * row_sum.numel(), 1)
+
+
+def sparse_batch_mean_std(adj: torch.Tensor, row_sum: torch.Tensor, x: torch.Tensor, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    denom = torch.clamp(_expand_row_sum(row_sum, batch_size, x.dtype), min=1e-6)
+    mean_num = sparse_batch_mm(adj, x, batch_size)
+    second_num = sparse_batch_mm(adj, x * x, batch_size)
+    mean = mean_num / denom
+    second = second_num / denom
+    std = torch.sqrt(torch.clamp(second - mean * mean, min=0.0) + 1e-6)
+    return mean, std
+
+
 def temporal_downsample(x: torch.Tensor, fine_to_coarse: torch.Tensor, coarse_counts: torch.Tensor, batch_size: int) -> torch.Tensor:
     n_fine = fine_to_coarse.numel()
     n_coarse = coarse_counts.numel()
@@ -557,7 +574,7 @@ class LightEncoderBlock(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.msg_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.msg_proj = nn.Linear(hidden_dim * 3, hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.ff = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
@@ -567,10 +584,10 @@ class LightEncoderBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, adj: torch.Tensor, row_sum: torch.Tensor, batch_size: int) -> torch.Tensor:
         h = self.norm1(x)
-        agg = sparse_batch_mm(adj, h, batch_size)
-        x = x + self.dropout(self.msg_proj(torch.cat([h, agg], dim=-1)))
+        mean, std = sparse_batch_mean_std(adj, row_sum, h, batch_size)
+        x = x + self.dropout(self.msg_proj(torch.cat([h, mean, std], dim=-1)))
         return x + self.dropout(self.ff(self.norm2(x)))
 
 
@@ -580,7 +597,7 @@ class LightConditionedBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.msg_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.msg_proj = nn.Linear(hidden_dim * 3, hidden_dim)
         self.ff = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
             nn.SiLU(),
@@ -588,19 +605,31 @@ class LightConditionedBlock(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
         self.cond_proj = nn.Linear(cond_dim, hidden_dim * 6)
+        self.node_proj = nn.Linear(hidden_dim, hidden_dim * 4)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor, cond: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        row_sum: torch.Tensor,
+        cond: torch.Tensor,
+        node_cond: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
         n_nodes = adj.size(0)
-        cond_params = self.cond_proj(cond).view(batch_size, 6, self.hidden_dim)
+        cond_params = self.cond_proj(cond).reshape(batch_size, 6, self.hidden_dim)
         shift1, scale1, gate1, shift2, scale2, gate2 = cond_params.unbind(dim=1)
+        node_shift1, node_scale1, node_shift2, node_scale2 = self.node_proj(node_cond).chunk(4, dim=-1)
 
         h = _apply_affine(self.norm1(x), scale1, shift1, batch_size, n_nodes)
-        agg = sparse_batch_mm(adj, h, batch_size)
+        h = h * (1.0 + node_scale1) + node_shift1
+        mean, std = sparse_batch_mean_std(adj, row_sum, h, batch_size)
         gate1_e = torch.sigmoid(_expand_condition(gate1, n_nodes))
-        x = x + gate1_e * self.dropout(self.msg_proj(torch.cat([h, agg], dim=-1)))
+        x = x + gate1_e * self.dropout(self.msg_proj(torch.cat([h, mean, std], dim=-1)))
 
         h2 = _apply_affine(self.norm2(x), scale2, shift2, batch_size, n_nodes)
+        h2 = h2 * (1.0 + node_scale2) + node_shift2
         gate2_e = torch.sigmoid(_expand_condition(gate2, n_nodes))
         return x + gate2_e * self.dropout(self.ff(h2))
 
@@ -673,7 +702,7 @@ class LightGraphEncoder(nn.Module):
                 h = h + _repeat_graph_feature(self.lpe_proj(level.lpe.to(h.dtype)), batch_size)
 
             for block in self.stages[scale_idx]:
-                h = block(h, level.adj, batch_size)
+                h = block(h, level.adj, level.row_sum, batch_size)
 
             h_view = h.reshape(batch_size, level.n_nodes, self.hidden_dim)
             readouts.append(
@@ -728,9 +757,23 @@ class LightGraphDiffusionDecoder(nn.Module):
             for _ in range(num_scales)
         ])
         self.pos_drop = nn.Dropout(pos_dropout)
-        self.scale_cond = nn.ModuleList([nn.Linear(cond_dim, hidden_dim) for _ in range(num_scales)])
+        self.node_cond_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(cond_dim + pos_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            for _ in range(num_scales)
+        ])
+        self.down_scale_cond = nn.ModuleList([nn.Linear(cond_dim, hidden_dim) for _ in range(num_scales)])
+        self.up_scale_cond = nn.ModuleList([nn.Linear(cond_dim, hidden_dim) for _ in range(num_scales)])
         self.start_proj = nn.Linear(cond_dim, hidden_dim)
-        self.stages = nn.ModuleList([
+        self.down_stages = nn.ModuleList([
+            nn.ModuleList([LightConditionedBlock(hidden_dim, cond_dim, dropout=dropout) for _ in range(blocks_per_stage)])
+            for _ in range(num_scales)
+        ])
+        self.bottleneck = nn.ModuleList([LightConditionedBlock(hidden_dim, cond_dim, dropout=dropout) for _ in range(blocks_per_stage)])
+        self.up_stages = nn.ModuleList([
             nn.ModuleList([LightConditionedBlock(hidden_dim, cond_dim, dropout=dropout) for _ in range(blocks_per_stage)])
             for _ in range(num_scales)
         ])
@@ -747,21 +790,56 @@ class LightGraphDiffusionDecoder(nn.Module):
                 h = temporal_downsample(h, level.fine_to_coarse, level.coarse_counts, batch_size)
         return levels
 
+    def _build_node_cond_pyramid(
+        self,
+        cond: torch.Tensor,
+        pyramid: GraphPyramid,
+        batch_size: int,
+        dtype: torch.dtype,
+    ) -> List[torch.Tensor]:
+        node_levels: List[torch.Tensor] = []
+        for scale_idx, level in enumerate(pyramid.levels):
+            pos_rep = _repeat_graph_feature(level.pos.to(dtype), batch_size)
+            cond_rep = _expand_condition(cond, level.n_nodes)
+            node_levels.append(self.node_cond_mlps[scale_idx](torch.cat([cond_rep, pos_rep], dim=-1)))
+        return node_levels
+
     def forward(self, x: torch.Tensor, pyramid: GraphPyramid, cond: torch.Tensor, batch_size: int = 1) -> torch.Tensor:
         x_pyr = self._build_input_pyramid(x, pyramid, batch_size)
+        node_cond_pyr = self._build_node_cond_pyramid(cond, pyramid, batch_size, x.dtype)
         last_idx = len(pyramid.levels) - 1
-        h = x_pyr[last_idx] + _expand_condition(self.start_proj(cond), pyramid.levels[last_idx].n_nodes)
+        h = x_pyr[0]
+        skips: List[torch.Tensor] = []
+
+        for scale_idx, level in enumerate(pyramid.levels):
+            if scale_idx > 0:
+                h = h + x_pyr[scale_idx]
+            h = h + _expand_condition(self.down_scale_cond[scale_idx](cond), level.n_nodes)
+            node_cond = node_cond_pyr[scale_idx]
+            for block in self.down_stages[scale_idx]:
+                h = block(h, level.adj, level.row_sum, cond, node_cond, batch_size)
+            skips.append(h)
+            if scale_idx < last_idx:
+                assert level.fine_to_coarse is not None and level.coarse_counts is not None
+                h = temporal_downsample(h, level.fine_to_coarse, level.coarse_counts, batch_size)
+
+        h = h + _expand_condition(self.start_proj(cond), pyramid.levels[last_idx].n_nodes)
+        coarsest_level = pyramid.levels[last_idx]
+        coarsest_node_cond = node_cond_pyr[last_idx]
+        for block in self.bottleneck:
+            h = block(h, coarsest_level.adj, coarsest_level.row_sum, cond, coarsest_node_cond, batch_size)
 
         for scale_idx in reversed(range(len(pyramid.levels))):
             level = pyramid.levels[scale_idx]
-            h = h + _expand_condition(self.scale_cond[scale_idx](cond), level.n_nodes)
-            for block in self.stages[scale_idx]:
-                h = block(h, level.adj, cond, batch_size)
+            h = h + _expand_condition(self.up_scale_cond[scale_idx](cond), level.n_nodes)
+            node_cond = node_cond_pyr[scale_idx]
+            for block in self.up_stages[scale_idx]:
+                h = block(h, level.adj, level.row_sum, cond, node_cond, batch_size)
             if scale_idx > 0:
                 fine_level = pyramid.levels[scale_idx - 1]
                 assert fine_level.fine_to_coarse is not None
                 h = temporal_upsample(h, fine_level.fine_to_coarse, batch_size)
-                h = h + self.skip_scale * x_pyr[scale_idx - 1]
+                h = h + self.skip_scale * skips[scale_idx - 1]
 
         return self.out_proj(F.silu(self.out_norm(h)))
 
@@ -787,6 +865,14 @@ class LightLatentDecoder(nn.Module):
             )
             for _ in range(num_scales)
         ])
+        self.node_cond_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(cond_dim + pos_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            for _ in range(num_scales)
+        ])
         self.scale_cond = nn.ModuleList([nn.Linear(cond_dim, hidden_dim) for _ in range(num_scales)])
         self.start_proj = nn.Linear(cond_dim, hidden_dim)
         self.stages = nn.ModuleList([
@@ -796,17 +882,33 @@ class LightLatentDecoder(nn.Module):
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, out_dim)
 
+    def _build_node_cond_pyramid(
+        self,
+        cond: torch.Tensor,
+        pyramid: GraphPyramid,
+        batch_size: int,
+        dtype: torch.dtype,
+    ) -> List[torch.Tensor]:
+        node_levels: List[torch.Tensor] = []
+        for scale_idx, level in enumerate(pyramid.levels):
+            pos_rep = _repeat_graph_feature(level.pos.to(dtype), batch_size)
+            cond_rep = _expand_condition(cond, level.n_nodes)
+            node_levels.append(self.node_cond_mlps[scale_idx](torch.cat([cond_rep, pos_rep], dim=-1)))
+        return node_levels
+
     def forward(self, z: torch.Tensor, pyramid: GraphPyramid, batch_size: int = 1) -> torch.Tensor:
         last_idx = len(pyramid.levels) - 1
         last_level = pyramid.levels[last_idx]
+        node_cond_pyr = self._build_node_cond_pyramid(z, pyramid, batch_size, z.dtype)
         h = _expand_condition(self.start_proj(z), last_level.n_nodes)
         h = h + _repeat_graph_feature(self.pos_mlps[last_idx](last_level.pos.to(h.dtype)), batch_size)
 
         for scale_idx in reversed(range(len(pyramid.levels))):
             level = pyramid.levels[scale_idx]
             h = h + _expand_condition(self.scale_cond[scale_idx](z), level.n_nodes)
+            node_cond = node_cond_pyr[scale_idx]
             for block in self.stages[scale_idx]:
-                h = block(h, level.adj, z, batch_size)
+                h = block(h, level.adj, level.row_sum, z, node_cond, batch_size)
             if scale_idx > 0:
                 fine_level = pyramid.levels[scale_idx - 1]
                 assert fine_level.fine_to_coarse is not None
