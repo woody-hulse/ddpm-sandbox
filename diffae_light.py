@@ -1258,8 +1258,11 @@ def train_diffae_light(cfg: Config = default_config) -> None:
         if cfg.visualize and (epoch % cfg.training.visualize_every == 0 or epoch == cfg.training.epochs - 1):
             enc_vis = ema_encoder if ema_encoder is not None else encoder
             dec_vis = ema_decoder if ema_decoder is not None else decoder
+            reg_vis = ema_regressive_decoder if ema_regressive_decoder is not None else regressive_decoder
             enc_vis.eval()
             dec_vis.eval()
+            if reg_vis is not None:
+                reg_vis.eval()
 
             with torch.no_grad():
                 b_vis = min(batch_size, 4)
@@ -1276,6 +1279,17 @@ def train_diffae_light(cfg: Config = default_config) -> None:
                 samples = sample_diffae_light(ctx, x_ref, encoder=enc_vis, decoder=dec_vis, pbar=False)
                 samples_denorm = data_stats.denormalize(samples.cpu().numpy())
                 samples_denorm = np.clip(samples_denorm, 0, None)
+                reg_samples_denorm = None
+                if reg_vis is not None:
+                    x_ref_flat = x_ref.reshape(b_vis * n_nodes, 1)
+                    z_vis, _, _ = _encode_with_context(ctx, x_ref_flat, b_vis, encoder=enc_vis)
+                    if isinstance(reg_vis, LightLatentDecoder):
+                        reg_flat = reg_vis(z_vis, ctx.decoder_pyramid, batch_size=b_vis)
+                    else:
+                        reg_flat = reg_vis(z_vis, ctx.A_sparse, ctx.pos, batch_size=b_vis)  # type: ignore[misc]
+                    reg_samples = reg_flat.reshape(b_vis, n_nodes, 1).permute(0, 2, 1)
+                    reg_samples_denorm = data_stats.denormalize(reg_samples.cpu().numpy())
+                    reg_samples_denorm = np.clip(reg_samples_denorm, 0, None)
 
             plots_dir = os.path.join(ctx.plot_dir, f"epoch_{epoch}")
             os.makedirs(plots_dir, exist_ok=True)
@@ -1288,26 +1302,36 @@ def train_diffae_light(cfg: Config = default_config) -> None:
             for idx in range(samples.shape[0]):
                 rec_int = samples_denorm[idx, 0]
                 true_int = batch_np_raw[idx, :, 0]
+                reg_int = reg_samples_denorm[idx, 0] if reg_samples_denorm is not None else None
 
                 rec_xy = rec_int.reshape(n_channels, n_time_points, order="F").sum(axis=1)
                 true_xy = true_int.reshape(n_channels, n_time_points, order="F").sum(axis=1)
                 rec_z = rec_int.reshape(n_channels, n_time_points, order="F")
                 true_z = true_int.reshape(n_channels, n_time_points, order="F")
+                reg_xy = reg_int.reshape(n_channels, n_time_points, order="F").sum(axis=1) if reg_int is not None else None
+                reg_z = reg_int.reshape(n_channels, n_time_points, order="F") if reg_int is not None else None
 
-                fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
+                n_cols = 3 if reg_xy is not None else 2
+                fig, axes = plt.subplots(1, n_cols, figsize=(4.5 * n_cols, 3.8))
                 visualize_event(gxy, true_xy, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event(gxy, rec_xy, None, ax=axes[1])
-                axes[1].set_title("DiffAE Light reconstruction")
+                axes[1].set_title("Diffusion reconstruction")
+                if reg_xy is not None:
+                    visualize_event(gxy, reg_xy, None, ax=axes[2])
+                    axes[2].set_title("Regressive reconstruction")
                 fig.tight_layout()
                 fig.savefig(os.path.join(plots_dir, f"event_{idx}_xy.png"))
                 plt.close(fig)
 
-                fig, axes = plt.subplots(1, 2, figsize=(9, 3.2))
+                fig, axes = plt.subplots(1, n_cols, figsize=(4.5 * n_cols, 3.2))
                 visualize_event_z(gz, true_z, None, ax=axes[0])
                 axes[0].set_title("Ground truth")
                 visualize_event_z(gz, rec_z, None, ax=axes[1])
-                axes[1].set_title("DiffAE Light reconstruction")
+                axes[1].set_title("Diffusion reconstruction")
+                if reg_z is not None:
+                    visualize_event_z(gz, reg_z, None, ax=axes[2])
+                    axes[2].set_title("Regressive reconstruction")
                 fig.tight_layout()
                 fig.savefig(os.path.join(plots_dir, f"event_{idx}_z.png"))
                 plt.close(fig)
@@ -1320,7 +1344,9 @@ def train_diffae_light(cfg: Config = default_config) -> None:
                 t_axis = np.arange(n_time_points)
                 for ax, ch in zip(axes, top_channels):
                     ax.plot(t_axis, true_z[ch], color=COLORS["truth"], linewidth=1.2, label="Truth")
-                    ax.plot(t_axis, rec_z[ch], color=COLORS["diffae"], linewidth=1.0, alpha=0.9, label="DiffAE Light")
+                    ax.plot(t_axis, rec_z[ch], color=COLORS["diffae"], linewidth=1.0, alpha=0.9, label="Diffusion")
+                    if reg_z is not None:
+                        ax.plot(t_axis, reg_z[ch], color=COLORS["model3"], linewidth=1.0, alpha=0.9, label="Regressive")
                     ax.set_ylabel(f"ch {ch}")
                 axes[0].legend(loc="upper right", handlelength=1.2)
                 axes[-1].set_xlabel("Time bin")
