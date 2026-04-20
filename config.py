@@ -29,7 +29,7 @@ class ModelConfig:
     """
     in_dim: int = 1                 # Input feature dimension per node
     out_dim: int = 1                # Output feature dimension per node
-    hidden_dim: int = 32            # Hidden dimension in graph convolutions
+    hidden_dim: int = 64            # Diffusion graph U-Net node width
     depth: int = 3                  # Number of pooling/unpooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.5         # Fraction of nodes to keep per pooling
@@ -49,7 +49,8 @@ class EncoderConfig:
     decoder_type applies only to AE: "graph", "cnn", or "mlp".
     """
     latent_dim: int = 64            # Latent representation dimension
-    hidden_dim: int = 32            # Hidden dimension in encoder layers
+    hidden_dim: int = 64            # Graph encoder node width
+    latent_head_dim: Optional[int] = None  # None => max(2 * latent_dim, graph readout dim)
     depth: int = 4                  # Number of pooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.5         # Pooling ratio per stage
@@ -58,8 +59,13 @@ class EncoderConfig:
     kl_weight: float = 0.001        # DiffAE: KL weight when use_stochastic
     encoder_type: str = "graph"   # Encoder: "cnn", "mlp", or "graph"
     decoder_type: str = "graph"     # AE decoder: "graph" (SimpleGraphDecoder), "cnn", or "mlp"
+    conv_channels: tuple = (32, 64, 128)  # CNN encoder/decoder channel widths
+    conv_kernel_size: int = 7       # CNN encoder/decoder temporal kernel size
+    conv_pool_size: int = 4         # CNN encoder/decoder pooling/upsampling factor
+    mlp_hidden_dim: int = 128       # MLP encoder/decoder hidden width
     mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
     mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
+    regressive_hidden_dim: int = 64 # Optional regressive graph/MLP decoder width
     use_regressive_head: bool = False   # DiffAE: add a second decoder head with regressive (MSE) loss
     regressive_head_weight: float = 1.0 # DiffAE: weight for the regressive head loss
 
@@ -254,11 +260,24 @@ def get_config(**overrides) -> Config:
     Searches for keys in nested configs:
         get_config(lr=1e-4)           # sets training.lr
         get_config(latent_dim=128)    # sets encoder.latent_dim
-        get_config(hidden_dim=64)     # sets model.hidden_dim
+        get_config(model_hidden_dim=64)   # sets model.hidden_dim
+        get_config(encoder_hidden_dim=64) # sets encoder.hidden_dim
     """
     cfg = Config()
+    aliases = {
+        "hidden_dim": ("model", "hidden_dim"),
+        "model_hidden_dim": ("model", "hidden_dim"),
+        "unet_hidden_dim": ("model", "hidden_dim"),
+        "encoder_hidden_dim": ("encoder", "hidden_dim"),
+        "graph_encoder_hidden_dim": ("encoder", "hidden_dim"),
+    }
     
     for key, value in overrides.items():
+        if key in aliases:
+            section_name, attr_name = aliases[key]
+            setattr(getattr(cfg, section_name), attr_name, value)
+            continue
+
         # Check top-level
         if hasattr(cfg, key):
             setattr(cfg, key, value)
@@ -285,7 +304,7 @@ def print_config(cfg: Config, include_encoder: bool = False, include_ms: bool = 
     print("Configuration")
     print("=" * 50)
     
-    print(f"\nModel (decoder):")
+    print(f"\nModel (diffusion graph U-Net):")
     print(f"  hidden_dim: {cfg.model.hidden_dim}")
     print(f"  depth: {cfg.model.depth}")
     print(f"  blocks_per_stage: {cfg.model.blocks_per_stage}")
@@ -298,7 +317,11 @@ def print_config(cfg: Config, include_encoder: bool = False, include_ms: bool = 
     if include_encoder:
         print(f"\nEncoder:")
         print(f"  latent_dim: {cfg.encoder.latent_dim}")
-        print(f"  hidden_dim: {cfg.encoder.hidden_dim}")
+        print(f"  graph_hidden_dim: {cfg.encoder.hidden_dim}")
+        print(f"  latent_head_dim: {cfg.encoder.latent_head_dim or 'auto'}")
+        print(f"  conv_channels: {cfg.encoder.conv_channels}")
+        print(f"  mlp_hidden_dim: {cfg.encoder.mlp_hidden_dim}")
+        print(f"  regressive_hidden_dim: {cfg.encoder.regressive_hidden_dim}")
         print(f"  depth: {cfg.encoder.depth}")
         print(f"  encoder_type: {cfg.encoder.encoder_type}")
         print(f"  decoder_type: {cfg.encoder.decoder_type}")

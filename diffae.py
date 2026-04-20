@@ -127,11 +127,14 @@ class DiffAEContext:
                 n_nodes=n_nodes,
                 dropout=cfg.encoder.dropout,
                 use_stochastic=cfg.encoder.use_stochastic,
+                channels=tuple(cfg.encoder.conv_channels),
+                kernel_size=cfg.encoder.conv_kernel_size,
+                pool_size=cfg.encoder.conv_pool_size,
             ).to(device)
         elif encoder_type == "mlp":
             encoder = MLPEncoder(
                 in_dim=cfg.model.in_dim,
-                hidden_dim=cfg.encoder.hidden_dim,
+                hidden_dim=cfg.encoder.mlp_hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
                 num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
@@ -171,7 +174,7 @@ class DiffAEContext:
             if decoder_type == "mlp":
                 regressive_decoder = MLPDecoder(
                     latent_dim=cfg.encoder.latent_dim,
-                    hidden_dim=cfg.encoder.hidden_dim,
+                    hidden_dim=cfg.encoder.regressive_hidden_dim,
                     out_dim=cfg.model.out_dim,
                     n_nodes=n_nodes,
                     num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
@@ -180,7 +183,7 @@ class DiffAEContext:
             else:
                 regressive_decoder = SimpleGraphDecoder(
                     latent_dim=cfg.encoder.latent_dim,
-                    hidden_dim=cfg.encoder.hidden_dim,
+                    hidden_dim=cfg.encoder.regressive_hidden_dim,
                     out_dim=cfg.model.out_dim,
                     n_nodes=n_nodes,
                     depth=cfg.encoder.depth,

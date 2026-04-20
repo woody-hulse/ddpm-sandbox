@@ -200,6 +200,7 @@ class DiffAELightContext:
                 in_dim=cfg.model.in_dim,
                 hidden_dim=cfg.encoder.hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
+                latent_head_dim=cfg.encoder.latent_head_dim,
                 num_scales=len(encoder_pyramid.levels),
                 blocks_per_stage=cfg.encoder.blocks_per_stage,
                 dropout=cfg.encoder.dropout,
@@ -214,11 +215,14 @@ class DiffAELightContext:
                 n_nodes=n_nodes,
                 dropout=cfg.encoder.dropout,
                 use_stochastic=cfg.encoder.use_stochastic,
+                channels=tuple(cfg.encoder.conv_channels),
+                kernel_size=cfg.encoder.conv_kernel_size,
+                pool_size=cfg.encoder.conv_pool_size,
             ).to(device)
         elif encoder_type == "mlp":
             encoder = MLPEncoder(
                 in_dim=cfg.model.in_dim,
-                hidden_dim=cfg.encoder.hidden_dim,
+                hidden_dim=cfg.encoder.mlp_hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
                 num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
@@ -247,7 +251,7 @@ class DiffAELightContext:
             if decoder_type == "mlp":
                 regressive_decoder = MLPDecoder(
                     latent_dim=cfg.encoder.latent_dim,
-                    hidden_dim=cfg.encoder.hidden_dim,
+                    hidden_dim=cfg.encoder.regressive_hidden_dim,
                     out_dim=cfg.model.out_dim,
                     n_nodes=n_nodes,
                     num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
@@ -256,7 +260,7 @@ class DiffAELightContext:
             else:
                 regressive_decoder = LightLatentDecoder(
                     out_dim=cfg.model.out_dim,
-                    hidden_dim=cfg.encoder.hidden_dim,
+                    hidden_dim=cfg.encoder.regressive_hidden_dim,
                     cond_dim=cfg.encoder.latent_dim,
                     num_scales=len(decoder_pyramid.levels),
                     blocks_per_stage=cfg.encoder.blocks_per_stage,
@@ -640,6 +644,7 @@ class LightGraphEncoder(nn.Module):
         in_dim: int,
         hidden_dim: int,
         latent_dim: int,
+        latent_head_dim: Optional[int],
         num_scales: int,
         blocks_per_stage: int,
         dropout: float,
@@ -668,23 +673,22 @@ class LightGraphEncoder(nn.Module):
         ])
 
         readout_dim = num_scales * hidden_dim * 3
+        head_dim = int(latent_head_dim) if latent_head_dim and latent_head_dim > 0 else max(2 * latent_dim, readout_dim)
+        self.latent_head_dim = head_dim
+
+        def make_head(out_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.LayerNorm(readout_dim),
+                nn.Linear(readout_dim, head_dim),
+                nn.SiLU(),
+                nn.Linear(head_dim, out_dim),
+            )
+
         if use_stochastic:
-            self.to_mu = nn.Sequential(
-                nn.Linear(readout_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, latent_dim),
-            )
-            self.to_logvar = nn.Sequential(
-                nn.Linear(readout_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, latent_dim),
-            )
+            self.to_mu = make_head(latent_dim)
+            self.to_logvar = make_head(latent_dim)
         else:
-            self.to_latent = nn.Sequential(
-                nn.Linear(readout_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, latent_dim),
-            )
+            self.to_latent = make_head(latent_dim)
 
     def forward(
         self,

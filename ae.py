@@ -487,11 +487,14 @@ class AEContext:
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
                 dropout=cfg.encoder.dropout,
+                channels=tuple(cfg.encoder.conv_channels),
+                kernel_size=cfg.encoder.conv_kernel_size,
+                pool_size=cfg.encoder.conv_pool_size,
             ).to(device)
         elif encoder_type == "mlp":
             encoder = MLPEncoder(
                 in_dim=cfg.model.in_dim,
-                hidden_dim=cfg.encoder.hidden_dim,
+                hidden_dim=cfg.encoder.mlp_hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
                 num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
@@ -503,13 +506,16 @@ class AEContext:
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
                 dropout=cfg.encoder.dropout,
+                channels=tuple(cfg.encoder.conv_channels),
+                kernel_size=cfg.encoder.conv_kernel_size,
+                pool_size=cfg.encoder.conv_pool_size,
             ).to(device)
 
         decoder_type = (getattr(cfg.encoder, "decoder_type", "mlp") or "mlp").lower()
         if decoder_type == "mlp":
             decoder = MLPDecoder(
                 latent_dim=cfg.encoder.latent_dim,
-                hidden_dim=cfg.encoder.hidden_dim,
+                hidden_dim=cfg.encoder.mlp_hidden_dim,
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
                 num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
@@ -521,11 +527,14 @@ class AEContext:
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
                 dropout=cfg.encoder.dropout,
+                channels=tuple(cfg.encoder.conv_channels),
+                kernel_size=cfg.encoder.conv_kernel_size,
+                pool_size=cfg.encoder.conv_pool_size,
             ).to(device)
         else:
             decoder = MLPDecoder(
                 latent_dim=cfg.encoder.latent_dim,
-                hidden_dim=cfg.encoder.hidden_dim,
+                hidden_dim=cfg.encoder.mlp_hidden_dim,
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
                 num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
