@@ -33,7 +33,7 @@ class ModelConfig:
     depth: int = 3                  # Number of pooling/unpooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.5         # Fraction of nodes to keep per pooling
-    dropout: float = 0.0            # Dropout rate
+    dropout: float = 0.05           # Dropout rate
     pos_dim: int = 3                # Position embedding dimension (x, y, z)
     pos_dropout: float = 0.0        # Dropout on position embeddings
     cache_norm_top: bool = True     # Cache normalization at top level
@@ -48,13 +48,13 @@ class EncoderConfig:
     use_stochastic and kl_weight apply only to DiffAE's encoder.
     decoder_type applies only to AE: "graph", "cnn", or "mlp".
     """
-    latent_dim: int = 64            # Latent representation dimension
+    latent_dim: int = 1024            # Latent representation dimension
     hidden_dim: int = 64            # Graph encoder node width
     latent_head_dim: Optional[int] = None  # None => max(2 * latent_dim, graph readout dim)
     depth: int = 4                  # Number of pooling stages
     blocks_per_stage: int = 2       # Residual blocks per stage
     pool_ratio: float = 0.5         # Pooling ratio per stage
-    dropout: float = 0.0            # Dropout rate
+    dropout: float = 0.05           # Dropout rate
     use_stochastic: bool = False    # DiffAE encoder: stochastic (VAE-style) encoding
     kl_weight: float = 0.001        # DiffAE: KL weight when use_stochastic
     encoder_type: str = "graph"   # Encoder: "cnn", "mlp", or "graph"
@@ -66,8 +66,11 @@ class EncoderConfig:
     mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
     mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
     regressive_hidden_dim: int = 64 # Optional regressive graph/MLP decoder width
-    use_regressive_head: bool = False   # DiffAE: add a second decoder head with regressive (MSE) loss
-    regressive_head_weight: float = 1.0 # DiffAE: weight for the regressive head loss
+    latent_anchor_dim: Optional[int] = None  # None => latent_dim; 0 disables node-level anchor readout
+    latent_anchor_count: int = 128     # Geometric anchors per encoder scale for latent readout
+    latent_anchor_value_dim: int = 4   # Features pooled per anchor before source projection
+    use_regressive_head: bool = True   # DiffAE: add a second decoder head with regressive (MSE) loss
+    regressive_head_weight: float = 0.5 # DiffAE: weight for the regressive head loss
 
 
 @dataclass
@@ -105,9 +108,9 @@ class GraphConfig:
 
     Defines how nodes (channel × time) are connected.
     """
-    radius: float = 12.0            # Spatial radius for within-layer adjacency (cm)
-    z_sep: float = 20.0             # Z-spacing between time layers
-    z_hops: int = 3                 # Cross-layer connectivity distance
+    radius: float = 15.0            # Spatial radius for within-layer adjacency (cm)
+    z_sep: float = 5.0             # Z-spacing between time layers
+    z_hops: int = 5                 # Cross-layer connectivity distance
     weighted_edges: bool = True     # Gaussian distance-weighted edges (vs binary)
     lpe_dim: int = 16               # Laplacian positional encoding dimension (0 = disabled)
 
@@ -139,15 +142,14 @@ class MSDataConfig:
 @dataclass
 class TrainingConfig:
     """Training loop parameters.
-    
     Controls optimization, checkpointing, and dataset encoding.
     """
     # Optimization
     epochs: int = 20_000            # Total training epochs
-    batch_size: int = 4             # Batch size
-    lr: float = 1e-3                # Learning rate
+    batch_size: int = 8             # Batch size
+    lr: float = 5e-4                # Learning rate
     lr_schedule: str = "cosine"     # LR schedule: "constant" or "cosine"
-    warmup_epochs: int = 500        # Linear warmup epochs (0 = no warmup)
+    warmup_epochs: int = 0        # Linear warmup epochs (0 = no warmup)
     weight_decay: float = 0         # AdamW weight decay
     ema_decay: float = 0.999        # Exponential moving average decay
     grad_clip: float = 5.0          # Gradient clipping norm
@@ -165,11 +167,11 @@ class TrainingConfig:
     lopsided_sigma: float = 10.0    # Gaussian kernel sigma for lopsided augmentation
 
     # Checkpointing
-    checkpoint_every: int = 100     # Save checkpoint every N epochs
-    visualize_every: int = 100      # Generate visualizations every N epochs
+    checkpoint_every: int = 25     # Save checkpoint every N epochs
+    visualize_every: int = 25      # Generate visualizations every N epochs
     
     # Encoded dataset export (for aux task)
-    encode_dataset_every: int = 500    # Export encoded latents every N epochs (0 = disable)
+    encode_dataset_every: int = 0    # Export encoded latents every N epochs (0 = disable)
     encode_n_samples: int = 500_000       # Number of MS samples to encode and save
 
 
@@ -209,7 +211,7 @@ class PathConfig:
     # Subdirectory templates (use .format(latent_dim=N))
     diffae_subdir: str = "diffae_z{latent_dim}"
     ae_subdir: str = "ae_z{latent_dim}"
-    graph_ae_subdir: str = "graph_ae_z{latent_dim}"
+    graph_ae_subdir: str = "graph_ae_z{latent_dim}_full"
 
     # Encoded latent filenames (written by encode_dataset_every)
     ae_latents_file:      str = "ae_encoded_ms_latents.h5"
@@ -243,7 +245,7 @@ class Config:
     
     # Runtime flags
     device: Optional[str] = None    # Device override (None = auto-detect)
-    resume: bool = False             # Resume from checkpoint if available
+    resume: bool = True             # Resume from checkpoint if available
     visualize: bool = True          # Generate visualizations during training
 
 
@@ -322,6 +324,9 @@ def print_config(cfg: Config, include_encoder: bool = False, include_ms: bool = 
         print(f"  conv_channels: {cfg.encoder.conv_channels}")
         print(f"  mlp_hidden_dim: {cfg.encoder.mlp_hidden_dim}")
         print(f"  regressive_hidden_dim: {cfg.encoder.regressive_hidden_dim}")
+        print(f"  latent_anchor_dim: {cfg.encoder.latent_anchor_dim or 'auto'}")
+        print(f"  latent_anchor_count: {cfg.encoder.latent_anchor_count}")
+        print(f"  latent_anchor_value_dim: {cfg.encoder.latent_anchor_value_dim}")
         print(f"  depth: {cfg.encoder.depth}")
         print(f"  encoder_type: {cfg.encoder.encoder_type}")
         print(f"  decoder_type: {cfg.encoder.decoder_type}")

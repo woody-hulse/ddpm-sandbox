@@ -55,6 +55,20 @@ torch.set_float32_matmul_precision("high")
 DataLoaderType = Union[TritiumSSDataLoader, OnlineMSBatcher]
 
 
+def _load_compatible_state_dict(module: nn.Module, state_dict: dict, label: str) -> None:
+    current = module.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key in current and current[key].shape == value.shape:
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    module.load_state_dict(compatible, strict=False)
+    if skipped:
+        print(f"  {label}: skipped {len(skipped)} incompatible checkpoint tensors")
+
+
 @dataclass
 class PyramidLevel:
     adj: torch.Tensor
@@ -201,6 +215,9 @@ class DiffAELightContext:
                 hidden_dim=cfg.encoder.hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 latent_head_dim=cfg.encoder.latent_head_dim,
+                anchor_dim=cfg.encoder.latent_anchor_dim,
+                anchor_count=cfg.encoder.latent_anchor_count,
+                anchor_value_dim=cfg.encoder.latent_anchor_value_dim,
                 num_scales=len(encoder_pyramid.levels),
                 blocks_per_stage=cfg.encoder.blocks_per_stage,
                 dropout=cfg.encoder.dropout,
@@ -352,16 +369,16 @@ class DiffAELightContext:
 
     def load_checkpoint(self, path: str, load_optim: bool = True) -> int:
         chk = torch.load(path, map_location=self.device)
-        self.encoder.load_state_dict(chk["encoder"], strict=False)
-        self.decoder.load_state_dict(chk["decoder"], strict=False)
+        _load_compatible_state_dict(self.encoder, chk["encoder"], "encoder")
+        _load_compatible_state_dict(self.decoder, chk["decoder"], "decoder")
         if self.ema_encoder is not None and "ema_encoder" in chk:
-            self.ema_encoder.load_state_dict(chk["ema_encoder"], strict=False)
+            _load_compatible_state_dict(self.ema_encoder, chk["ema_encoder"], "ema_encoder")
         if self.ema_decoder is not None and "ema_decoder" in chk:
-            self.ema_decoder.load_state_dict(chk["ema_decoder"], strict=False)
+            _load_compatible_state_dict(self.ema_decoder, chk["ema_decoder"], "ema_decoder")
         if self.regressive_decoder is not None and "regressive_decoder" in chk:
-            self.regressive_decoder.load_state_dict(chk["regressive_decoder"], strict=False)
+            _load_compatible_state_dict(self.regressive_decoder, chk["regressive_decoder"], "regressive_decoder")
         if self.ema_regressive_decoder is not None and "ema_regressive_decoder" in chk:
-            self.ema_regressive_decoder.load_state_dict(chk["ema_regressive_decoder"], strict=False)
+            _load_compatible_state_dict(self.ema_regressive_decoder, chk["ema_regressive_decoder"], "ema_regressive_decoder")
         if load_optim and self.optim is not None and chk.get("optim"):
             try:
                 self.optim.load_state_dict(chk["optim"])
@@ -413,23 +430,24 @@ def _normalize_scipy_adj(adj: sp.csr_matrix) -> sp.csr_matrix:
     return (d @ adj @ d).tocsr()
 
 
-def _pool_group_size(pool_ratio: float) -> int:
+def _coarse_time_points(n_time_points: int, pool_ratio: float) -> int:
+    if pool_ratio <= 0.0:
+        raise ValueError("pool_ratio must be positive")
     if pool_ratio >= 1.0:
-        return 1
-    return max(1, int(round(1.0 / max(pool_ratio, 1e-6))))
+        return n_time_points
+    return max(1, min(n_time_points, int(math.ceil(n_time_points * pool_ratio))))
 
 
 def _build_temporal_mapping(n_channels: int, n_time_points: int, pool_ratio: float) -> Optional[Tuple[np.ndarray, np.ndarray, int, sp.csr_matrix]]:
-    group_size = _pool_group_size(pool_ratio)
-    if group_size <= 1 or n_time_points <= 1:
+    coarse_time = _coarse_time_points(n_time_points, pool_ratio)
+    if coarse_time >= n_time_points or n_time_points <= 1:
         return None
     n_fine = n_channels * n_time_points
-    coarse_time = int(math.ceil(n_time_points / group_size))
     n_coarse = n_channels * coarse_time
     fine_idx = np.arange(n_fine, dtype=np.int64)
     fine_t = fine_idx // n_channels
     fine_c = fine_idx % n_channels
-    coarse_t = fine_t // group_size
+    coarse_t = np.minimum((fine_t * coarse_time) // n_time_points, coarse_time - 1)
     fine_to_coarse = coarse_t * n_channels + fine_c
     coarse_counts = np.bincount(fine_to_coarse, minlength=n_coarse).astype(np.float32, copy=False)
     assign = sp.csr_matrix(
@@ -520,6 +538,71 @@ def _repeat_graph_feature(x: torch.Tensor, batch_size: int) -> torch.Tensor:
 
 def _expand_condition(cond: torch.Tensor, n_nodes: int) -> torch.Tensor:
     return cond.unsqueeze(1).expand(-1, n_nodes, -1).reshape(cond.size(0) * n_nodes, cond.size(1))
+
+
+def _split_feature_dim(total_dim: int, n_parts: int) -> List[int]:
+    if n_parts <= 0:
+        return []
+    base = total_dim // n_parts
+    rem = total_dim % n_parts
+    return [base + (1 if i < rem else 0) for i in range(n_parts)]
+
+
+def _anchor_grid_factors(n_anchors: int, n_dims: int) -> List[int]:
+    factors = [1 for _ in range(max(1, n_dims))]
+    remaining = max(1, int(n_anchors))
+    prime = 2
+    prime_factors: List[int] = []
+    while prime * prime <= remaining:
+        while remaining % prime == 0:
+            prime_factors.append(prime)
+            remaining //= prime
+        prime += 1
+    if remaining > 1:
+        prime_factors.append(remaining)
+
+    for factor in sorted(prime_factors, reverse=True):
+        idx = min(range(len(factors)), key=lambda i: (factors[i], -i))
+        factors[idx] *= factor
+    return factors
+
+
+def geometric_anchor_assignment(pos: torch.Tensor, n_anchors: int) -> torch.Tensor:
+    n_dims = max(1, pos.size(1))
+    factors = _anchor_grid_factors(n_anchors, n_dims)
+    pos_f = pos.float()
+    pos_min = pos_f.amin(dim=0, keepdim=True)
+    pos_max = pos_f.amax(dim=0, keepdim=True)
+    pos_unit = (pos_f - pos_min) / torch.clamp(pos_max - pos_min, min=1e-6)
+
+    bucket = torch.zeros(pos.size(0), device=pos.device, dtype=torch.long)
+    stride = 1
+    for dim, factor in enumerate(factors):
+        coord = torch.clamp((pos_unit[:, dim] * factor).long(), min=0, max=factor - 1)
+        bucket = bucket + coord * stride
+        stride *= factor
+    if stride > n_anchors:
+        bucket = torch.remainder(bucket, n_anchors)
+    return bucket
+
+
+def node_anchor_pool(
+    values: torch.Tensor,
+    pos: torch.Tensor,
+    batch_size: int,
+    n_anchors: int,
+) -> torch.Tensor:
+    channels = values.size(1)
+    n_nodes = pos.size(0)
+    values_view = values.reshape(batch_size, n_nodes, channels)
+    anchor_idx = geometric_anchor_assignment(pos, n_anchors)
+
+    out = values.new_zeros(batch_size, n_anchors, channels)
+    scatter_idx = anchor_idx.view(1, n_nodes, 1).expand(batch_size, n_nodes, channels)
+    out.scatter_add_(1, scatter_idx, values_view)
+
+    counts = torch.bincount(anchor_idx, minlength=n_anchors).clamp_min(1).to(values.dtype)
+    return out / counts.view(1, n_anchors, 1)
 
 
 def _apply_affine(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, batch_size: int, n_nodes: int) -> torch.Tensor:
@@ -638,6 +721,30 @@ class LightConditionedBlock(nn.Module):
         return x + gate2_e * self.dropout(self.ff(h2))
 
 
+class AnchorPoolReadout(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, n_anchors: int, value_dim: int):
+        super().__init__()
+        self.out_dim = out_dim
+        self.n_anchors = max(1, int(n_anchors))
+        self.value_dim = max(1, int(value_dim))
+        self.norm = nn.LayerNorm(in_dim) if in_dim > 1 else nn.Identity()
+        self.value_proj = nn.Linear(in_dim, self.value_dim)
+        self.anchor_embed = nn.Parameter(torch.zeros(self.n_anchors, self.value_dim))
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(self.n_anchors * self.value_dim),
+            nn.Linear(self.n_anchors * self.value_dim, out_dim),
+        )
+        nn.init.normal_(self.anchor_embed, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor, pos: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if self.out_dim <= 0:
+            return x.new_zeros(batch_size, 0)
+        values = self.value_proj(self.norm(x))
+        pooled = node_anchor_pool(values, pos.to(x.device), batch_size, self.n_anchors)
+        pooled = pooled + self.anchor_embed.to(pooled.dtype).unsqueeze(0)
+        return self.out_proj(pooled.flatten(1))
+
+
 class LightGraphEncoder(nn.Module):
     def __init__(
         self,
@@ -645,6 +752,9 @@ class LightGraphEncoder(nn.Module):
         hidden_dim: int,
         latent_dim: int,
         latent_head_dim: Optional[int],
+        anchor_dim: Optional[int],
+        anchor_count: int,
+        anchor_value_dim: int,
         num_scales: int,
         blocks_per_stage: int,
         dropout: float,
@@ -656,6 +766,7 @@ class LightGraphEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.use_stochastic = use_stochastic
+        self.anchor_dim = latent_dim if anchor_dim is None else max(0, int(anchor_dim))
 
         self.in_proj = nn.Linear(in_dim, hidden_dim)
         self.pos_mlps = nn.ModuleList([
@@ -671,8 +782,29 @@ class LightGraphEncoder(nn.Module):
             nn.ModuleList([LightEncoderBlock(hidden_dim, dropout=dropout) for _ in range(blocks_per_stage)])
             for _ in range(num_scales)
         ])
+        anchor_sources = num_scales + 1
+        if self.anchor_dim > 0:
+            anchor_out_dims = _split_feature_dim(self.anchor_dim, anchor_sources)
+            self.raw_anchor_pool = AnchorPoolReadout(
+                in_dim=in_dim,
+                out_dim=anchor_out_dims[0],
+                n_anchors=anchor_count,
+                value_dim=anchor_value_dim,
+            )
+            self.anchor_pools = nn.ModuleList([
+                AnchorPoolReadout(
+                    in_dim=hidden_dim,
+                    out_dim=anchor_out_dims[scale_idx + 1],
+                    n_anchors=anchor_count,
+                    value_dim=anchor_value_dim,
+                )
+                for scale_idx in range(num_scales)
+            ])
+        else:
+            self.raw_anchor_pool = None
+            self.anchor_pools = nn.ModuleList()
 
-        readout_dim = num_scales * hidden_dim * 3
+        readout_dim = num_scales * hidden_dim * 3 + self.anchor_dim
         head_dim = int(latent_head_dim) if latent_head_dim and latent_head_dim > 0 else max(2 * latent_dim, readout_dim)
         self.latent_head_dim = head_dim
 
@@ -698,6 +830,11 @@ class LightGraphEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         h = self.in_proj(x)
         readouts: List[torch.Tensor] = []
+        anchor_readouts: List[torch.Tensor] = []
+
+        if self.anchor_dim > 0 and self.raw_anchor_pool is not None:
+            raw_level = pyramid.levels[0]
+            anchor_readouts.append(self.raw_anchor_pool(x, raw_level.pos, batch_size))
 
         for scale_idx, level in enumerate(pyramid.levels):
             pos_emb = _repeat_graph_feature(self.pos_mlps[scale_idx](level.pos.to(h.dtype)), batch_size)
@@ -719,11 +856,16 @@ class LightGraphEncoder(nn.Module):
                     dim=-1,
                 )
             )
+            if self.anchor_dim > 0:
+                anchor_readouts.append(self.anchor_pools[scale_idx](h, level.pos, batch_size))
 
             if level.fine_to_coarse is not None and level.coarse_counts is not None:
                 h = temporal_downsample(h, level.fine_to_coarse, level.coarse_counts, batch_size)
 
         h_readout = torch.cat(readouts, dim=-1)
+        if self.anchor_dim > 0:
+            h_readout = torch.cat([h_readout, torch.cat(anchor_readouts, dim=-1)], dim=-1)
+
         if self.use_stochastic:
             mu = self.to_mu(h_readout)
             logvar = torch.clamp(self.to_logvar(h_readout), min=-10.0, max=2.0)
