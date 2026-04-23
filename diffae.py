@@ -174,7 +174,7 @@ class DiffAEContext:
             if decoder_type == "mlp":
                 regressive_decoder = MLPDecoder(
                     latent_dim=cfg.encoder.latent_dim,
-                    hidden_dim=cfg.encoder.regressive_hidden_dim,
+                    hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                     out_dim=cfg.model.out_dim,
                     n_nodes=n_nodes,
                     num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),

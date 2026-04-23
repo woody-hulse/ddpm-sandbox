@@ -63,6 +63,7 @@ class EncoderConfig:
     conv_kernel_size: int = 7       # CNN encoder/decoder temporal kernel size
     conv_pool_size: int = 4         # CNN encoder/decoder pooling/upsampling factor
     mlp_hidden_dim: int = 128       # MLP encoder/decoder hidden width
+    mlp_decoder_hidden_dim: Optional[int] = None  # None => mirror MLP encoder geometry
     mlp_encoder_layers: int = 3     # MLP encoder: number of hidden layers (only if encoder_type="mlp")
     mlp_decoder_layers: int = 3     # MLP decoder: number of hidden layers (only if decoder_type="mlp")
     regressive_hidden_dim: int = 64 # Optional regressive graph/MLP decoder width
@@ -323,6 +324,7 @@ def print_config(cfg: Config, include_encoder: bool = False, include_ms: bool = 
         print(f"  latent_head_dim: {cfg.encoder.latent_head_dim or 'auto'}")
         print(f"  conv_channels: {cfg.encoder.conv_channels}")
         print(f"  mlp_hidden_dim: {cfg.encoder.mlp_hidden_dim}")
+        print(f"  mlp_decoder_hidden_dim: {cfg.encoder.mlp_decoder_hidden_dim or 'auto'}")
         print(f"  regressive_hidden_dim: {cfg.encoder.regressive_hidden_dim}")
         print(f"  latent_anchor_dim: {cfg.encoder.latent_anchor_dim or 'auto'}")
         print(f"  latent_anchor_count: {cfg.encoder.latent_anchor_count}")

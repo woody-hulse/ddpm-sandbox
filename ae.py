@@ -376,7 +376,7 @@ class MLPDecoder(nn.Module):
     def __init__(
         self,
         latent_dim: int,
-        hidden_dim: int,
+        hidden_dim: Optional[int],
         out_dim: int,
         n_nodes: int,
         num_layers: int = 3,
@@ -384,18 +384,34 @@ class MLPDecoder(nn.Module):
     ):
         super().__init__()
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
         self.out_dim = out_dim
         self.n_nodes = n_nodes
 
         layers = []
+        output_size = n_nodes * out_dim
+        n_hidden = num_layers - 1
+        if hidden_dim is None or hidden_dim <= 0:
+            if n_hidden <= 0:
+                layer_sizes = []
+            else:
+                ratio = (latent_dim / output_size) ** (1.0 / n_hidden)
+                encoder_sizes = [
+                    max(latent_dim, int(round(output_size * ratio ** i)))
+                    for i in range(1, n_hidden + 1)
+                ]
+                layer_sizes = list(reversed(encoder_sizes))
+        else:
+            layer_sizes = [hidden_dim for _ in range(n_hidden)]
+        self.hidden_dim = max(layer_sizes) if layer_sizes else latent_dim
+        self.layer_sizes = tuple(layer_sizes)
+
         in_d = latent_dim
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(in_d, hidden_dim))
+        for out_d in layer_sizes:
+            layers.append(nn.Linear(in_d, out_d))
             layers.append(nn.SiLU())
             layers.append(nn.Dropout(dropout))
-            in_d = hidden_dim
-        layers.append(nn.Linear(in_d, n_nodes * out_dim))
+            in_d = out_d
+        layers.append(nn.Linear(in_d, output_size))
         self.mlp = nn.Sequential(*layers)
         self.reset_parameters()
 
@@ -515,7 +531,7 @@ class AEContext:
         if decoder_type == "mlp":
             decoder = MLPDecoder(
                 latent_dim=cfg.encoder.latent_dim,
-                hidden_dim=cfg.encoder.mlp_hidden_dim,
+                hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
                 num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
@@ -534,7 +550,7 @@ class AEContext:
         else:
             decoder = MLPDecoder(
                 latent_dim=cfg.encoder.latent_dim,
-                hidden_dim=cfg.encoder.mlp_hidden_dim,
+                hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
                 num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
