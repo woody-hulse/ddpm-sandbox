@@ -39,7 +39,8 @@ def compute_rqs(z_profile: np.ndarray) -> Optional[Dict[str, float]]:
     peak_idx = int(np.argmax(z_profile))
     peak_amplitude = float(z_profile[peak_idx])
     peak_time = float(time_axis[peak_idx])
-    total_integral = float(np.trapz(z_profile, time_axis))
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    total_integral = float(trapz(z_profile, time_axis))
 
     t10 = 0.1 * peak_amplitude
     t90 = 0.9 * peak_amplitude
@@ -172,7 +173,14 @@ def plot_rq_comparison(
             mask = np.isfinite(true_vals) & np.isfinite(pred_vals)
             all_residuals_rq.append(pred_vals[mask] - true_vals[mask])
         resid_concat = np.concatenate(all_residuals_rq) if all_residuals_rq else np.array([0.0])
-        resid_xlim = max(abs(resid_concat.min()), abs(resid_concat.max())) * 1.05 if len(resid_concat) > 0 else 1.0
+        if len(resid_concat) > 0:
+            resid_xlim = max(
+                max(abs(resid_concat.min()), abs(resid_concat.max())) * 1.05,
+                float(np.nanstd(resid_concat)) * 3.0,
+                1e-3,
+            )
+        else:
+            resid_xlim = 1.0
         resid_bins = np.linspace(-resid_xlim, resid_xlim, 51)
 
         for i, mname in enumerate(model_names):
@@ -215,8 +223,8 @@ def plot_rq_comparison(
             ax_res.set_xlim(-resid_xlim, resid_xlim)
             ax_res.legend()
 
-        fig.suptitle(display_name, fontsize=14, fontweight='bold', y=1.01)
-        plt.tight_layout()
+        fig.suptitle(display_name, fontsize=14, fontweight='bold', y=0.99)
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
         fig.savefig(os.path.join(output_dir, f'rq_{rq_name}.png'), dpi=PLOT_DPI, bbox_inches='tight')
         plt.close(fig)
 
@@ -273,8 +281,8 @@ def plot_rq_comparison(
     for idx in range(n_rqs, len(axes_flat)):
         axes_flat[idx].set_visible(False)
 
-    fig_vio.suptitle('Absolute Error Distribution per Reduced Quantity', y=1.01)
-    fig_vio.tight_layout()
+    fig_vio.suptitle('Absolute Error Distribution per Reduced Quantity', y=0.99, fontweight='bold')
+    fig_vio.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     fig_vio.savefig(os.path.join(output_dir, 'rq_error_summary.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig_vio)
 
@@ -347,8 +355,8 @@ def plot_example_reconstructions(
             ax.set_ylim(0, y_max)
             ax.set_yticks([])
 
-    fig.suptitle('Z-Profile Reconstructions', y=1.01)
-    fig.tight_layout()
+    fig.suptitle('Z-Profile Reconstructions', y=0.99, fontweight='bold')
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     fig.savefig(os.path.join(output_dir, 'example_z_profiles.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig)
 
@@ -382,8 +390,8 @@ def plot_example_reconstructions(
             if row == len(indices) - 1:
                 ax.set_xlabel('Time bin')
 
-    fig2.suptitle('Waveform Reconstructions (channel × time)', y=1.01)
-    fig2.tight_layout()
+    fig2.suptitle('Waveform Reconstructions (channel by time)', y=0.99, fontweight='bold')
+    fig2.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     fig2.savefig(os.path.join(output_dir, 'example_heatmaps.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig2)
 

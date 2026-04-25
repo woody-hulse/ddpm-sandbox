@@ -54,6 +54,8 @@ except ImportError:
     _ssim_fn = None  # type: ignore[assignment]
     _SKIMAGE = False
 
+PLOT_DPI = 300
+
 
 # ---------------------------------------------------------------------------
 # Data layout helpers
@@ -438,9 +440,9 @@ def plot_results(
         ax.legend()
     for ax in axes_flat[n_metrics:]:
         ax.set_visible(False)
-    fig.suptitle("Per-sample reconstruction metric distributions")
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "metric_histograms.png"))
+    fig.suptitle("Per-sample reconstruction metric distributions", fontweight="bold")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.savefig(os.path.join(output_dir, "metric_histograms.png"), dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
     # 2. Physics marginal scatter: true vs reconstructed (total_charge, peak_time)
@@ -464,7 +466,7 @@ def plot_results(
             ax.set_title(m)
             ax.set_aspect("equal", adjustable="box")
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "physics_marginals.png"))
+    fig.savefig(os.path.join(output_dir, "physics_marginals.png"), dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
     # 3. Distribution-level: overlaid marginal histograms
@@ -496,9 +498,9 @@ def plot_results(
         ax.set_xlabel(marg_labels.get(key, key))
         ax.set_ylabel("Density")
         ax.legend(handlelength=1.2)
-    fig.suptitle("Marginal distributions: truth vs. reconstructions")
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "marginal_distributions.png"))
+    fig.suptitle("Marginal distributions: truth vs. reconstructions", fontweight="bold")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.savefig(os.path.join(output_dir, "marginal_distributions.png"), dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
     # 4. DiffAE stochasticity: rank histogram + energy dispersion
@@ -527,7 +529,7 @@ def plot_results(
         axes[1].legend()
 
         fig.tight_layout()
-        fig.savefig(os.path.join(output_dir, "diffae_stochasticity.png"))
+        fig.savefig(os.path.join(output_dir, "diffae_stochasticity.png"), dpi=PLOT_DPI, bbox_inches="tight")
         plt.close(fig)
 
 

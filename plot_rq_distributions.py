@@ -201,9 +201,12 @@ def plot_distributions(
         axes[row][col].set_visible(False)
 
     if title:
-        fig.suptitle(title, fontsize=13, fontweight="bold", y=1.01)
+        fig.suptitle(title, fontsize=13, fontweight="bold", y=0.99)
 
-    fig.tight_layout()
+    if title:
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    else:
+        fig.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fig.savefig(output_path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)

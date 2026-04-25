@@ -43,6 +43,8 @@ from plot_style import apply_style, COLORS
 
 apply_style()
 
+PLOT_DPI = 300
+
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -255,12 +257,12 @@ def plot_scatter(panels, ss_shift, delta_max, method_label, out_path, point_size
                     frameon=True, edgecolor="0.8")
 
     fig.suptitle(
-        f"{method_label} of encoded latents — SS vs MS  "
-        f"(SS δ={ss_shift}, MS δ~U[±{delta_max}])",
+        f"{method_label} of AE and DiffAE latents for SS vs MS events",
         fontweight="bold",
     )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    fig.savefig(out_path)
+    fig.savefig(out_path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved scatter: {out_path}")
 
@@ -282,11 +284,11 @@ def plot_probe_bar(results, out_path):
     ax.set_xticklabels(models)
     ax.set_ylabel("Linear probe accuracy")
     ax.set_ylim(0.4, 1.05)
-    ax.set_title("SS vs MS — linear probe accuracy", fontweight="bold")
+    ax.set_title("SS vs MS probe accuracy", fontweight="bold")
     ax.legend(fontsize=8)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    fig.savefig(out_path)
+    fig.savefig(out_path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved probe bar: {out_path}")
 

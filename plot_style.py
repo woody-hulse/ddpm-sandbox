@@ -52,6 +52,7 @@ def apply_style() -> None:
     """
     matplotlib.rcParams.update({
         # --- typography ---
+        "font.family":        "DejaVu Sans",
         "font.size":          10,
         "axes.labelsize":     11,
         "axes.titlesize":     11,
@@ -59,11 +60,17 @@ def apply_style() -> None:
         "legend.fontsize":    9,
         "xtick.labelsize":    9,
         "ytick.labelsize":    9,
+        "mathtext.fontset":   "dejavusans",
+        "axes.titlepad":      8,
+        "axes.labelpad":      4,
 
         # --- axes ---
         "axes.spines.top":    False,
         "axes.spines.right":  False,
         "axes.linewidth":     0.8,
+        "axes.facecolor":     "white",
+        "figure.facecolor":   "white",
+        "savefig.facecolor":  "white",
 
         # --- grid (subtle) ---
         "axes.grid":          True,
@@ -97,4 +104,7 @@ def apply_style() -> None:
         "savefig.dpi":        300,
         "savefig.bbox":       "tight",
         "savefig.pad_inches": 0.05,
+        "pdf.fonttype":       42,
+        "ps.fonttype":        42,
+        "svg.fonttype":       "none",
     })

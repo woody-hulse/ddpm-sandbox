@@ -1279,14 +1279,37 @@ def sample_diffae_light(
     pbar: bool = False,
 ) -> torch.Tensor:
     enc = ctx.ema_encoder if encoder is None and ctx.ema_encoder is not None else (ctx.encoder if encoder is None else encoder)
-    dec = ctx.ema_decoder if decoder is None and ctx.ema_decoder is not None else (ctx.decoder if decoder is None else decoder)
-    parametrization = ctx.cfg.diffusion.parametrization if parametrization is None else parametrization
 
     bsz, n_nodes, channels = x_ref.shape
     x_ref_flat = x_ref.reshape(bsz * n_nodes, channels)
     z, _, _ = _encode_with_context(ctx, x_ref_flat, bsz, encoder=enc)
 
-    x = torch.randn((bsz, n_nodes, channels), device=x_ref.device)
+    return sample_from_latent_diffae_light(
+        ctx,
+        z,
+        decoder=decoder,
+        parametrization=parametrization,
+        pbar=pbar,
+    )
+
+
+@torch.no_grad()
+def sample_from_latent_diffae_light(
+    ctx: DiffAELightContext,
+    z: torch.Tensor,
+    decoder: Optional[nn.Module] = None,
+    parametrization: Optional[str] = None,
+    pbar: bool = False,
+) -> torch.Tensor:
+    dec = ctx.ema_decoder if decoder is None and ctx.ema_decoder is not None else (ctx.decoder if decoder is None else decoder)
+    parametrization = ctx.cfg.diffusion.parametrization if parametrization is None else parametrization
+
+    z = z.to(ctx.device)
+    bsz = z.shape[0]
+    n_nodes = ctx.n_nodes
+    channels = ctx.cfg.model.out_dim
+
+    x = torch.randn((bsz, n_nodes, channels), device=ctx.device)
     t_total = ctx.schedule["betas"].shape[0]
 
     for step in tqdm(reversed(range(t_total)), desc="Sampling", disable=not pbar, total=t_total, ncols=150):
@@ -1295,7 +1318,7 @@ def sample_diffae_light(
         alpha_bar_t = ctx.schedule["alphas_cumprod"][step]
         alpha_bar_prev_t = ctx.schedule["alphas_cumprod_prev"][step]
 
-        t_emb = sinusoidal_embedding(torch.tensor([step], device=x_ref.device), ctx.cfg.conditioning.time_dim)
+        t_emb = sinusoidal_embedding(torch.tensor([step], device=ctx.device), ctx.cfg.conditioning.time_dim)
         cond_full = torch.cat([z, t_emb.expand(bsz, -1)], dim=-1)
 
         x_flat = x.reshape(bsz * n_nodes, channels)

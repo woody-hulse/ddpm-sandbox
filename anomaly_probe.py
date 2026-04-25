@@ -46,7 +46,7 @@ from config import default_config
 from diffae import DiffAEContext
 from graphae import GraphAEContext
 from compare_rqs import collect_rqs, compute_rqs, wf_to_z_profile
-from plot_style import apply_style
+from plot_style import apply_style, COLORS
 
 apply_style()
 
@@ -383,7 +383,7 @@ def anomaly_heatmap(
     ax.set_xticklabels(space_labels, fontsize=10)
     ax.set_yticks(range(n_types))
     ax.set_yticklabels(anomaly_labels, fontsize=9)
-    ax.set_title("Anomaly percentile rank by representation space", fontsize=11)
+    ax.set_title("Anomaly percentile rank by representation space", fontsize=11, fontweight="bold")
     ax.set_xlabel("Representation space", fontsize=10)
 
     cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.03)
@@ -452,18 +452,19 @@ def scatter_plot(
 
     ax.scatter(
         Z_real_2d[:, 0], Z_real_2d[:, 1],
-        c="#888888", s=6, alpha=0.40, linewidths=0,
+        c=COLORS["baseline"], s=6, alpha=0.40, linewidths=0,
         zorder=1, label="In distribution",
+        rasterized=True,
     )
     ax.scatter(
         Z_protos_2d[:, 0], Z_protos_2d[:, 1],
-        c="#D6231A", s=60, alpha=1.0, linewidths=0,
+        c=COLORS["diffae"], s=60, alpha=1.0, linewidths=0,
         zorder=3, label="Anomaly",
     )
 
     ax.set_xlabel("t-SNE 1", fontsize=10)
     ax.set_ylabel("t-SNE 2", fontsize=10)
-    ax.set_title(f"{title}\n{subtitle}", fontsize=11)
+    ax.set_title(f"{title}\n{subtitle}", fontsize=11, fontweight="bold")
     ax.legend(fontsize=9, markerscale=1.4, loc="best",
               handlelength=0.8, borderpad=0.5)
 
