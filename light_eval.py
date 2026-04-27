@@ -198,6 +198,8 @@ def validate_shared_sample_store(
         n_time_points=ref_ctx.n_time_points,
         diffae_samples=max(1, int(diffae_samples)),
     )
+    optional_model_attr_suffixes = ("_latent_dim", "_epoch", "_checkpoint_path")
+    missing_optional_attrs: List[str] = []
 
     with h5py.File(path, "r") as f:
         attrs = {key: f.attrs[key] for key in f.attrs.keys()}
@@ -207,6 +209,9 @@ def validate_shared_sample_store(
                 actual = actual.decode("utf-8")
             if isinstance(expected_value, np.generic):
                 expected_value = expected_value.item()
+            if actual is None and key.endswith(optional_model_attr_suffixes):
+                missing_optional_attrs.append(key)
+                continue
             if actual != expected_value:
                 raise RuntimeError(
                     f"Shared sample cache mismatch for '{key}': expected {expected_value!r}, got {actual!r}. "
@@ -234,6 +239,12 @@ def validate_shared_sample_store(
                     f"expected {expected_shape}. Rerun with --regenerate to rebuild the cache."
                 )
 
+    if missing_optional_attrs:
+        print(
+            "\nShared sample cache is missing backward-compatible metadata attributes: "
+            + ", ".join(sorted(missing_optional_attrs))
+            + ". Reusing cache based on structural validation only."
+        )
     print(f"\nUsing existing shared MS sample cache: {path}")
     return _build_shared_store(path, expected)
 
