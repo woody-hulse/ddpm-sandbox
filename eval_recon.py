@@ -90,8 +90,27 @@ def metric_poisson_deviance(
     rec is clipped to eps to avoid log(0); true zeros contribute 0.
     """
     rec_clip = np.clip(rec, eps, None)
-    term = np.where(true > 0, true * np.log(true / rec_clip) - (true - rec_clip), -(true - rec_clip))
+    term = rec_clip - true
+    mask = true > 0
+    term = term.astype(np.float64, copy=False)
+    term[mask] = true[mask] * np.log(true[mask] / rec_clip[mask]) - (true[mask] - rec_clip[mask])
     return 2.0 * term.sum(axis=(1, 2))
+
+
+def _shared_bins(values: np.ndarray, n_bins: int = 50) -> np.ndarray:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return np.linspace(-0.5, 0.5, n_bins + 1)
+    lo = float(np.percentile(finite, 0.5))
+    hi = float(np.percentile(finite, 99.5))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return np.linspace(-0.5, 0.5, n_bins + 1)
+    if hi <= lo:
+        center = float(finite[0])
+        pad = max(abs(center) * 0.05, 1e-3)
+        lo, hi = center - pad, center + pad
+    return np.linspace(lo, hi, n_bins + 1)
 
 
 def metric_total_charge_rel_error(
@@ -428,8 +447,7 @@ def plot_results(
     for ax, k in zip(axes_flat, metric_keys):
         all_vals = np.concatenate([per_sample[m][k] for m in models])
         all_vals = all_vals[np.isfinite(all_vals)]
-        lo, hi = np.percentile(all_vals, 0.5), np.percentile(all_vals, 99.5)
-        shared_bins = np.linspace(lo, hi, 51)
+        shared_bins = _shared_bins(all_vals, n_bins=50)
         for m in models:
             arr = per_sample[m][k]
             ax.hist(arr, bins=shared_bins, alpha=0.60, color=col[m], density=True,
@@ -487,8 +505,7 @@ def plot_results(
     for ax, key in zip(axes, marginal_keys):
         all_vals = np.concatenate([true_marg[key]] + [rec_margs[m][key] for m in models])
         all_vals = all_vals[np.isfinite(all_vals)]
-        lo, hi = np.percentile(all_vals, 0.5), np.percentile(all_vals, 99.5)
-        shared_bins = np.linspace(lo, hi, 51)
+        shared_bins = _shared_bins(all_vals, n_bins=50)
         ax.hist(true_marg[key], bins=shared_bins, alpha=0.50, color=COLORS["truth"],
                 density=True, label="Truth", edgecolor='none')
         for m in models:

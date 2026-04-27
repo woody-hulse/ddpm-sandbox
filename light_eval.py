@@ -144,15 +144,118 @@ def metric_summary(metrics: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, Dict[
     return out
 
 
+def shared_sample_store_metadata(
+    models: Sequence[LoadedLightModel],
+    n_samples: int,
+    n_nodes: int,
+    n_channels: int,
+    n_time_points: int,
+    diffae_samples: int,
+) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "n_samples": int(n_samples),
+        "n_nodes": int(n_nodes),
+        "n_channels": int(n_channels),
+        "n_time_points": int(n_time_points),
+        "diffae_samples": int(diffae_samples),
+    }
+    for model in models:
+        prefix = model.key
+        meta[f"{prefix}_latent_dim"] = int(model.latent_dim)
+        meta[f"{prefix}_epoch"] = int(model.epoch)
+        meta[f"{prefix}_checkpoint_path"] = os.path.abspath(model.checkpoint_path)
+    return meta
+
+
+def _build_shared_store(path: str, attrs: Dict[str, Any]) -> SharedSampleStore:
+    return SharedSampleStore(
+        path=path,
+        n_samples=int(attrs["n_samples"]),
+        n_nodes=int(attrs["n_nodes"]),
+        n_channels=int(attrs["n_channels"]),
+        n_time_points=int(attrs["n_time_points"]),
+        diffae_samples=int(attrs["diffae_samples"]),
+    )
+
+
+def validate_shared_sample_store(
+    path: str,
+    models: Sequence[LoadedLightModel],
+    n_samples: int,
+    diffae_samples: int,
+) -> SharedSampleStore:
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Shared sample cache not found at {path}. Run light_eval.py with --regenerate to create it."
+        )
+
+    ref_ctx = models[0].ctx
+    expected = shared_sample_store_metadata(
+        models=models,
+        n_samples=n_samples,
+        n_nodes=ref_ctx.n_nodes,
+        n_channels=ref_ctx.n_channels,
+        n_time_points=ref_ctx.n_time_points,
+        diffae_samples=max(1, int(diffae_samples)),
+    )
+
+    with h5py.File(path, "r") as f:
+        attrs = {key: f.attrs[key] for key in f.attrs.keys()}
+        for key, expected_value in expected.items():
+            actual = attrs.get(key)
+            if isinstance(actual, bytes):
+                actual = actual.decode("utf-8")
+            if isinstance(expected_value, np.generic):
+                expected_value = expected_value.item()
+            if actual != expected_value:
+                raise RuntimeError(
+                    f"Shared sample cache mismatch for '{key}': expected {expected_value!r}, got {actual!r}. "
+                    "Rerun with --regenerate to rebuild the cache."
+                )
+
+        required_shapes = {
+            "raw": (n_samples, ref_ctx.n_nodes, 1),
+            "delta_mu": (n_samples,),
+            "diffae_light_samples": (max(1, int(diffae_samples)), n_samples, ref_ctx.n_nodes),
+        }
+        for model in models:
+            required_shapes[model.key] = (n_samples, ref_ctx.n_nodes)
+
+        for dataset_name, expected_shape in required_shapes.items():
+            if dataset_name not in f:
+                raise RuntimeError(
+                    f"Shared sample cache is missing dataset '{dataset_name}'. "
+                    "Rerun with --regenerate to rebuild the cache."
+                )
+            actual_shape = tuple(int(v) for v in f[dataset_name].shape)
+            if actual_shape != expected_shape:
+                raise RuntimeError(
+                    f"Shared sample cache dataset '{dataset_name}' has shape {actual_shape}, "
+                    f"expected {expected_shape}. Rerun with --regenerate to rebuild the cache."
+                )
+
+    print(f"\nUsing existing shared MS sample cache: {path}")
+    return _build_shared_store(path, expected)
+
+
 def create_shared_sample_store(
     models: Sequence[LoadedLightModel],
     output_root: str,
     n_samples: int,
     batch_size: int,
     diffae_samples: int,
+    regenerate: bool,
 ) -> SharedSampleStore:
     diffae_samples = max(1, int(diffae_samples))
     path = os.path.join(output_root, "shared_ms_samples.h5")
+    if not regenerate:
+        return validate_shared_sample_store(
+            path=path,
+            models=models,
+            n_samples=n_samples,
+            diffae_samples=diffae_samples,
+        )
+
     ref_ctx = models[0].ctx
     n_nodes = ref_ctx.n_nodes
     n_channels = ref_ctx.n_channels
@@ -163,11 +266,15 @@ def create_shared_sample_store(
 
     print(f"\nPrecomputing shared MS sample cache: {n_samples} events")
     with h5py.File(path, "w") as f:
-        f.attrs["n_samples"] = n_samples
-        f.attrs["n_nodes"] = n_nodes
-        f.attrs["n_channels"] = n_channels
-        f.attrs["n_time_points"] = n_time_points
-        f.attrs["diffae_samples"] = diffae_samples
+        for key, value in shared_sample_store_metadata(
+            models=models,
+            n_samples=n_samples,
+            n_nodes=n_nodes,
+            n_channels=n_channels,
+            n_time_points=n_time_points,
+            diffae_samples=diffae_samples,
+        ).items():
+            f.attrs[key] = value
 
         raw_ds = f.create_dataset("raw", shape=(n_samples, n_nodes, 1), dtype=np.float16)
         delta_mu_ds = f.create_dataset("delta_mu", shape=(n_samples,), dtype=np.float32)
@@ -239,9 +346,11 @@ def get_ss_loader(loader: Any) -> Any:
     return loader.ss_loader if hasattr(loader, "ss_loader") else loader
 
 
+@torch.no_grad()
 def encode_raw_flat_batch(model: LoadedLightModel, batch_np: np.ndarray, batch_size: int) -> np.ndarray:
     ctx = model.ctx
     encoder = resolve_encoder(ctx)
+    encoder.eval()
     all_z = []
     for start in range(0, len(batch_np), batch_size):
         end = min(start + batch_size, len(batch_np))
@@ -255,10 +364,11 @@ def encode_raw_flat_batch(model: LoadedLightModel, batch_np: np.ndarray, batch_s
             z, _, _ = encoder(x_flat, ctx.encoder_pyramid, batch_size=bs)
         else:
             z, _, _ = encoder(x_flat, ctx.A_sparse, ctx.pos, batch_size=bs)
-        all_z.append(z.cpu().numpy())
+        all_z.append(z.detach().cpu().numpy())
     return np.concatenate(all_z, axis=0)
 
 
+@torch.no_grad()
 def encode_ct_batch(model: LoadedLightModel, wf_ct: np.ndarray, batch_size: int) -> np.ndarray:
     bsz = wf_ct.shape[0]
     wf_col = np.transpose(wf_ct, (0, 2, 1)).reshape(bsz, -1, 1).astype(np.float32)
@@ -1524,6 +1634,7 @@ def run_experiment(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run inference-only evaluations for AE Light and DiffAE Light.")
     parser.add_argument("--output-dir", type=str, default="light_eval")
+    parser.add_argument("--regenerate", action="store_true", help="Regenerate the shared MS sample cache before running experiments.")
     parser.add_argument("--ae-latent-dim", type=int, default=default_config.encoder.latent_dim)
     parser.add_argument("--diffae-latent-dim", type=int, default=default_config.encoder.latent_dim)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -1586,6 +1697,7 @@ def main() -> None:
         n_samples=args.shared_samples,
         batch_size=args.batch_size,
         diffae_samples=args.diffae_samples,
+        regenerate=args.regenerate,
     )
 
     summary: Dict[str, Any] = {

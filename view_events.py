@@ -26,6 +26,16 @@ from compare_rqs import wf_to_z_profile
 from lz_data_loader import TritiumSSDataLoader
 
 
+def apply_lopsided_to_profile(profile: np.ndarray, sigma: float) -> np.ndarray:
+    """Blur only the first half of a 1D summed event profile."""
+    from scipy.ndimage import gaussian_filter1d
+
+    out = np.asarray(profile, dtype=np.float32).copy()
+    half = out.shape[0] // 2
+    out[:half] = gaussian_filter1d(out[:half], sigma=sigma)
+    return out
+
+
 def load_events(cfg: Config, indices: np.ndarray) -> np.ndarray:
     """Load specific MS events by generating them from a seeded batcher.
 
@@ -93,38 +103,36 @@ def cmd_view(args):
     np.random.seed(args.seed)
     ctx = AEContext.build(cfg, for_training=False, verbose=False)
     batch_np, cond, *_ = ctx.loader.get_batch(args.n)
-    if args.lopsided:
-        batch_np = apply_lopsided_augmentation(batch_np, frac=1.0, sigma=args.lopsided_sigma)
     n_channels = ctx.n_channels
     n_time = ctx.n_time_points
 
-    cols = 4
-    rows = (args.n + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 2.5 * rows), squeeze=False)
-    time_axis = np.arange(n_time)
-
-    for i in range(args.n):
-        r, c = divmod(i, cols)
-        ax = axes[r, c]
+    n_plot = min(args.n, 3)
+    fig, axes = plt.subplots(1, n_plot, figsize=(5.0 * n_plot, 3.6), squeeze=False, sharey=True)
+    z_axis = np.linspace(0.0, 1.0, n_time)
+    z_profiles = []
+    for i in range(n_plot):
         z = wf_to_z_profile(batch_np[i, :, 0], n_channels, n_time)
-        ax.plot(time_axis, z, color="black", linewidth=1.2)
-        ax.fill_between(time_axis, z, alpha=0.1, color="black")
-        ax.set_title(f"Event {i}", fontsize=9)
-        ax.set_ylim(0, max(z.max() * 1.15, 1))
-        if r == rows - 1:
-            ax.set_xlabel("Time bin")
-        if c == 0:
-            ax.set_ylabel("Amplitude")
+        if args.lopsided:
+            z = apply_lopsided_to_profile(z, sigma=args.lopsided_sigma)
+        z_profiles.append(z)
+    y_max = max(max(z.max() for z in z_profiles) * 1.25, 1.0)
 
-    for i in range(args.n, rows * cols):
-        r, c = divmod(i, cols)
-        axes[r, c].set_visible(False)
+    for i in range(n_plot):
+        ax = axes[0, i]
+        z = z_profiles[i]
+        ax.plot(z_axis, z, linewidth=2.0)
+        ax.set_title(f"Event {i + 1}", fontsize=11)
+        ax.set_ylim(0, y_max)
+        ax.set_xlabel("z")
+        if i == 0:
+            ax.set_ylabel("intensity")
+        ax.grid(False)
+        ax.spines["top"].set_visible(True)
+        ax.spines["right"].set_visible(True)
 
-    title = f"Random MS Events (seed={args.seed})"
-    if args.lopsided:
-        title += f"  [lopsided σ={args.lopsided_sigma}]"
-    fig.suptitle(title, fontweight="bold")
-    fig.tight_layout()
+    title = "Sampled lopsided MS events" if args.lopsided else "MS events"
+    fig.suptitle(title, fontsize=14)
+    fig.subplots_adjust(top=0.82, wspace=0.14)
     suffix = f"_lopsided_s{args.lopsided_sigma}" if args.lopsided else ""
     out = os.path.join(args.output_dir, f"view_events{suffix}.png")
     os.makedirs(args.output_dir, exist_ok=True)
