@@ -270,14 +270,15 @@ def multi_sample_metrics(
     """
     Metrics that require multiple independent samples of the same event.
 
-    rank_histogram_counts: verification rank histogram (Talagrand diagram).
-      For each event, rank the true observation within K samples.
+    rank_histogram_counts: pooled verification rank histogram (Talagrand diagram).
+      For each pixel of each event, rank the true observation within K samples.
       Uniform = calibrated; peaked = under-dispersed; U-shaped = over-dispersed.
 
     multi_sample_std: mean pixel-wise std across K samples.
 
     energy_dispersion_ratio: std(total_charge of K samples) / sqrt(true_charge).
-      For Poisson-calibrated reconstruction, ratio ≈ 1.
+      This is a scale reference, not a strict optimality target for conditional
+      reconstructions. Values well below 1 indicate a narrow conditional spread.
     """
     K, B, C, T = samples.shape
 
@@ -289,14 +290,16 @@ def multi_sample_metrics(
     true_charge = true.sum(axis=(1, 2))                # (B,)
     energy_dispersion_ratio = k_charges.std(axis=0) / (np.sqrt(true_charge) + 1e-8)  # (B,)
 
-    # Rank histogram: for each pixel, where does true fall among K samples?
-    # Aggregate over pixels to get a single rank per event.
-    # rank ∈ {0, ..., K}: number of samples that are less than truth.
+    # Proper pooled rank histogram over all pixels of all events.
+    # rank ∈ {0, ..., K}: number of samples strictly less than truth.
     flat_samples = samples.reshape(K, B, -1)      # (K, B, C*T)
-    flat_true    = true.reshape(B, 1, -1)         # (B, 1, C*T)
-    ranks = (flat_samples < flat_true.transpose(1, 0, 2)).sum(axis=0).mean(axis=1)  # (B,)
-    # Bin into K+1 bins
-    rank_counts = np.histogram(ranks, bins=np.linspace(0, K, K + 2))[0]
+    flat_true = true.reshape(B, -1)               # (B, C*T)
+    rank_counts = np.zeros(K + 1, dtype=np.int64)
+    chunk_events = max(1, min(B, 32))
+    for start in range(0, B, chunk_events):
+        end = min(start + chunk_events, B)
+        less = (flat_samples[:, start:end, :] < flat_true[None, start:end, :]).sum(axis=0)
+        rank_counts += np.bincount(less.reshape(-1), minlength=K + 1)
 
     return {
         "multi_sample_std":         pix_std,
@@ -417,7 +420,7 @@ def plot_results(
     dist: Dict[str, Dict[str, float]],
     true_2d: np.ndarray,
     rec_2d_dict: Dict[str, np.ndarray],
-    stoch_metrics: Optional[Dict[str, np.ndarray]],
+    stoch_metrics: Optional[Dict[str, Dict[str, np.ndarray]]],
     channel_positions: np.ndarray,
     ns_per_bin: float,
     output_dir: str,
@@ -520,32 +523,42 @@ def plot_results(
     fig.savefig(os.path.join(output_dir, "marginal_distributions.png"), dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
-    # 4. DiffAE stochasticity: rank histogram + energy dispersion
+    # 4. Stochasticity: rank histogram + energy dispersion
     if stoch_metrics is not None:
-        fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.8))
+        if "rank_histogram_counts" in stoch_metrics:
+            stoch_by_model = {"DiffAE": stoch_metrics}  # backward-compatible path
+        else:
+            stoch_by_model = stoch_metrics
 
-        rhist: np.ndarray = stoch_metrics["rank_histogram_counts"]  # type: ignore[assignment,index]
-        K_bins = len(rhist)
-        axes[0].bar(range(K_bins), rhist, width=0.85,
-                    color=COLORS["diffae"], alpha=0.75, edgecolor='none')
-        axes[0].axhline(len(true_2d) / K_bins, color=COLORS["truth"],
-                        linestyle="--", linewidth=1.0, label="Uniform (ideal)")
-        axes[0].set_xlabel("Rank bin")
-        axes[0].set_ylabel("Count")
-        axes[0].set_title("Rank histogram (Talagrand diagram)")
-        axes[0].legend()
+        stoch_models = list(stoch_by_model.keys())
+        fig, axes = plt.subplots(len(stoch_models), 2, figsize=(9.5, 3.7 * len(stoch_models)), squeeze=False)
 
-        edisp: np.ndarray = stoch_metrics["energy_dispersion_ratio"]  # type: ignore[assignment,index]
-        axes[1].hist(edisp, bins=50, color=COLORS["diffae"], alpha=0.75,
-                     density=True, edgecolor='none')
-        axes[1].axvline(1.0, color=COLORS["truth"], linestyle="--",
-                        linewidth=1.0, label="Poisson ideal (1.0)")
-        axes[1].set_xlabel(r"$\sigma_K(Q) \,/\, \sqrt{\bar{Q}}$")
-        axes[1].set_ylabel("Density")
-        axes[1].set_title("Energy dispersion ratio")
-        axes[1].legend()
+        for row, model_name in enumerate(stoch_models):
+            metrics = stoch_by_model[model_name]
+            model_color = col.get(model_name, COLORS["diffae"])
+
+            rhist: np.ndarray = metrics["rank_histogram_counts"]
+            rank_frac = rhist / max(int(rhist.sum()), 1)
+            K_bins = len(rhist)
+            ax_rank = axes[row, 0]
+            ax_rank.bar(range(K_bins), rank_frac, width=0.85, color=model_color, alpha=0.75, edgecolor="none")
+            ax_rank.axhline(1.0 / K_bins, color=COLORS["truth"], linestyle="--", linewidth=1.0, label="Uniform")
+            ax_rank.set_xlabel("Rank bin")
+            ax_rank.set_ylabel("Fraction")
+            ax_rank.set_title(f"{model_name} rank histogram (Talagrand)")
+            ax_rank.legend()
+
+            edisp: np.ndarray = metrics["energy_dispersion_ratio"]
+            ax_disp = axes[row, 1]
+            ax_disp.hist(edisp, bins=50, color=model_color, alpha=0.75, density=True, edgecolor="none")
+            ax_disp.axvline(1.0, color=COLORS["truth"], linestyle="--", linewidth=1.0, label=r"$\sqrt{Q}$ reference")
+            ax_disp.set_xlabel(r"$\sigma_K(Q) \,/\, \sqrt{Q_{\mathrm{true}}}$")
+            ax_disp.set_ylabel("Density")
+            ax_disp.set_title(f"{model_name} charge-dispersion ratio")
+            ax_disp.legend()
 
         fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, "stochasticity_comparison.png"), dpi=PLOT_DPI, bbox_inches="tight")
         fig.savefig(os.path.join(output_dir, "diffae_stochasticity.png"), dpi=PLOT_DPI, bbox_inches="tight")
         plt.close(fig)
 
@@ -717,7 +730,7 @@ def main() -> None:
     # -------------------------------------------------------------------
     # DiffAE stochasticity (K > 1 samples)
     # -------------------------------------------------------------------
-    stoch_metrics: Optional[Dict[str, np.ndarray]] = None
+    stoch_metrics: Optional[Dict[str, Dict[str, np.ndarray]]] = None
     if diffae_ctx is not None and args.n_samples > 1:
         K = args.n_samples
         print(f"\nRunning {K} independent DiffAE samples for stochasticity metrics...")
@@ -734,14 +747,21 @@ def main() -> None:
             k_samples.append(to_2d(np.concatenate(k_batches, axis=0), n_channels, n_time_points))
 
         samples_arr = np.stack(k_samples, axis=0)   # (K, N_ev, C, T)
-        stoch_metrics = multi_sample_metrics(samples_arr, true_2d, ns_per_bin)
+        stoch_metrics = {
+            "DiffAE": multi_sample_metrics(samples_arr, true_2d, ns_per_bin)
+        }
+
+        if graphae_ctx is not None:
+            ae_samples_arr = np.repeat(to_2d(graphae_rec_flat, n_channels, n_time_points)[None, ...], K, axis=0)
+            stoch_metrics["GraphAE"] = multi_sample_metrics(ae_samples_arr, true_2d, ns_per_bin)
 
         # Print stochasticity summary
-        pix_std = stoch_metrics["multi_sample_std"]
-        edisp   = stoch_metrics["energy_dispersion_ratio"]
-        print(f"\n  DiffAE stochasticity (K={K}):")
-        print(f"    Mean pixel-wise std across samples:   {pix_std.mean():.4f} ± {pix_std.std():.4f}")
-        print(f"    Energy dispersion ratio (ideal=1.0):  {edisp.mean():.4f} ± {edisp.std():.4f}")
+        for model_name, model_metrics in stoch_metrics.items():
+            pix_std = model_metrics["multi_sample_std"]
+            edisp = model_metrics["energy_dispersion_ratio"]
+            print(f"\n  {model_name} stochasticity (K={K}):")
+            print(f"    Mean pixel-wise std across samples:    {pix_std.mean():.4f} ± {pix_std.std():.4f}")
+            print(f"    Charge-dispersion ratio vs sqrt(Q):    {edisp.mean():.4f} ± {edisp.std():.4f}")
 
     # -------------------------------------------------------------------
     # Results

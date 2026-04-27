@@ -788,7 +788,7 @@ def plot_full_pmt_reconstruction_3d_triptych(
     min_amplitude: Optional[float] = None,
 ) -> None:
     ensure_dir(output_dir)
-    subset_to_full = map_subset_pmts_to_full(subset_xy, full_xy)
+    del full_xy
     cmap = plt.get_cmap("viridis")
 
     for idx in indices:
@@ -796,21 +796,21 @@ def plot_full_pmt_reconstruction_3d_triptych(
         diffae_ct = diffae_flat[idx].reshape(n_channels, n_time, order="F")
         ae_ct = ae_flat[idx].reshape(n_channels, n_time, order="F")
         waveforms = {
-            "Original": expand_waveform_to_full_detector(raw_ct, subset_to_full, full_xy.shape[0]),
-            "DiffAE": expand_waveform_to_full_detector(diffae_ct, subset_to_full, full_xy.shape[0]),
-            "AE": expand_waveform_to_full_detector(ae_ct, subset_to_full, full_xy.shape[0]),
+            "Original": raw_ct,
+            "DiffAE": diffae_ct,
+            "AE": ae_ct,
         }
         vmax = max(float(max(np.max(wf), 0.0)) for wf in waveforms.values())
         norm = Normalize(vmin=0.0, vmax=max(vmax, 1e-8))
 
-        fig = plt.figure(figsize=(14.2, 4.8))
+        fig = plt.figure(figsize=(14.2, 5.8))
         axes = [fig.add_subplot(1, 3, i + 1, projection="3d") for i in range(3)]
         scatter = None
         for ax, (title, waveform) in zip(axes, waveforms.items()):
             panel = plot_waveform_3d_scatter(
                 ax,
                 waveform,
-                full_xy,
+                subset_xy,
                 ns_per_bin=ns_per_bin,
                 threshold_quantile=threshold_quantile,
                 min_amplitude=min_amplitude,
@@ -820,15 +820,15 @@ def plot_full_pmt_reconstruction_3d_triptych(
             )
             scatter = panel["scatter"]
 
-        fig.subplots_adjust(left=0.03, right=0.90, bottom=0.05, top=0.86, wspace=0.06)
+        fig.subplots_adjust(left=0.03, right=0.90, bottom=0.18, top=0.86, wspace=0.08)
         cax = fig.add_axes([0.92, 0.20, 0.015, 0.56])
         cbar = fig.colorbar(scatter, cax=cax)
         cbar.ax.set_ylabel("Amplitude (AU)")
         fig.suptitle(f"3D Reconstruction Comparison (event {idx})", fontweight="bold")
         png_path = os.path.join(output_dir, f"event_{idx:04d}_3d_full.png")
         pdf_path = os.path.join(output_dir, f"event_{idx:04d}_3d_full.pdf")
-        fig.savefig(png_path, dpi=300, bbox_inches="tight")
-        fig.savefig(pdf_path, bbox_inches="tight")
+        fig.savefig(png_path, dpi=300)
+        fig.savefig(pdf_path)
         plt.close(fig)
 
 
@@ -1089,20 +1089,30 @@ def run_reconstruction_eval(
     stoch_metrics = None
     stoch_summary = None
     if shared_store.diffae_samples > 1:
+        K = shared_store.diffae_samples
+        stoch_metrics = {}
+        stoch_summary = {}
+
         diff_samples = load_shared_diffae_samples(shared_store, n_samples=n_events)
-        samples_arr = np.stack([to_2d(diff_samples[k], n_channels, n_time) for k in range(diff_samples.shape[0])], axis=0)
-        stoch_metrics = multi_sample_metrics(samples_arr, true_2d, ns_per_bin)
-        stoch_summary = {
-            "multi_sample_std": {
-                "mean": float(np.mean(stoch_metrics["multi_sample_std"])),
-                "std": float(np.std(stoch_metrics["multi_sample_std"])),
-            },
-            "energy_dispersion_ratio": {
-                "mean": float(np.mean(stoch_metrics["energy_dispersion_ratio"])),
-                "std": float(np.std(stoch_metrics["energy_dispersion_ratio"])),
-            },
-            "rank_histogram_counts": stoch_metrics["rank_histogram_counts"].tolist(),
-        }
+        diff_samples_arr = np.stack([to_2d(diff_samples[k], n_channels, n_time) for k in range(diff_samples.shape[0])], axis=0)
+        stoch_metrics["DiffAE"] = multi_sample_metrics(diff_samples_arr, true_2d, ns_per_bin)
+
+        if "AE" in rec_2d_dict:
+            ae_samples_arr = np.repeat(rec_2d_dict["AE"][None, ...], K, axis=0)
+            stoch_metrics["AE"] = multi_sample_metrics(ae_samples_arr, true_2d, ns_per_bin)
+
+        for model_name, model_metrics in stoch_metrics.items():
+            stoch_summary[model_name] = {
+                "multi_sample_std": {
+                    "mean": float(np.mean(model_metrics["multi_sample_std"])),
+                    "std": float(np.std(model_metrics["multi_sample_std"])),
+                },
+                "energy_dispersion_ratio": {
+                    "mean": float(np.mean(model_metrics["energy_dispersion_ratio"])),
+                    "std": float(np.std(model_metrics["energy_dispersion_ratio"])),
+                },
+                "rank_histogram_counts": model_metrics["rank_histogram_counts"].tolist(),
+            }
 
     print_table(per_sample, dist_metrics)
     plot_results(
@@ -1122,7 +1132,7 @@ def run_reconstruction_eval(
         "distribution_metrics": dist_metrics,
     }
     if stoch_summary is not None:
-        summary["diffae_light_stochasticity"] = stoch_summary
+        summary["stochasticity"] = stoch_summary
     write_json(os.path.join(out_dir, "metrics_summary.json"), summary)
     return summary
 

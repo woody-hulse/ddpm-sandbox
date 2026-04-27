@@ -9,6 +9,7 @@ __pycache__/
 *.egg
 
 checkpoints/
+light_eval/
 
 plots/
 correlation_analysis/

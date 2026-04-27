@@ -7,25 +7,20 @@ shows:
   • N real SS events  — small grey dots (background distribution)
   • 1 prototype per anomaly type — large coloured markers, labelled
 
-The spatial anomaly prototypes lie exactly on top of the base real event in
-RQ space (by construction); temporal anomalies deviate according to how much
-the z-profile changed.  Both model latent plots test whether the encoder
-separates what the RQ metrics cannot.
+The anomaly set is intentionally subtle. Instead of using grossly altered
+events that every representation can reject, these prototypes preserve most
+low-order marginals while violating joint spatial-temporal coherence patterns
+that a generative latent space should model more explicitly.
 
 Two anomaly families:
 
-  SPATIAL  — z-profile unchanged → all 8 RQs identical to real event.
-    uniform, peripheral, single_pmt, checkerboard
+  SPATIAL  — preserve the summed z-profile but perturb the charge pattern in a
+             locally inconsistent way.
+    spatial_residual_boost, azimuthal_charge_roll
 
-  TEMPORAL  — z-profile modified; real spatial weights preserved.
-    Synthetic (clearly differ on some RQs):
-      square_wave, smooth_gaussian
-    Modification-of-real (nearly indistinguishable in RQ space):
-      pmt_saturation, diffusion_smear, delayed_echo, stretched_tail
-
-Usage:
-  python anomaly_probe.py [--n-events 500] [--batch-size 8]
-                          [--latent-dim 64] [--output-dir anomaly_results]
+  TEMPORAL — preserve total charge and much of the global envelope, but break
+             channel-to-channel timing consistency.
+    radial_time_shear, sector_time_split, subset_late_charge
 """
 
 import argparse
@@ -35,7 +30,6 @@ import os
 
 import h5py
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
 import torch
 import matplotlib
 matplotlib.use("Agg")
@@ -55,17 +49,12 @@ apply_style()
 # ---------------------------------------------------------------------------
 
 ANOMALY_TYPES = [
-    # (key,              display label,             colour,    family)
-    ("uniform",          "Uniform spatial",         "#2166AC", "spatial"),
-    ("peripheral",       "Peripheral PMTs",         "#D6604D", "spatial"),
-    ("single_pmt",       "Single PMT",              "#1A9850", "spatial"),
-    ("checkerboard",     "Checkerboard",            "#762A83", "spatial"),
-    ("square_wave",      "Square wave",             "#B35806", "temporal"),
-    ("smooth_gaussian",  "Smooth Gaussian",         "#4393C3", "temporal"),
-    ("pmt_saturation",   "PMT saturation",          "#D01C8B", "temporal"),
-    ("diffusion_smear",  "Diffusion smear",         "#74C476", "temporal"),
-    ("delayed_echo",     "Delayed echo",            "#F4A460", "temporal"),
-    ("stretched_tail",   "Stretched tail",          "#9370DB", "temporal"),
+    # (key,                       display label,            colour,    family)
+    ("spatial_residual_boost",    "Spatial residual boost", "#2166AC", "spatial"),
+    ("azimuthal_charge_roll",     "Azimuthal charge roll",  "#D6604D", "spatial"),
+    ("radial_time_shear",         "Radial time shear",      "#1A9850", "temporal"),
+    ("sector_time_split",         "Sector time split",      "#762A83", "temporal"),
+    ("subset_late_charge",        "Subset late charge",     "#B35806", "temporal"),
 ]
 
 ANOMALY_LABELS = {t[0]: t[1] for t in ANOMALY_TYPES}
@@ -78,29 +67,60 @@ PLOT_DPI = 300
 
 
 # ---------------------------------------------------------------------------
-# Spatial weight helpers
+# Subtle anomaly constructors
 # ---------------------------------------------------------------------------
-
-SPATIAL_BLEND = {
-    "uniform": 0.22,
-    "peripheral": 0.28,
-    "single_pmt": 0.35,
-    "checkerboard": 0.24,
-}
-
-TEMPORAL_BLEND = {
-    "square_wave": 0.28,
-    "smooth_gaussian": 0.20,
-    "pmt_saturation": 0.22,
-    "diffusion_smear": 0.20,
-    "delayed_echo": 0.18,
-    "stretched_tail": 0.18,
-}
-
 
 def _trapz(y: np.ndarray, x: np.ndarray) -> float:
     trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return float(trapz(y, x))
+
+
+def _channel_weights(wf_ct: np.ndarray) -> np.ndarray:
+    ch = wf_ct.sum(axis=1).astype(np.float64)
+    total = float(ch.sum())
+    if total <= 1e-8:
+        return np.full(wf_ct.shape[0], 1.0 / max(wf_ct.shape[0], 1), dtype=np.float32)
+    return (ch / total).astype(np.float32)
+
+
+def _renormalize_positive(values: np.ndarray, target_sum: float) -> np.ndarray:
+    out = np.clip(np.asarray(values, dtype=np.float64), 0.0, None)
+    cur = float(out.sum())
+    if cur > 1e-8 and target_sum > 0.0:
+        out *= target_sum / cur
+    return out.astype(np.float32)
+
+
+def _neighbor_average(values: np.ndarray, channel_positions: np.ndarray, k: int = 4) -> np.ndarray:
+    if len(values) <= 1:
+        return values.astype(np.float32)
+    diff = channel_positions[:, None, :] - channel_positions[None, :, :]
+    dist = np.linalg.norm(diff, axis=2)
+    order = np.argsort(dist, axis=1)
+    k_eff = min(max(1, k), len(values) - 1)
+    nbr_idx = order[:, 1 : 1 + k_eff]
+    return values[nbr_idx].mean(axis=1).astype(np.float32)
+
+
+def _shift_trace(trace: np.ndarray, shift_bins: float) -> np.ndarray:
+    t = np.arange(trace.shape[0], dtype=np.float64)
+    shifted = np.interp(t - float(shift_bins), t, trace.astype(np.float64), left=0.0, right=0.0)
+    target = float(np.sum(trace))
+    cur = float(np.sum(shifted))
+    if cur > 1e-8 and target > 0.0:
+        shifted *= target / cur
+    return shifted.astype(np.float32)
+
+
+def _event_centered_radii(channel_positions: np.ndarray) -> np.ndarray:
+    center = channel_positions.mean(axis=0)
+    return np.linalg.norm(channel_positions - center[None, :], axis=1).astype(np.float32)
+
+
+def _event_angles(channel_positions: np.ndarray) -> np.ndarray:
+    center = channel_positions.mean(axis=0)
+    return np.arctan2(channel_positions[:, 1] - center[1], channel_positions[:, 0] - center[0]).astype(np.float32)
+
 
 def compute_spatial_weights(
     channel_positions: np.ndarray,
@@ -108,40 +128,26 @@ def compute_spatial_weights(
     xc: float = 0.0,
     yc: float = 0.0,
 ) -> np.ndarray:
+    del xc, yc
     C = len(channel_positions)
-    center = channel_positions.mean(axis=0)
-    radii  = np.linalg.norm(channel_positions - center, axis=1)
-    radial_scale = max(float(np.std(radii)), 1e-6)
+    dummy = np.ones(C, dtype=np.float32) / max(C, 1)
 
-    if mode == "uniform":
-        w = np.ones(C, dtype=np.float32)
+    if mode == "spatial_residual_boost":
+        local = _neighbor_average(dummy, channel_positions, k=min(4, C - 1))
+        w = dummy + 0.35 * (dummy - local)
 
-    elif mode == "peripheral":
-        thr = np.percentile(radii, 75.0)
-        logits = (radii - thr) / (0.75 * radial_scale)
-        w = 1.0 / (1.0 + np.exp(-logits))
-        w = 0.6 + 0.8 * w
-
-    elif mode == "single_pmt":
-        anchor_idx = int(np.argmin(radii))
-        d_anchor = np.linalg.norm(channel_positions - channel_positions[anchor_idx], axis=1)
-        sigma = max(float(np.percentile(d_anchor[d_anchor > 0], 35.0)), 1e-3) if np.any(d_anchor > 0) else 1.0
-        hotspot = np.exp(-0.5 * (d_anchor / sigma) ** 2)
-        w = 0.55 + 0.90 * hotspot
-
-    elif mode == "checkerboard":
-        angles = np.arctan2(channel_positions[:, 1] - center[1],
-                            channel_positions[:, 0] - center[0])
+    elif mode == "azimuthal_charge_roll":
+        angles = _event_angles(channel_positions)
         idx = np.argsort(angles)
-        w = np.ones(C, dtype=np.float32)
-        w[idx[0::2]] = 1.22
-        w[idx[1::2]] = 0.78
+        rolled = np.roll(dummy[idx], max(2, C // 10))
+        w = dummy.copy()
+        w[idx] = 0.7 * dummy[idx] + 0.3 * rolled
 
     else:
         raise ValueError(f"Unknown spatial mode: {mode!r}")
 
-    s = w.sum()
-    return w / s if s > 1e-8 else np.ones(C, dtype=np.float32) / C
+    s = float(w.sum())
+    return (w / s).astype(np.float32) if s > 1e-8 else dummy
 
 
 def make_spatial_anomaly(
@@ -151,111 +157,83 @@ def make_spatial_anomaly(
     xc: float = 0.0,
     yc: float = 0.0,
 ) -> np.ndarray:
+    del xc, yc
     z = wf_ct.sum(axis=0).astype(np.float32)
-    total = float(wf_ct.sum())
-    ch_real = wf_ct.sum(axis=1) / total if total > 1e-8 else np.ones(wf_ct.shape[0], dtype=np.float32) / wf_ct.shape[0]
-    w_target = compute_spatial_weights(channel_positions, mode, xc, yc)
-    alpha = SPATIAL_BLEND.get(mode, 0.25)
-    w = (1.0 - alpha) * ch_real + alpha * w_target
-    w = w / np.clip(w.sum(), 1e-8, None)
+    ch_real = _channel_weights(wf_ct)
+
+    if mode == "spatial_residual_boost":
+        local = _neighbor_average(ch_real, channel_positions, k=min(4, len(ch_real) - 1))
+        residual = ch_real - local
+        w = _renormalize_positive(ch_real + 0.55 * residual, target_sum=1.0)
+
+    elif mode == "azimuthal_charge_roll":
+        angles = _event_angles(channel_positions)
+        idx = np.argsort(angles)
+        rolled = np.roll(ch_real[idx], max(2, len(ch_real) // 10))
+        w = ch_real.copy()
+        w[idx] = 0.68 * ch_real[idx] + 0.32 * rolled
+        w = _renormalize_positive(w, target_sum=1.0)
+
+    else:
+        w_target = compute_spatial_weights(channel_positions, mode)
+        w = _renormalize_positive(0.75 * ch_real + 0.25 * w_target, target_sum=1.0)
+
     return (w[:, None] * z[None, :]).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Temporal z-profile constructors
-# ---------------------------------------------------------------------------
-
-def _make_temporal_zprofile(
-    T: int,
-    rqs: dict,
+def make_temporal_anomaly(
+    wf_ct: np.ndarray,
     mode: str,
-    z_real: np.ndarray | None = None,
+    rqs: dict,
+    channel_positions: np.ndarray,
 ) -> np.ndarray:
-    t        = np.arange(T, dtype=np.float64)
-    pt       = float(rqs["peak_time"])
-    amp      = float(rqs["peak_amplitude"])
-    integral = float(rqs["total_integral"])
-    fwhm     = max(float(rqs["fwhm"]), 4.0)
-    z_base = z_real.astype(np.float64) if z_real is not None else None
+    del rqs
+    C, T = wf_ct.shape
+    ch_charge = wf_ct.sum(axis=1).astype(np.float32)
+    total = float(np.sum(ch_charge))
+    if np.any(ch_charge > 0):
+        thresh = max(float(np.percentile(ch_charge[ch_charge > 0], 35.0)), 1e-6)
+        active = np.flatnonzero(ch_charge > thresh)
+    else:
+        active = np.arange(C)
 
-    if mode == "square_wave":
-        half_w = fwhm / 2.0
-        tau    = 2.4
-        rise   = 1.0 / (1.0 + np.exp(-(t - (pt - half_w)) / tau))
-        fall   = 1.0 / (1.0 + np.exp( (t - (pt + half_w)) / tau))
-        z      = amp * rise * fall
-        z = np.clip(z, 0.0, None)
-        cur = _trapz(z, t)
-        if cur > 1e-8:
-            z *= integral / cur
+    if mode == "radial_time_shear":
+        radii = _event_centered_radii(channel_positions)
+        r_norm = (radii - float(radii.mean())) / max(float(radii.std()), 1e-6)
+        shifts = np.clip(np.rint(2.8 * r_norm), -4, 4)
+        if np.any(ch_charge > 0):
+            shifts = shifts - np.rint(np.average(shifts, weights=np.clip(ch_charge, 1e-6, None)))
+        shifted = np.stack([_shift_trace(wf_ct[ch], shifts[ch]) for ch in range(C)], axis=0)
+        out = 0.58 * wf_ct + 0.42 * shifted
 
-    elif mode == "smooth_gaussian":
-        sigma = integral / (amp * np.sqrt(2.0 * np.pi) + 1e-8)
-        sigma = max(sigma, 3.0)
-        z     = amp * np.exp(-0.5 * ((t - pt) / sigma) ** 2)
-        z = np.clip(z, 0.0, None)
-        cur = _trapz(z, t)
-        if cur > 1e-8:
-            z *= integral / cur
+    elif mode == "sector_time_split":
+        angles = _event_angles(channel_positions)
+        sector_sign = np.sign(np.sin(2.0 * angles))
+        sector_sign[sector_sign == 0.0] = 1.0
+        shifts = 3.0 * sector_sign
+        if np.any(ch_charge > 0):
+            shifts = shifts - np.average(shifts, weights=np.clip(ch_charge, 1e-6, None))
+        shifted = np.stack([_shift_trace(wf_ct[ch], shifts[ch]) for ch in range(C)], axis=0)
+        out = 0.60 * wf_ct + 0.40 * shifted
 
-    elif mode == "pmt_saturation":
-        assert z_real is not None
-        sat_level = 0.93 * float(z_real.max())
-        z = np.minimum(z_real.astype(np.float64), sat_level)
-        z = np.clip(z, 0.0, None)
-        cur = _trapz(z, t)
-        if cur > 1e-8:
-            z *= integral / cur
-
-    elif mode == "diffusion_smear":
-        assert z_real is not None
-        z = gaussian_filter1d(z_real.astype(np.float64), sigma=5.0)
-        z = np.clip(z, 0.0, None)
-
-    elif mode == "delayed_echo":
-        assert z_real is not None
-        delay     = min(18, max(6, T // 8))
-        echo_frac = 0.03
-        echo      = np.zeros(T, dtype=np.float64)
-        echo[delay:] = z_real[:-delay].astype(np.float64) * echo_frac
-        z = z_real.astype(np.float64) + echo
-        z = np.clip(z, 0.0, None)
-
-    elif mode == "stretched_tail":
-        assert z_real is not None
-        t_arr    = np.arange(T, dtype=np.float64)
-        peak_loc = int(np.argmax(z_real))
-        peak_amp = float(z_real[peak_loc])
-        tau_slow = 45.0
-        tail     = np.where(
-            t_arr > peak_loc,
-            0.05 * peak_amp * np.exp(-(t_arr - peak_loc) / tau_slow),
-            0.0,
-        )
-        z = z_real.astype(np.float64) + tail
-        z = np.clip(z, 0.0, None)
+    elif mode == "subset_late_charge":
+        out = wf_ct.astype(np.float32).copy()
+        active_sorted = active[np.argsort(ch_charge[active])[::-1]] if active.size > 0 else active
+        subset = active_sorted[::3] if active_sorted.size > 0 else active_sorted
+        delay = min(12, max(6, T // 18))
+        frac = 0.18
+        for ch in subset:
+            late = _shift_trace(wf_ct[ch], delay)
+            out[ch] = (1.0 - frac) * wf_ct[ch] + frac * late
 
     else:
         raise ValueError(f"Unknown temporal mode: {mode!r}")
 
-    if z_base is not None:
-        alpha = TEMPORAL_BLEND.get(mode, 0.2)
-        z = (1.0 - alpha) * z_base + alpha * z
-    if z_base is not None:
-        target_integral = _trapz(z_base, t)
-        cur = _trapz(z, t)
-        if cur > 1e-8 and target_integral > 0:
-            z *= target_integral / cur
-    return z.astype(np.float32)
-
-
-def make_temporal_anomaly(wf_ct: np.ndarray, mode: str, rqs: dict) -> np.ndarray:
-    C, T   = wf_ct.shape
-    total  = float(wf_ct.sum())
-    ch_w   = wf_ct.sum(axis=1) / total if total > 1e-8 else np.ones(C) / C
-    z_real = wf_ct.sum(axis=0).astype(np.float64)
-    z_anom = _make_temporal_zprofile(T, rqs, mode, z_real=z_real)
-    return (ch_w[:, None] * z_anom[None, :]).astype(np.float32)
+    out = np.clip(out, 0.0, None).astype(np.float64)
+    cur_total = float(np.sum(out))
+    if cur_total > 1e-8 and total > 0.0:
+        out *= total / cur_total
+    return out.astype(np.float32)
 
 
 def make_anomaly(
@@ -269,7 +247,7 @@ def make_anomaly(
     if mode in SPATIAL_TYPES:
         return make_spatial_anomaly(wf_ct, channel_positions, mode, xc, yc)
     assert rqs is not None
-    return make_temporal_anomaly(wf_ct, mode, rqs)
+    return make_temporal_anomaly(wf_ct, mode, rqs, channel_positions)
 
 
 def plot_anomaly_examples(
@@ -315,8 +293,8 @@ def plot_anomaly_examples(
         fig.savefig(os.path.join(output_dir, filename), dpi=PLOT_DPI, bbox_inches="tight")
         plt.close(fig)
 
-    _plot_family(SPATIAL_TYPES, "Spatial anomaly prototypes", "anomaly_examples_spatial.png")
-    _plot_family(TEMPORAL_TYPES, "Temporal anomaly prototypes", "anomaly_examples_temporal.png")
+    _plot_family(SPATIAL_TYPES, "Charge-pattern anomaly prototypes", "anomaly_examples_spatial.png")
+    _plot_family(TEMPORAL_TYPES, "Timing-coherence anomaly prototypes", "anomaly_examples_temporal.png")
 
 
 # ---------------------------------------------------------------------------
