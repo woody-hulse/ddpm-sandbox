@@ -115,6 +115,93 @@ def active_mask_from_waveform(
     return mask, threshold
 
 
+def detector_plot_radii(pmt_xy: np.ndarray) -> tuple[float, float, float]:
+    actual_radius = float(np.max(np.linalg.norm(pmt_xy, axis=1)))
+    boundary_radius = actual_radius + 7.0
+    plot_radius = boundary_radius + 2.0
+    return actual_radius, boundary_radius, plot_radius
+
+
+def plot_waveform_3d_scatter(
+    ax3d: plt.Axes,
+    waveform: np.ndarray,
+    pmt_xy: np.ndarray,
+    *,
+    ns_per_bin: float,
+    threshold_quantile: float = 0.95,
+    min_amplitude: float | None = None,
+    norm: Normalize | None = None,
+    cmap=None,
+    title: str | None = None,
+):
+    if waveform.shape[0] != pmt_xy.shape[0]:
+        raise ValueError(
+            f"Waveform channel count ({waveform.shape[0]}) does not match PMT positions ({pmt_xy.shape[0]})."
+        )
+
+    active_mask, threshold = active_mask_from_waveform(
+        waveform,
+        threshold_quantile=threshold_quantile,
+        min_amplitude=min_amplitude,
+    )
+
+    ch_idx, time_idx = np.nonzero(active_mask)
+    amplitudes = waveform[ch_idx, time_idx]
+    times_ns = time_idx.astype(np.float32) * float(ns_per_bin)
+    x = pmt_xy[ch_idx, 0]
+    y = pmt_xy[ch_idx, 1]
+
+    if cmap is None:
+        cmap = plt.get_cmap("viridis")
+    if norm is None:
+        vmax = float(max(amplitudes.max(), waveform.max(), 1e-8))
+        norm = Normalize(vmin=0.0, vmax=vmax)
+
+    scatter = ax3d.scatter(
+        x, y, times_ns,
+        c=amplitudes,
+        cmap=cmap,
+        norm=norm,
+        s=10,
+        alpha=0.72,
+        linewidths=0.0,
+        depthshade=False,
+        rasterized=True,
+    )
+
+    _, _, plot_radius = detector_plot_radii(pmt_xy)
+    ax3d.set_xlim(-plot_radius, plot_radius)
+    ax3d.set_ylim(-plot_radius, plot_radius)
+    ax3d.set_zlim(0.0, float(waveform.shape[1] - 1) * float(ns_per_bin))
+    ax3d.set_xlabel("x (cm)")
+    ax3d.set_ylabel("y (cm)", labelpad=4)
+    ax3d.set_zlabel("Time (ns)", labelpad=6, fontsize=10)
+    ax3d.view_init(elev=22, azim=-58)
+    ax3d.set_box_aspect((1.0, 1.0, 1.8))
+    ax3d.grid(False)
+    ax3d.tick_params(axis="x", pad=1)
+    ax3d.tick_params(axis="y", pad=1)
+    ax3d.tick_params(axis="z", pad=2)
+    ax3d.set_zticks(np.arange(0, waveform.shape[1] * float(ns_per_bin), 2000.0))
+    ax3d.xaxis.pane.fill = False
+    ax3d.yaxis.pane.fill = False
+    ax3d.zaxis.pane.fill = False
+    ax3d.xaxis.pane.set_edgecolor((1, 1, 1, 0))
+    ax3d.yaxis.pane.set_edgecolor((1, 1, 1, 0))
+    ax3d.zaxis.pane.set_edgecolor((1, 1, 1, 0))
+    if title:
+        ax3d.set_title(title, pad=10, fontweight="bold")
+
+    return {
+        "scatter": scatter,
+        "threshold": float(threshold),
+        "active_nodes": int(active_mask.sum()),
+        "active_pmts": int(np.count_nonzero(active_mask.any(axis=1))),
+        "amplitude_min": float(amplitudes.min()),
+        "amplitude_max": float(amplitudes.max()),
+    }
+
+
 def main() -> None:
     args = parse_args()
 
@@ -134,10 +221,6 @@ def main() -> None:
 
     ch_idx, time_idx = np.nonzero(active_mask)
     amplitudes = waveform[ch_idx, time_idx]
-    times_ns = time_idx.astype(np.float32) * float(args.ns_per_bin)
-    x = pmt_xy[ch_idx, 0]
-    y = pmt_xy[ch_idx, 1]
-
     active_channels = np.flatnonzero(active_mask.any(axis=1))
     channel_peak = waveform.max(axis=1)
     vmax = float(max(amplitudes.max(), channel_peak.max()))
@@ -159,39 +242,18 @@ def main() -> None:
     ax3d = fig.add_subplot(gs[0, 0], projection="3d")
     ax_xy = fig.add_subplot(gs[0, 1])
 
-    sc3d = ax3d.scatter(
-        x, y, times_ns,
-        c=amplitudes,
-        cmap=cmap,
+    panel_info = plot_waveform_3d_scatter(
+        ax3d,
+        waveform,
+        pmt_xy,
+        ns_per_bin=float(args.ns_per_bin),
+        threshold_quantile=args.threshold_quantile,
+        min_amplitude=args.min_amplitude,
         norm=norm,
-        s=10,
-        alpha=0.72,
-        linewidths=0.0,
-        depthshade=False,
-        rasterized=True,
+        cmap=cmap,
     )
-    actual_radius = float(np.max(np.linalg.norm(pmt_xy, axis=1)))
-    boundary_radius = actual_radius + 7.0
-    plot_radius = boundary_radius + 2.0
-    ax3d.set_xlim(-plot_radius, plot_radius)
-    ax3d.set_ylim(-plot_radius, plot_radius)
-    ax3d.set_zlim(0.0, float(waveform.shape[1] - 1) * float(args.ns_per_bin))
-    ax3d.set_xlabel("x (cm)")
-    ax3d.set_ylabel("y (cm)", labelpad=4)
-    ax3d.set_zlabel("Time (ns)", labelpad=6, fontsize=10)
-    ax3d.view_init(elev=22, azim=-58)
-    ax3d.set_box_aspect((1.0, 1.0, 1.8))
-    ax3d.grid(False)
-    ax3d.tick_params(axis="x", pad=1)
-    ax3d.tick_params(axis="y", pad=1)
-    ax3d.tick_params(axis="z", pad=2)
-    ax3d.set_zticks(np.arange(0, waveform.shape[1] * float(args.ns_per_bin), 2000.0))
-    ax3d.xaxis.pane.fill = False
-    ax3d.yaxis.pane.fill = False
-    ax3d.zaxis.pane.fill = False
-    ax3d.xaxis.pane.set_edgecolor((1, 1, 1, 0))
-    ax3d.yaxis.pane.set_edgecolor((1, 1, 1, 0))
-    ax3d.zaxis.pane.set_edgecolor((1, 1, 1, 0))
+    sc3d = panel_info["scatter"]
+    _, boundary_radius, plot_radius = detector_plot_radii(pmt_xy)
 
     ax_xy.scatter(
         pmt_xy[:, 0],
@@ -256,9 +318,9 @@ def main() -> None:
     print(f"Saved {out_pdf}")
     print(f"Event index: {args.event_idx}")
     print(f"Threshold: {threshold:.4f}")
-    print(f"Active 3D nodes: {int(active_mask.sum())}")
-    print(f"Active PMTs: {active_channels.size}")
-    print(f"Amplitude range: [{float(amplitudes.min()):.4f}, {float(amplitudes.max()):.4f}]")
+    print(f"Active 3D nodes: {panel_info['active_nodes']}")
+    print(f"Active PMTs: {panel_info['active_pmts']}")
+    print(f"Amplitude range: [{panel_info['amplitude_min']:.4f}, {panel_info['amplitude_max']:.4f}]")
 
 
 if __name__ == "__main__":

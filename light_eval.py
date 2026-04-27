@@ -77,6 +77,7 @@ from eval_recon import (
 )
 from lz_data_loader import TritiumSSDataLoader
 from plot_rq_distributions import plot_distributions
+from plot_real_event_3d import plot_waveform_3d_scatter
 from plot_style import COLORS, MODEL_COLORS, apply_style
 
 
@@ -381,6 +382,29 @@ def expand_charge_to_full_detector(charge_subset: np.ndarray, subset_to_full: np
     charge_full = np.zeros(n_full_pmts, dtype=np.float32)
     charge_full[subset_to_full] = np.asarray(charge_subset, dtype=np.float32)
     return charge_full
+
+
+def expand_waveform_to_full_detector(
+    waveform_subset_ct: np.ndarray,
+    subset_to_full: np.ndarray,
+    n_full_pmts: int,
+) -> np.ndarray:
+    waveform_full = np.zeros((n_full_pmts, waveform_subset_ct.shape[1]), dtype=np.float32)
+    waveform_full[subset_to_full] = np.asarray(waveform_subset_ct, dtype=np.float32)
+    return waveform_full
+
+
+def select_nonzero_example_indices(raw_flat: np.ndarray, n_examples: int, seed: int) -> np.ndarray:
+    n_total = raw_flat.shape[0]
+    if n_total == 0:
+        return np.empty((0,), dtype=np.int32)
+    nnz = np.count_nonzero(raw_flat, axis=1)
+    candidates = np.flatnonzero(nnz > 0)
+    if candidates.size == 0:
+        raise ValueError("No nonzero events found in the shared cache.")
+    rng = np.random.default_rng(seed)
+    chosen = rng.choice(candidates, size=min(n_examples, candidates.size), replace=False)
+    return np.sort(chosen.astype(np.int32))
 
 
 def resolve_encoder(ctx: Any) -> nn.Module:
@@ -698,13 +722,9 @@ def plot_full_pmt_reconstruction_triptych(
     n_channels: int,
     n_time: int,
     output_dir: str,
-    n_examples: int,
-    seed: int,
-) -> List[int]:
+    indices: Sequence[int],
+) -> None:
     ensure_dir(output_dir)
-    rng = np.random.default_rng(seed)
-    n_total = raw_flat.shape[0]
-    indices = np.sort(rng.choice(n_total, size=min(n_examples, n_total), replace=False))
     subset_to_full = map_subset_pmts_to_full(subset_xy, full_xy)
     plot_radius = float(np.max(np.linalg.norm(full_xy, axis=1)) * 1.05)
 
@@ -752,7 +772,64 @@ def plot_full_pmt_reconstruction_triptych(
         fig.savefig(os.path.join(output_dir, f"event_{idx:04d}_xy_full.png"), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
-    return [int(i) for i in indices]
+
+def plot_full_pmt_reconstruction_3d_triptych(
+    raw_flat: np.ndarray,
+    diffae_flat: np.ndarray,
+    ae_flat: np.ndarray,
+    subset_xy: np.ndarray,
+    full_xy: np.ndarray,
+    n_channels: int,
+    n_time: int,
+    output_dir: str,
+    indices: Sequence[int],
+    ns_per_bin: float,
+    threshold_quantile: float = 0.95,
+    min_amplitude: Optional[float] = None,
+) -> None:
+    ensure_dir(output_dir)
+    subset_to_full = map_subset_pmts_to_full(subset_xy, full_xy)
+    cmap = plt.get_cmap("viridis")
+
+    for idx in indices:
+        raw_ct = raw_flat[idx].reshape(n_channels, n_time, order="F")
+        diffae_ct = diffae_flat[idx].reshape(n_channels, n_time, order="F")
+        ae_ct = ae_flat[idx].reshape(n_channels, n_time, order="F")
+        waveforms = {
+            "Original": expand_waveform_to_full_detector(raw_ct, subset_to_full, full_xy.shape[0]),
+            "DiffAE": expand_waveform_to_full_detector(diffae_ct, subset_to_full, full_xy.shape[0]),
+            "AE": expand_waveform_to_full_detector(ae_ct, subset_to_full, full_xy.shape[0]),
+        }
+        vmax = max(float(max(np.max(wf), 0.0)) for wf in waveforms.values())
+        norm = Normalize(vmin=0.0, vmax=max(vmax, 1e-8))
+
+        fig = plt.figure(figsize=(14.2, 4.8))
+        axes = [fig.add_subplot(1, 3, i + 1, projection="3d") for i in range(3)]
+        scatter = None
+        for ax, (title, waveform) in zip(axes, waveforms.items()):
+            panel = plot_waveform_3d_scatter(
+                ax,
+                waveform,
+                full_xy,
+                ns_per_bin=ns_per_bin,
+                threshold_quantile=threshold_quantile,
+                min_amplitude=min_amplitude,
+                norm=norm,
+                cmap=cmap,
+                title=title,
+            )
+            scatter = panel["scatter"]
+
+        fig.subplots_adjust(left=0.03, right=0.90, bottom=0.05, top=0.86, wspace=0.06)
+        cax = fig.add_axes([0.92, 0.20, 0.015, 0.56])
+        cbar = fig.colorbar(scatter, cax=cax)
+        cbar.ax.set_ylabel("Amplitude (AU)")
+        fig.suptitle(f"3D Reconstruction Comparison (event {idx})", fontweight="bold")
+        png_path = os.path.join(output_dir, f"event_{idx:04d}_3d_full.png")
+        pdf_path = os.path.join(output_dir, f"event_{idx:04d}_3d_full.pdf")
+        fig.savefig(png_path, dpi=300, bbox_inches="tight")
+        fig.savefig(pdf_path, bbox_inches="tight")
+        plt.close(fig)
 
 
 def node_vector_to_grid(values: np.ndarray, n_channels: int, n_time: int) -> np.ndarray:
@@ -1167,8 +1244,10 @@ def run_full_pmt_reconstruction_examples(
     diffae = load_shared_reconstruction(shared_store, "diffae_light")
     subset_xy = np.asarray(models[0].ctx.loader.channel_positions, dtype=np.float32)
     full_xy = load_pmt_positions(FULL_PMT_XY_PATH)
+    example_indices_arr = select_nonzero_example_indices(raw, n_examples=n_examples, seed=seed)
+    example_indices = [int(i) for i in example_indices_arr]
 
-    example_indices = plot_full_pmt_reconstruction_triptych(
+    plot_full_pmt_reconstruction_triptych(
         raw_flat=raw,
         diffae_flat=diffae,
         ae_flat=ae,
@@ -1177,15 +1256,30 @@ def run_full_pmt_reconstruction_examples(
         n_channels=shared_store.n_channels,
         n_time=shared_store.n_time_points,
         output_dir=out_dir,
-        n_examples=n_examples,
-        seed=seed,
+        indices=example_indices_arr,
+    )
+    plot_full_pmt_reconstruction_3d_triptych(
+        raw_flat=raw,
+        diffae_flat=diffae,
+        ae_flat=ae,
+        subset_xy=subset_xy,
+        full_xy=full_xy,
+        n_channels=shared_store.n_channels,
+        n_time=shared_store.n_time_points,
+        output_dir=out_dir,
+        indices=example_indices_arr,
+        ns_per_bin=default_config.ms_data.ns_per_bin,
     )
 
     summary = {
         "n_examples": int(len(example_indices)),
         "full_pmt_xy_path": os.path.abspath(FULL_PMT_XY_PATH),
         "example_indices": example_indices,
-        "output_pattern": os.path.abspath(os.path.join(out_dir, "event_####_xy_full.png")),
+        "output_patterns": {
+            "xy_full_png": os.path.abspath(os.path.join(out_dir, "event_####_xy_full.png")),
+            "three_d_full_png": os.path.abspath(os.path.join(out_dir, "event_####_3d_full.png")),
+            "three_d_full_pdf": os.path.abspath(os.path.join(out_dir, "event_####_3d_full.pdf")),
+        },
     }
     write_json(os.path.join(out_dir, "summary.json"), summary)
     return summary
