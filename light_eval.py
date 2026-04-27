@@ -233,18 +233,11 @@ def validate_shared_sample_store(
                     f"Shared sample cache is missing dataset '{dataset_name}'. "
                     "Rerun with --regenerate to rebuild the cache."
                 )
-            dataset = f[dataset_name]
-            actual_shape = tuple(int(v) for v in dataset.shape)
+            actual_shape = tuple(int(v) for v in f[dataset_name].shape)
             if actual_shape != expected_shape:
                 raise RuntimeError(
                     f"Shared sample cache dataset '{dataset_name}' has shape {actual_shape}, "
                     f"expected {expected_shape}. Rerun with --regenerate to rebuild the cache."
-                )
-            if dataset.dtype.kind != "f" or dataset.dtype.itemsize < 4:
-                raise RuntimeError(
-                    f"Shared sample cache dataset '{dataset_name}' uses dtype {dataset.dtype}, "
-                    "which is too low-precision for waveform evaluation. "
-                    "Rerun with --regenerate to rebuild the cache."
                 )
 
     if missing_optional_attrs:
@@ -295,17 +288,17 @@ def create_shared_sample_store(
         ).items():
             f.attrs[key] = value
 
-        raw_ds = f.create_dataset("raw", shape=(n_samples, n_nodes, 1), dtype=np.float32)
+        raw_ds = f.create_dataset("raw", shape=(n_samples, n_nodes, 1), dtype=np.float16)
         delta_mu_ds = f.create_dataset("delta_mu", shape=(n_samples,), dtype=np.float32)
         for model in models:
-            f.create_dataset(model.key, shape=(n_samples, n_nodes), dtype=np.float32)
-        f.create_dataset("diffae_light_samples", shape=(diffae_samples, n_samples, n_nodes), dtype=np.float32)
+            f.create_dataset(model.key, shape=(n_samples, n_nodes), dtype=np.float16)
+        f.create_dataset("diffae_light_samples", shape=(diffae_samples, n_samples, n_nodes), dtype=np.float16)
 
         written = 0
         while written < n_samples:
             bs = min(batch_size, n_samples - written)
             wf_col, cond, *_ = ref_ctx.loader.get_batch(bs)
-            raw_ds[written:written + bs] = wf_col.astype(np.float32)
+            raw_ds[written:written + bs] = wf_col.astype(np.float16)
             delta_mu_ds[written:written + bs] = cond[:, 4].astype(np.float32)
 
             for model in models:
@@ -313,11 +306,11 @@ def create_shared_sample_store(
                     diff_samples = []
                     for _ in range(diffae_samples):
                         diff_samples.append(reconstruct_raw_flat_batch(model, wf_col))
-                    diff_stack = np.stack(diff_samples, axis=0).astype(np.float32)
+                    diff_stack = np.stack(diff_samples, axis=0).astype(np.float16)
                     f["diffae_light_samples"][:, written:written + bs, :] = diff_stack
                     f[model.key][written:written + bs] = diff_stack[0]
                 else:
-                    rec = reconstruct_raw_flat_batch(model, wf_col).astype(np.float32)
+                    rec = reconstruct_raw_flat_batch(model, wf_col).astype(np.float16)
                     f[model.key][written:written + bs] = rec
 
             written += bs
