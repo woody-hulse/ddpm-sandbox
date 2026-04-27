@@ -142,7 +142,13 @@ def _hist_range(a: np.ndarray, b: np.ndarray, clip_pct: float = 99.5):
         return None
     lo = np.percentile(finite, 100 - clip_pct)
     hi = np.percentile(finite, clip_pct)
-    margin = max((hi - lo) * 0.05, 1e-8)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return None
+    if hi <= lo:
+        center = float(finite[0])
+        pad = max(abs(center) * 0.05, 1e-3)
+        return (center - pad, center + pad)
+    margin = max((hi - lo) * 0.05, 1e-3)
     return (lo - margin, hi + margin)
 
 

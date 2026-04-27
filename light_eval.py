@@ -52,6 +52,7 @@ import torch
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DIAGNOSE_DIR = os.path.join(ROOT, "diagnose")
+FULL_PMT_XY_PATH = os.path.join(ROOT, "data", "pmt_xy.h5")
 if DIAGNOSE_DIR not in sys.path:
     sys.path.insert(0, DIAGNOSE_DIR)
 
@@ -232,11 +233,18 @@ def validate_shared_sample_store(
                     f"Shared sample cache is missing dataset '{dataset_name}'. "
                     "Rerun with --regenerate to rebuild the cache."
                 )
-            actual_shape = tuple(int(v) for v in f[dataset_name].shape)
+            dataset = f[dataset_name]
+            actual_shape = tuple(int(v) for v in dataset.shape)
             if actual_shape != expected_shape:
                 raise RuntimeError(
                     f"Shared sample cache dataset '{dataset_name}' has shape {actual_shape}, "
                     f"expected {expected_shape}. Rerun with --regenerate to rebuild the cache."
+                )
+            if dataset.dtype.kind != "f" or dataset.dtype.itemsize < 4:
+                raise RuntimeError(
+                    f"Shared sample cache dataset '{dataset_name}' uses dtype {dataset.dtype}, "
+                    "which is too low-precision for waveform evaluation. "
+                    "Rerun with --regenerate to rebuild the cache."
                 )
 
     if missing_optional_attrs:
@@ -287,17 +295,17 @@ def create_shared_sample_store(
         ).items():
             f.attrs[key] = value
 
-        raw_ds = f.create_dataset("raw", shape=(n_samples, n_nodes, 1), dtype=np.float16)
+        raw_ds = f.create_dataset("raw", shape=(n_samples, n_nodes, 1), dtype=np.float32)
         delta_mu_ds = f.create_dataset("delta_mu", shape=(n_samples,), dtype=np.float32)
         for model in models:
-            f.create_dataset(model.key, shape=(n_samples, n_nodes), dtype=np.float16)
-        f.create_dataset("diffae_light_samples", shape=(diffae_samples, n_samples, n_nodes), dtype=np.float16)
+            f.create_dataset(model.key, shape=(n_samples, n_nodes), dtype=np.float32)
+        f.create_dataset("diffae_light_samples", shape=(diffae_samples, n_samples, n_nodes), dtype=np.float32)
 
         written = 0
         while written < n_samples:
             bs = min(batch_size, n_samples - written)
             wf_col, cond, *_ = ref_ctx.loader.get_batch(bs)
-            raw_ds[written:written + bs] = wf_col.astype(np.float16)
+            raw_ds[written:written + bs] = wf_col.astype(np.float32)
             delta_mu_ds[written:written + bs] = cond[:, 4].astype(np.float32)
 
             for model in models:
@@ -305,11 +313,11 @@ def create_shared_sample_store(
                     diff_samples = []
                     for _ in range(diffae_samples):
                         diff_samples.append(reconstruct_raw_flat_batch(model, wf_col))
-                    diff_stack = np.stack(diff_samples, axis=0).astype(np.float16)
+                    diff_stack = np.stack(diff_samples, axis=0).astype(np.float32)
                     f["diffae_light_samples"][:, written:written + bs, :] = diff_stack
                     f[model.key][written:written + bs] = diff_stack[0]
                 else:
-                    rec = reconstruct_raw_flat_batch(model, wf_col).astype(np.float16)
+                    rec = reconstruct_raw_flat_batch(model, wf_col).astype(np.float32)
                     f[model.key][written:written + bs] = rec
 
             written += bs
@@ -347,6 +355,39 @@ def load_shared_diffae_samples(store: SharedSampleStore, n_samples: Optional[int
     n = store.n_samples if n_samples is None else min(n_samples, store.n_samples)
     with h5py.File(store.path, "r") as f:
         return np.asarray(f["diffae_light_samples"][:, :n], dtype=np.float32)
+
+
+def load_pmt_positions(path: str) -> np.ndarray:
+    with h5py.File(path, "r") as f:
+        if "TA_PMTs_xy" in f:
+            xy = np.asarray(f["TA_PMTs_xy"][:], dtype=np.float32)
+            if np.max(np.abs(xy)) > 30.0:
+                xy = xy / 10.0
+            return xy
+        if "xy" in f:
+            return np.asarray(f["xy"][:], dtype=np.float32)
+        raise ValueError(f"No recognized xy dataset in {path}; available keys: {list(f.keys())}")
+
+
+def map_subset_pmts_to_full(subset_xy: np.ndarray, full_xy: np.ndarray, tol: float = 1e-5) -> np.ndarray:
+    mapping = np.empty(subset_xy.shape[0], dtype=np.int32)
+    used: set[int] = set()
+    for i, xy in enumerate(subset_xy):
+        d = np.linalg.norm(full_xy - xy[None, :], axis=1)
+        j = int(np.argmin(d))
+        if float(d[j]) > tol:
+            raise ValueError(f"Could not match subset PMT {i} to full detector geometry within tolerance {tol}.")
+        if j in used:
+            raise ValueError(f"Subset PMT {i} maps to duplicate full-detector index {j}.")
+        mapping[i] = j
+        used.add(j)
+    return mapping
+
+
+def expand_charge_to_full_detector(charge_subset: np.ndarray, subset_to_full: np.ndarray, n_full_pmts: int) -> np.ndarray:
+    charge_full = np.zeros(n_full_pmts, dtype=np.float32)
+    charge_full[subset_to_full] = np.asarray(charge_subset, dtype=np.float32)
+    return charge_full
 
 
 def resolve_encoder(ctx: Any) -> nn.Module:
@@ -655,6 +696,72 @@ def plot_example_reconstructions_generic(
     plt.close(fig2)
 
 
+def plot_full_pmt_reconstruction_triptych(
+    raw_flat: np.ndarray,
+    diffae_flat: np.ndarray,
+    ae_flat: np.ndarray,
+    subset_xy: np.ndarray,
+    full_xy: np.ndarray,
+    n_channels: int,
+    n_time: int,
+    output_dir: str,
+    n_examples: int,
+    seed: int,
+) -> List[int]:
+    ensure_dir(output_dir)
+    rng = np.random.default_rng(seed)
+    n_total = raw_flat.shape[0]
+    indices = np.sort(rng.choice(n_total, size=min(n_examples, n_total), replace=False))
+    subset_to_full = map_subset_pmts_to_full(subset_xy, full_xy)
+    plot_radius = float(np.max(np.linalg.norm(full_xy, axis=1)) * 1.05)
+
+    for idx in indices:
+        raw_ct = raw_flat[idx].reshape(n_channels, n_time, order="F")
+        diffae_ct = diffae_flat[idx].reshape(n_channels, n_time, order="F")
+        ae_ct = ae_flat[idx].reshape(n_channels, n_time, order="F")
+
+        charges = {
+            "Original": expand_charge_to_full_detector(raw_ct.sum(axis=1), subset_to_full, full_xy.shape[0]),
+            "DiffAE": expand_charge_to_full_detector(diffae_ct.sum(axis=1), subset_to_full, full_xy.shape[0]),
+            "AE": expand_charge_to_full_detector(ae_ct.sum(axis=1), subset_to_full, full_xy.shape[0]),
+        }
+        vmax = max(float(charge.max()) for charge in charges.values())
+        vmax = max(vmax, 1e-8)
+
+        fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.1), squeeze=False)
+        axes_row = axes[0]
+        scatter = None
+        for ax, (title, charge) in zip(axes_row, charges.items()):
+            scatter = ax.scatter(
+                full_xy[:, 0],
+                full_xy[:, 1],
+                c=charge,
+                cmap="viridis",
+                vmin=0.0,
+                vmax=vmax,
+                s=54,
+                edgecolors="k",
+                linewidths=0.22,
+            )
+            ax.set_title(title, fontweight="bold")
+            ax.set_aspect("equal")
+            ax.set_xlim(-plot_radius, plot_radius)
+            ax.set_ylim(-plot_radius, plot_radius)
+            ax.set_xlabel("x (cm)")
+            ax.set_ylabel("y (cm)")
+            ax.grid(False)
+
+        fig.subplots_adjust(left=0.06, right=0.90, bottom=0.12, top=0.86, wspace=0.22)
+        cax = fig.add_axes([0.92, 0.20, 0.015, 0.60])
+        cbar = fig.colorbar(scatter, cax=cax)
+        cbar.ax.set_ylabel("Integrated charge")
+        fig.suptitle(f"Reconstruction Comparison (event {idx})", fontweight="bold")
+        fig.savefig(os.path.join(output_dir, f"event_{idx:04d}_xy_full.png"), dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    return [int(i) for i in indices]
+
+
 def node_vector_to_grid(values: np.ndarray, n_channels: int, n_time: int) -> np.ndarray:
     return np.asarray(values, dtype=np.float32).reshape(n_channels, n_time, order="F")
 
@@ -671,7 +778,7 @@ def plot_node_metric_triptych(
 ) -> None:
     ensure_dir(os.path.dirname(output_path) or ".")
     arrays = [node_vector_to_grid(values, n_channels, n_time) for _, values in panels]
-    fig, axes = plt.subplots(1, len(panels), figsize=(5.0 * len(panels), 4.0), squeeze=False)
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), 4.0), squeeze=False)
     axes_row = axes[0]
 
     vmin = min(float(arr.min()) for arr in arrays)
@@ -689,10 +796,11 @@ def plot_node_metric_triptych(
         ax.set_ylabel("Channel")
         ax.grid(False)
 
-    cbar = fig.colorbar(images[-1], ax=axes_row.tolist(), shrink=0.82, pad=0.03)
+    fig.subplots_adjust(left=0.06, right=0.90, bottom=0.10, top=0.86, wspace=0.26)
+    cax = fig.add_axes([0.92, 0.22, 0.015, 0.56])
+    cbar = fig.colorbar(images[-1], cax=cax)
     cbar.ax.set_ylabel(colorbar_label)
     fig.suptitle(suptitle, fontweight="bold")
-    fig.subplots_adjust(left=0.06, right=0.94, bottom=0.10, top=0.86, wspace=0.26)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -1045,6 +1153,47 @@ def run_latent_delta_mu(
         knn_k=knn_k,
     )
     summary = {"n_samples": n_samples, "dataset": "shared_ms_cache", "method": method, "models": stats}
+    write_json(os.path.join(out_dir, "summary.json"), summary)
+    return summary
+
+
+def run_full_pmt_reconstruction_examples(
+    models: Sequence[LoadedLightModel],
+    shared_store: SharedSampleStore,
+    out_dir: str,
+    n_examples: int,
+    seed: int,
+) -> Dict[str, Any]:
+    ensure_dir(out_dir)
+    model_map = {model.display_name: model for model in models}
+    if "AE" not in model_map or "DiffAE" not in model_map:
+        raise RuntimeError("Full-PMT reconstruction comparison requires both AE and DiffAE models.")
+
+    raw = load_shared_raw(shared_store)[:, :, 0]
+    ae = load_shared_reconstruction(shared_store, "ae_light")
+    diffae = load_shared_reconstruction(shared_store, "diffae_light")
+    subset_xy = np.asarray(models[0].ctx.loader.channel_positions, dtype=np.float32)
+    full_xy = load_pmt_positions(FULL_PMT_XY_PATH)
+
+    example_indices = plot_full_pmt_reconstruction_triptych(
+        raw_flat=raw,
+        diffae_flat=diffae,
+        ae_flat=ae,
+        subset_xy=subset_xy,
+        full_xy=full_xy,
+        n_channels=shared_store.n_channels,
+        n_time=shared_store.n_time_points,
+        output_dir=out_dir,
+        n_examples=n_examples,
+        seed=seed,
+    )
+
+    summary = {
+        "n_examples": int(len(example_indices)),
+        "full_pmt_xy_path": os.path.abspath(FULL_PMT_XY_PATH),
+        "example_indices": example_indices,
+        "output_pattern": os.path.abspath(os.path.join(out_dir, "event_####_xy_full.png")),
+    }
     write_json(os.path.join(out_dir, "summary.json"), summary)
     return summary
 
@@ -1483,6 +1632,7 @@ def run_anomaly_probe(
         anomaly_scores,
         fit_reduce,
         make_anomaly,
+        plot_anomaly_examples,
         print_score_table,
         scatter_plot,
         to_flat,
@@ -1527,6 +1677,8 @@ def run_anomaly_probe(
         [make_anomaly(wf_base, channel_pos, atype, xc=xc_base, yc=yc_base, rqs=rqs_base) for atype in proto_types],
         axis=0,
     )
+    proto_wfs = {atype: wf_protos[i] for i, atype in enumerate(proto_types)}
+    plot_anomaly_examples(wf_base, proto_wfs, channel_pos, out_dir)
 
     rq_real_dict = collect_rqs(wf_flat_all, n_channels, n_time)
     rq_proto_dict = collect_rqs(to_flat(wf_protos), n_channels, n_time)
@@ -1583,6 +1735,10 @@ def run_anomaly_probe(
         "n_events": n_events_loaded,
         "perplexity": perplexity,
         "scores": score_summary,
+        "example_plots": {
+            "spatial": os.path.abspath(os.path.join(out_dir, "anomaly_examples_spatial.png")),
+            "temporal": os.path.abspath(os.path.join(out_dir, "anomaly_examples_temporal.png")),
+        },
     }
     write_json(os.path.join(out_dir, "summary.json"), summary)
     return summary
@@ -1651,6 +1807,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--shared-samples", type=int, default=8192, help="Number of cached MS events to generate once up front.")
     parser.add_argument("--recon-events", type=int, default=2048)
+    parser.add_argument("--recon-compare-examples", type=int, default=6, help="Full-PMT reconstruction comparison figures to save.")
     parser.add_argument("--diffae-samples", type=int, default=4, help="Independent DiffAE Light samples per event for stochasticity metrics.")
     parser.add_argument("--rq-samples", type=int, default=500)
     parser.add_argument("--rq-examples", type=int, default=6)
@@ -1674,6 +1831,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--node-chunk-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-recon", action="store_true")
+    parser.add_argument("--skip-recon-compare", action="store_true")
     parser.add_argument("--skip-rq", action="store_true")
     parser.add_argument("--skip-latent", action="store_true")
     parser.add_argument("--skip-latent-sampling", action="store_true")
@@ -1749,6 +1907,22 @@ def main() -> None:
                 shared_store=shared_store,
                 out_dir=out_dir,
                 n_events=args.recon_events,
+            ),
+        )
+
+    if not args.skip_recon_compare:
+        out_dir = os.path.join(output_root, "reconstruction_examples_full_pmt")
+        run_experiment(
+            summary,
+            summary_path,
+            "reconstruction_examples_full_pmt",
+            out_dir,
+            lambda: run_full_pmt_reconstruction_examples(
+                models=models,
+                shared_store=shared_store,
+                out_dir=out_dir,
+                n_examples=args.recon_compare_examples,
+                seed=args.seed,
             ),
         )
 

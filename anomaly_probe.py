@@ -81,6 +81,27 @@ PLOT_DPI = 300
 # Spatial weight helpers
 # ---------------------------------------------------------------------------
 
+SPATIAL_BLEND = {
+    "uniform": 0.22,
+    "peripheral": 0.28,
+    "single_pmt": 0.35,
+    "checkerboard": 0.24,
+}
+
+TEMPORAL_BLEND = {
+    "square_wave": 0.28,
+    "smooth_gaussian": 0.20,
+    "pmt_saturation": 0.22,
+    "diffusion_smear": 0.20,
+    "delayed_echo": 0.18,
+    "stretched_tail": 0.18,
+}
+
+
+def _trapz(y: np.ndarray, x: np.ndarray) -> float:
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    return float(trapz(y, x))
+
 def compute_spatial_weights(
     channel_positions: np.ndarray,
     mode: str,
@@ -90,25 +111,31 @@ def compute_spatial_weights(
     C = len(channel_positions)
     center = channel_positions.mean(axis=0)
     radii  = np.linalg.norm(channel_positions - center, axis=1)
+    radial_scale = max(float(np.std(radii)), 1e-6)
 
     if mode == "uniform":
         w = np.ones(C, dtype=np.float32)
 
     elif mode == "peripheral":
         thr = np.percentile(radii, 75.0)
-        w   = (radii >= thr).astype(np.float32)
+        logits = (radii - thr) / (0.75 * radial_scale)
+        w = 1.0 / (1.0 + np.exp(-logits))
+        w = 0.6 + 0.8 * w
 
     elif mode == "single_pmt":
-        w = np.zeros(C, dtype=np.float32)
-        w[int(np.argmin(radii))] = 1.0
-        return w
+        anchor_idx = int(np.argmin(radii))
+        d_anchor = np.linalg.norm(channel_positions - channel_positions[anchor_idx], axis=1)
+        sigma = max(float(np.percentile(d_anchor[d_anchor > 0], 35.0)), 1e-3) if np.any(d_anchor > 0) else 1.0
+        hotspot = np.exp(-0.5 * (d_anchor / sigma) ** 2)
+        w = 0.55 + 0.90 * hotspot
 
     elif mode == "checkerboard":
         angles = np.arctan2(channel_positions[:, 1] - center[1],
                             channel_positions[:, 0] - center[0])
         idx = np.argsort(angles)
-        w   = np.zeros(C, dtype=np.float32)
-        w[idx[0::2]] = 1.0
+        w = np.ones(C, dtype=np.float32)
+        w[idx[0::2]] = 1.22
+        w[idx[1::2]] = 0.78
 
     else:
         raise ValueError(f"Unknown spatial mode: {mode!r}")
@@ -124,8 +151,13 @@ def make_spatial_anomaly(
     xc: float = 0.0,
     yc: float = 0.0,
 ) -> np.ndarray:
-    z = wf_ct.sum(axis=0)
-    w = compute_spatial_weights(channel_positions, mode, xc, yc)
+    z = wf_ct.sum(axis=0).astype(np.float32)
+    total = float(wf_ct.sum())
+    ch_real = wf_ct.sum(axis=1) / total if total > 1e-8 else np.ones(wf_ct.shape[0], dtype=np.float32) / wf_ct.shape[0]
+    w_target = compute_spatial_weights(channel_positions, mode, xc, yc)
+    alpha = SPATIAL_BLEND.get(mode, 0.25)
+    w = (1.0 - alpha) * ch_real + alpha * w_target
+    w = w / np.clip(w.sum(), 1e-8, None)
     return (w[:, None] * z[None, :]).astype(np.float32)
 
 
@@ -144,45 +176,46 @@ def _make_temporal_zprofile(
     amp      = float(rqs["peak_amplitude"])
     integral = float(rqs["total_integral"])
     fwhm     = max(float(rqs["fwhm"]), 4.0)
+    z_base = z_real.astype(np.float64) if z_real is not None else None
 
     if mode == "square_wave":
         half_w = fwhm / 2.0
-        tau    = 1.5
+        tau    = 2.4
         rise   = 1.0 / (1.0 + np.exp(-(t - (pt - half_w)) / tau))
         fall   = 1.0 / (1.0 + np.exp( (t - (pt + half_w)) / tau))
         z      = amp * rise * fall
         z = np.clip(z, 0.0, None)
-        cur = float(np.trapz(z, t))
+        cur = _trapz(z, t)
         if cur > 1e-8:
             z *= integral / cur
 
     elif mode == "smooth_gaussian":
         sigma = integral / (amp * np.sqrt(2.0 * np.pi) + 1e-8)
-        sigma = max(sigma, 2.0)
+        sigma = max(sigma, 3.0)
         z     = amp * np.exp(-0.5 * ((t - pt) / sigma) ** 2)
         z = np.clip(z, 0.0, None)
-        cur = float(np.trapz(z, t))
+        cur = _trapz(z, t)
         if cur > 1e-8:
             z *= integral / cur
 
     elif mode == "pmt_saturation":
         assert z_real is not None
-        sat_level = 0.85 * float(z_real.max())
+        sat_level = 0.93 * float(z_real.max())
         z = np.minimum(z_real.astype(np.float64), sat_level)
         z = np.clip(z, 0.0, None)
-        cur = float(np.trapz(z, t))
+        cur = _trapz(z, t)
         if cur > 1e-8:
             z *= integral / cur
 
     elif mode == "diffusion_smear":
         assert z_real is not None
-        z = gaussian_filter1d(z_real.astype(np.float64), sigma=12.0)
+        z = gaussian_filter1d(z_real.astype(np.float64), sigma=5.0)
         z = np.clip(z, 0.0, None)
 
     elif mode == "delayed_echo":
         assert z_real is not None
-        delay     = 28
-        echo_frac = 0.07
+        delay     = min(18, max(6, T // 8))
+        echo_frac = 0.03
         echo      = np.zeros(T, dtype=np.float64)
         echo[delay:] = z_real[:-delay].astype(np.float64) * echo_frac
         z = z_real.astype(np.float64) + echo
@@ -193,10 +226,10 @@ def _make_temporal_zprofile(
         t_arr    = np.arange(T, dtype=np.float64)
         peak_loc = int(np.argmax(z_real))
         peak_amp = float(z_real[peak_loc])
-        tau_slow = 70.0
+        tau_slow = 45.0
         tail     = np.where(
             t_arr > peak_loc,
-            0.12 * peak_amp * np.exp(-(t_arr - peak_loc) / tau_slow),
+            0.05 * peak_amp * np.exp(-(t_arr - peak_loc) / tau_slow),
             0.0,
         )
         z = z_real.astype(np.float64) + tail
@@ -205,6 +238,14 @@ def _make_temporal_zprofile(
     else:
         raise ValueError(f"Unknown temporal mode: {mode!r}")
 
+    if z_base is not None:
+        alpha = TEMPORAL_BLEND.get(mode, 0.2)
+        z = (1.0 - alpha) * z_base + alpha * z
+    if z_base is not None:
+        target_integral = _trapz(z_base, t)
+        cur = _trapz(z, t)
+        if cur > 1e-8 and target_integral > 0:
+            z *= target_integral / cur
     return z.astype(np.float32)
 
 
@@ -229,6 +270,53 @@ def make_anomaly(
         return make_spatial_anomaly(wf_ct, channel_positions, mode, xc, yc)
     assert rqs is not None
     return make_temporal_anomaly(wf_ct, mode, rqs)
+
+
+def plot_anomaly_examples(
+    wf_base: np.ndarray,
+    proto_wfs: dict[str, np.ndarray],
+    channel_positions: np.ndarray,
+    output_dir: str,
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+
+    def _plot_family(modes: list[str], title: str, filename: str) -> None:
+        entries = [("base", "Base event", wf_base)] + [(mode, ANOMALY_LABELS[mode], proto_wfs[mode]) for mode in modes]
+        fig, axes = plt.subplots(len(entries), 2, figsize=(11, 2.9 * len(entries)), squeeze=False)
+        for row, (_, label, wf_ct) in enumerate(entries):
+            charge = wf_ct.sum(axis=1)
+            trace = wf_ct.sum(axis=0)
+
+            ax_xy = axes[row, 0]
+            sc = ax_xy.scatter(
+                channel_positions[:, 0],
+                channel_positions[:, 1],
+                c=charge,
+                cmap="viridis",
+                s=64,
+                edgecolors="k",
+                linewidths=0.2,
+            )
+            ax_xy.set_aspect("equal")
+            ax_xy.set_title(f"{label} charge map", fontweight="bold")
+            ax_xy.set_xlabel("x (cm)")
+            ax_xy.set_ylabel("y (cm)")
+            fig.colorbar(sc, ax=ax_xy, fraction=0.046, pad=0.04, label="Integrated charge")
+
+            ax_t = axes[row, 1]
+            ax_t.plot(np.arange(trace.shape[0]), trace, color=COLORS["truth"], linewidth=1.4)
+            ax_t.fill_between(np.arange(trace.shape[0]), trace, color=COLORS["truth"], alpha=0.10)
+            ax_t.set_title(f"{label} summed waveform", fontweight="bold")
+            ax_t.set_xlabel("Time bin")
+            ax_t.set_ylabel("Amplitude")
+
+        fig.suptitle(title, fontweight="bold")
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+        fig.savefig(os.path.join(output_dir, filename), dpi=PLOT_DPI, bbox_inches="tight")
+        plt.close(fig)
+
+    _plot_family(SPATIAL_TYPES, "Spatial anomaly prototypes", "anomaly_examples_spatial.png")
+    _plot_family(TEMPORAL_TYPES, "Temporal anomaly prototypes", "anomaly_examples_temporal.png")
 
 
 # ---------------------------------------------------------------------------
