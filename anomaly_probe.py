@@ -40,7 +40,7 @@ from config import default_config
 from diffae import DiffAEContext
 from graphae import GraphAEContext
 from compare_rqs import collect_rqs, compute_rqs, wf_to_z_profile
-from plot_style import apply_style, COLORS
+from plot_style import apply_style, COLORS, compact_layout
 
 apply_style()
 
@@ -260,17 +260,22 @@ def plot_anomaly_examples(
 
     def _plot_family(modes: list[str], title: str, filename: str) -> None:
         entries = [("base", "Base event", wf_base)] + [(mode, ANOMALY_LABELS[mode], proto_wfs[mode]) for mode in modes]
-        fig, axes = plt.subplots(len(entries), 2, figsize=(11, 2.9 * len(entries)), squeeze=False)
+        fig, axes = plt.subplots(len(entries), 2, figsize=(10.1, 2.45 * len(entries)), squeeze=False)
+        vmax = max(float(wf_ct.sum(axis=1).max()) for _, _, wf_ct in entries)
+        vmax = max(vmax, 1e-8)
+        scatter = None
         for row, (_, label, wf_ct) in enumerate(entries):
             charge = wf_ct.sum(axis=1)
             trace = wf_ct.sum(axis=0)
 
             ax_xy = axes[row, 0]
-            sc = ax_xy.scatter(
+            scatter = ax_xy.scatter(
                 channel_positions[:, 0],
                 channel_positions[:, 1],
                 c=charge,
                 cmap="viridis",
+                vmin=0.0,
+                vmax=vmax,
                 s=64,
                 edgecolors="k",
                 linewidths=0.2,
@@ -279,7 +284,7 @@ def plot_anomaly_examples(
             ax_xy.set_title(f"{label} charge map", fontweight="bold")
             ax_xy.set_xlabel("x (cm)")
             ax_xy.set_ylabel("y (cm)")
-            fig.colorbar(sc, ax=ax_xy, fraction=0.046, pad=0.04, label="Integrated charge")
+            ax_xy.grid(False)
 
             ax_t = axes[row, 1]
             ax_t.plot(np.arange(trace.shape[0]), trace, color=COLORS["truth"], linewidth=1.4)
@@ -288,8 +293,11 @@ def plot_anomaly_examples(
             ax_t.set_xlabel("Time bin")
             ax_t.set_ylabel("Amplitude")
 
-        fig.suptitle(title, fontweight="bold")
-        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+        fig.subplots_adjust(left=0.07, right=0.91, bottom=0.06, top=0.91, wspace=0.26, hspace=0.34)
+        cax = fig.add_axes([0.925, 0.18, 0.014, 0.66])
+        cbar = fig.colorbar(scatter, cax=cax)
+        cbar.ax.set_ylabel("Integrated charge")
+        fig.suptitle(title, fontweight="bold", y=0.965)
         fig.savefig(os.path.join(output_dir, filename), dpi=PLOT_DPI, bbox_inches="tight")
         plt.close(fig)
 
@@ -433,7 +441,7 @@ def anomaly_heatmap(
     data = np.column_stack(valid_arrays)                        # (n_types, n_spaces)
 
     n_types, n_spaces = data.shape
-    fig, ax = plt.subplots(figsize=(2.4 + 1.8 * n_spaces, 0.45 * n_types + 1.2))
+    fig, ax = plt.subplots(figsize=(2.15 + 1.55 * n_spaces, 0.42 * n_types + 1.0))
 
     im = ax.imshow(data, aspect="auto", cmap="YlOrRd", vmin=0, vmax=100)
 
@@ -460,7 +468,7 @@ def anomaly_heatmap(
     n_spatial = sum(1 for t in ANOMALY_TYPES if t[3] == "spatial")
     ax.axhline(n_spatial - 0.5, color="white", linewidth=2)
 
-    plt.tight_layout()
+    compact_layout(fig)
     fig.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  {os.path.basename(path)}")
@@ -514,7 +522,7 @@ def scatter_plot(
     """
     Grey in-distribution cloud + red anomaly dots (single "Anomaly" legend entry).
     """
-    fig, ax = plt.subplots(figsize=(6, 5))
+    fig, ax = plt.subplots(figsize=(5.45, 4.45))
 
     ax.scatter(
         Z_real_2d[:, 0], Z_real_2d[:, 1],
@@ -534,7 +542,7 @@ def scatter_plot(
     ax.legend(fontsize=9, markerscale=1.4, loc="best",
               handlelength=0.8, borderpad=0.5)
 
-    plt.tight_layout()
+    compact_layout(fig)
     fig.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  {os.path.basename(path)}")

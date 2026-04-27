@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.stats import ks_2samp
 
-from plot_style import apply_style, COLORS
+from plot_style import apply_style, COLORS, compact_layout
 from config import default_config, get_config
 from graphae import GraphAEContext, reconstruct_graphae
 from diffae import DiffAEContext, sample_diffae
@@ -168,7 +168,12 @@ def plot_distributions(
     n_rqs    = len(rq_names)
     n_rows   = (n_rqs + N_COLS - 1) // N_COLS
 
-    fig, axes = plt.subplots(n_rows, N_COLS, figsize=(4.5 * N_COLS, 3.5 * n_rows), squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows,
+        N_COLS,
+        figsize=(4.0 * N_COLS, 3.0 * n_rows),
+        squeeze=False,
+    )
 
     for idx, rq_name in enumerate(rq_names):
         row, col = divmod(idx, N_COLS)
@@ -207,12 +212,12 @@ def plot_distributions(
         axes[row][col].set_visible(False)
 
     if title:
-        fig.suptitle(title, fontsize=13, fontweight="bold", y=0.99)
+        fig.suptitle(title, fontsize=13, fontweight="bold", y=0.985)
 
     if title:
-        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+        compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
     else:
-        fig.tight_layout()
+        compact_layout(fig)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fig.savefig(output_path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)

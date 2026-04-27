@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import default_config, get_config
 from lz_data_loader import shift_waveform_2d
-from plot_style import apply_style, COLORS
+from plot_style import apply_style, COLORS, compact_layout
 
 apply_style()
 
@@ -226,7 +226,7 @@ MS_COLOR = COLORS["diffae"]  # red   — MS (variable-shift co-addition)
 def plot_scatter(panels, ss_shift, delta_max, method_label, out_path, point_size=3.0):
     """One scatter panel per model, coloured by SS (blue) vs MS (red)."""
     n = len(panels)
-    fig, axes = plt.subplots(1, n, figsize=(5.5 * n + 0.5, 5.5), squeeze=False)
+    fig, axes = plt.subplots(1, n, figsize=(4.85 * n + 0.35, 4.95), squeeze=False)
     axes = axes[0]
 
     for ax, (name, emb, labels, te_acc) in zip(axes, panels):
@@ -259,8 +259,9 @@ def plot_scatter(panels, ss_shift, delta_max, method_label, out_path, point_size
     fig.suptitle(
         f"{method_label} of AE and DiffAE latents for SS vs MS events",
         fontweight="bold",
+        y=0.985,
     )
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -276,7 +277,7 @@ def plot_probe_bar(results, out_path):
                for m in models]
 
     x = np.arange(len(models))
-    fig, ax = plt.subplots(figsize=(max(4, len(models) * 2), 4))
+    fig, ax = plt.subplots(figsize=(max(3.8, len(models) * 1.7), 3.6))
     ax.bar(x - 0.18, tr_accs, width=0.34, color=colors, alpha=0.5, label="Train")
     ax.bar(x + 0.18, te_accs, width=0.34, color=colors, alpha=0.85, label="Test")
     ax.axhline(0.5, color="#888", linestyle="--", linewidth=0.8, label="Chance")
@@ -286,7 +287,7 @@ def plot_probe_bar(results, out_path):
     ax.set_ylim(0.4, 1.05)
     ax.set_title("SS vs MS probe accuracy", fontweight="bold")
     ax.legend(fontsize=8)
-    fig.tight_layout()
+    compact_layout(fig)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)

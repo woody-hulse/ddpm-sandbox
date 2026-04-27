@@ -31,7 +31,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Circle
 
 from config import default_config
-from plot_style import apply_style
+from plot_style import apply_style, compact_layout
 
 FULL_TRITIUM_PATH = "data/tritium_ss.h5"
 FULL_PMT_PATH = "data/pmt_xy.h5"
@@ -233,11 +233,11 @@ def main() -> None:
     out_png = output_dir / f"{stem}.png"
     out_pdf = output_dir / f"{stem}.pdf"
 
-    fig = plt.figure(figsize=(8.0, 7.0))
+    fig = plt.figure(figsize=(7.4, 6.2))
     gs = GridSpec(
         1, 2, figure=fig,
         width_ratios=[0.78, 1.0],
-        left=0.06, right=0.90, bottom=0.10, top=0.86, wspace=0.24,
+        left=0.06, right=0.90, bottom=0.08, top=0.89, wspace=0.18,
     )
     ax3d = fig.add_subplot(gs[0, 0], projection="3d")
     ax_xy = fig.add_subplot(gs[0, 1])
@@ -307,11 +307,13 @@ def main() -> None:
         fontsize=11,
     )
 
-    cbar = fig.colorbar(sc3d, ax=[ax3d, ax_xy], fraction=0.022, pad=0.018, shrink=0.86)
+    cbar = fig.colorbar(sc3d, ax=[ax3d, ax_xy], fraction=0.022, pad=0.012, shrink=0.88)
     cbar.set_label("Amplitude (AU)")
 
-    fig.savefig(out_png, dpi=args.dpi)
-    fig.savefig(out_pdf)
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.985), pad=0.25, h_pad=0.25, w_pad=0.25)
+
+    fig.savefig(out_png, dpi=args.dpi, bbox_inches="tight")
+    fig.savefig(out_pdf, bbox_inches="tight")
     plt.close(fig)
 
     print(f"Saved {out_png}")

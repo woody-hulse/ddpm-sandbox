@@ -45,7 +45,7 @@ from diffae import DiffAEContext, sample_diffae
 from diffusion.schedule import build_cosine_schedule
 from graphae import GraphAEContext, reconstruct_graphae  # type: ignore[import]
 from lz_data_loader import TritiumSSDataLoader
-from plot_style import apply_style, COLORS, MODEL_COLORS  # noqa: F401
+from plot_style import apply_style, COLORS, MODEL_COLORS, compact_layout  # noqa: F401
 
 try:
     from skimage.metrics import structural_similarity as _ssim_fn
@@ -435,8 +435,11 @@ def plot_results(
     n_metrics = len(metric_keys)
     n_cols_h = min(5, n_metrics)
     n_rows_h = (n_metrics + n_cols_h - 1) // n_cols_h
-    fig, axes = plt.subplots(n_rows_h, n_cols_h,
-                             figsize=(4.5 * n_cols_h, 3.2 * n_rows_h))
+    fig, axes = plt.subplots(
+        n_rows_h,
+        n_cols_h,
+        figsize=(4.0 * n_cols_h, 2.85 * n_rows_h),
+    )
     axes_flat = np.array(axes).flatten()
     metric_labels = {
         "mse": "MSE", "mae": "MAE",
@@ -461,8 +464,8 @@ def plot_results(
         ax.legend()
     for ax in axes_flat[n_metrics:]:
         ax.set_visible(False)
-    fig.suptitle("Per-sample reconstruction metric distributions", fontweight="bold")
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.suptitle("Per-sample reconstruction metric distributions", fontweight="bold", y=0.985)
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
     fig.savefig(os.path.join(output_dir, "metric_histograms.png"), dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -470,9 +473,12 @@ def plot_results(
     true_marg = physics_marginals(true_2d, channel_positions, ns_per_bin)
     scatter_keys = ["total_charge", "peak_time_ns"]
     scatter_labels = {"total_charge": "Total charge (a.u.)", "peak_time_ns": "Peak time (ns)"}
-    fig, axes = plt.subplots(len(models), len(scatter_keys),
-                             figsize=(4.8 * len(scatter_keys), 4.0 * len(models)),
-                             squeeze=False)
+    fig, axes = plt.subplots(
+        len(models),
+        len(scatter_keys),
+        figsize=(4.35 * len(scatter_keys), 3.55 * len(models)),
+        squeeze=False,
+    )
     for row, m in enumerate(models):
         rec_marg = physics_marginals(rec_2d_dict[m], channel_positions, ns_per_bin)
         for col_idx, key in enumerate(scatter_keys):
@@ -486,7 +492,7 @@ def plot_results(
             ax.set_ylabel(f"Reconstructed {scatter_labels[key]}")
             ax.set_title(m)
             ax.set_aspect("equal", adjustable="box")
-    fig.tight_layout()
+    compact_layout(fig)
     fig.savefig(os.path.join(output_dir, "physics_marginals.png"), dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -501,8 +507,11 @@ def plot_results(
     # Pre-compute per-model marginals once so we can derive shared bins per key
     rec_margs = {m: physics_marginals(rec_2d_dict[m], channel_positions, ns_per_bin)
                  for m in models}
-    fig, axes = plt.subplots(1, len(marginal_keys),
-                             figsize=(4.2 * len(marginal_keys), 3.8))
+    fig, axes = plt.subplots(
+        1,
+        len(marginal_keys),
+        figsize=(3.85 * len(marginal_keys), 3.35),
+    )
     if len(marginal_keys) == 1:
         axes = [axes]
     for ax, key in zip(axes, marginal_keys):
@@ -518,8 +527,8 @@ def plot_results(
         ax.set_xlabel(marg_labels.get(key, key))
         ax.set_ylabel("Density")
         ax.legend(handlelength=1.2)
-    fig.suptitle("Marginal distributions: truth vs. reconstructions", fontweight="bold")
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.suptitle("Marginal distributions: truth vs. reconstructions", fontweight="bold", y=0.985)
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
     fig.savefig(os.path.join(output_dir, "marginal_distributions.png"), dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -531,7 +540,12 @@ def plot_results(
             stoch_by_model = stoch_metrics
 
         stoch_models = list(stoch_by_model.keys())
-        fig, axes = plt.subplots(len(stoch_models), 2, figsize=(9.5, 3.7 * len(stoch_models)), squeeze=False)
+        fig, axes = plt.subplots(
+            len(stoch_models),
+            2,
+            figsize=(8.75, 3.2 * len(stoch_models)),
+            squeeze=False,
+        )
 
         for row, model_name in enumerate(stoch_models):
             metrics = stoch_by_model[model_name]
@@ -557,7 +571,7 @@ def plot_results(
             ax_disp.set_title(f"{model_name} charge-dispersion ratio")
             ax_disp.legend()
 
-        fig.tight_layout()
+        compact_layout(fig)
         fig.savefig(os.path.join(output_dir, "stochasticity_comparison.png"), dpi=PLOT_DPI, bbox_inches="tight")
         fig.savefig(os.path.join(output_dir, "diffae_stochasticity.png"), dpi=PLOT_DPI, bbox_inches="tight")
         plt.close(fig)

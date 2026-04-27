@@ -56,13 +56,13 @@ def apply_style() -> None:
         "font.size":          10,
         "axes.labelsize":     11,
         "axes.titlesize":     11,
-        "figure.titlesize":   13,
+        "figure.titlesize":   12,
         "legend.fontsize":    9,
         "xtick.labelsize":    9,
         "ytick.labelsize":    9,
         "mathtext.fontset":   "dejavusans",
-        "axes.titlepad":      8,
-        "axes.labelpad":      4,
+        "axes.titlepad":      6,
+        "axes.labelpad":      3,
 
         # --- axes ---
         "axes.spines.top":    False,
@@ -97,14 +97,29 @@ def apply_style() -> None:
         "legend.framealpha":  0.95,
         "legend.edgecolor":   "0.8",
         "legend.fancybox":    False,
-        "legend.borderpad":   0.4,
+        "legend.borderpad":   0.3,
 
         # --- saving ---
         "figure.dpi":         150,
         "savefig.dpi":        300,
         "savefig.bbox":       "tight",
-        "savefig.pad_inches": 0.05,
+        "savefig.pad_inches": 0.025,
         "pdf.fonttype":       42,
         "ps.fonttype":        42,
         "svg.fonttype":       "none",
     })
+
+
+def compact_layout(
+    fig,
+    *,
+    rect: tuple[float, float, float, float] | None = None,
+    pad: float = 0.35,
+    h_pad: float = 0.45,
+    w_pad: float = 0.45,
+) -> None:
+    """Apply a tighter paper-oriented layout without changing plot semantics."""
+    kwargs = {"pad": pad, "h_pad": h_pad, "w_pad": w_pad}
+    if rect is not None:
+        kwargs["rect"] = rect
+    fig.tight_layout(**kwargs)

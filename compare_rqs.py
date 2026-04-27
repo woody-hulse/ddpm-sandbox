@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats as sp_stats
 from tqdm import tqdm
-from plot_style import apply_style, COLORS, MODEL_COLORS
+from plot_style import apply_style, COLORS, MODEL_COLORS, compact_layout
 
 from config import Config, default_config, get_config
 from lz_data_loader import OnlineMSBatcher
@@ -154,7 +154,7 @@ def plot_rq_comparison(
         unit = RQ_UNITS.get(rq_name, '')
         display_name = rq_name.replace('_', ' ').title()
 
-        fig, axes = plt.subplots(2, n_models, figsize=(4.5 * n_models, 7), squeeze=False)
+        fig, axes = plt.subplots(2, n_models, figsize=(4.0 * n_models, 6.1), squeeze=False)
 
         all_vals = [true_vals]
         for mname in model_names:
@@ -223,16 +223,19 @@ def plot_rq_comparison(
             ax_res.set_xlim(-resid_xlim, resid_xlim)
             ax_res.legend()
 
-        fig.suptitle(display_name, fontsize=14, fontweight='bold', y=0.99)
-        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+        fig.suptitle(display_name, fontsize=14, fontweight='bold', y=0.985)
+        compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
         fig.savefig(os.path.join(output_dir, f'rq_{rq_name}.png'), dpi=PLOT_DPI, bbox_inches='tight')
         plt.close(fig)
 
     n_rqs = len(rq_names)
     n_cols_vio = 4
     n_rows_vio = (n_rqs + n_cols_vio - 1) // n_cols_vio
-    fig_vio, axes_vio = plt.subplots(n_rows_vio, n_cols_vio,
-                                     figsize=(4.2 * n_cols_vio, 3.5 * n_rows_vio))
+    fig_vio, axes_vio = plt.subplots(
+        n_rows_vio,
+        n_cols_vio,
+        figsize=(3.75 * n_cols_vio, 3.0 * n_rows_vio),
+    )
     axes_flat = np.array(axes_vio).flatten()
 
     for idx, rq_name in enumerate(rq_names):
@@ -281,8 +284,8 @@ def plot_rq_comparison(
     for idx in range(n_rqs, len(axes_flat)):
         axes_flat[idx].set_visible(False)
 
-    fig_vio.suptitle('Absolute Error Distribution per Reduced Quantity', y=0.99, fontweight='bold')
-    fig_vio.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig_vio.suptitle('Absolute Error Distribution per Reduced Quantity', y=0.985, fontweight='bold')
+    compact_layout(fig_vio, rect=(0.0, 0.0, 1.0, 0.965))
     fig_vio.savefig(os.path.join(output_dir, 'rq_error_summary.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig_vio)
 
@@ -319,9 +322,12 @@ def plot_example_reconstructions(
 
     time_axis = np.arange(n_time)
 
-    fig, axes = plt.subplots(len(indices), n_cols,
-                             figsize=(3.8 * n_cols, 2.2 * len(indices)),
-                             squeeze=False)
+    fig, axes = plt.subplots(
+        len(indices),
+        n_cols,
+        figsize=(3.4 * n_cols, 1.95 * len(indices)),
+        squeeze=False,
+    )
 
     for row, idx in enumerate(indices):
         z_raw = wf_to_z_profile(raw[idx], n_channels, n_time)
@@ -355,15 +361,18 @@ def plot_example_reconstructions(
             ax.set_ylim(0, y_max)
             ax.set_yticks([])
 
-    fig.suptitle('Z-Profile Reconstructions', y=0.99, fontweight='bold')
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig.suptitle('Z-Profile Reconstructions', y=0.985, fontweight='bold')
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
     fig.savefig(os.path.join(output_dir, 'example_z_profiles.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig)
 
     # 2D heatmaps — channel × time
-    fig2, axes2 = plt.subplots(len(indices), n_cols,
-                               figsize=(3.8 * n_cols, 2.0 * len(indices)),
-                               squeeze=False)
+    fig2, axes2 = plt.subplots(
+        len(indices),
+        n_cols,
+        figsize=(3.4 * n_cols, 1.8 * len(indices)),
+        squeeze=False,
+    )
 
     for row, idx in enumerate(indices):
         wf_2d_raw = raw[idx].reshape(n_channels, n_time, order='F')
@@ -390,8 +399,8 @@ def plot_example_reconstructions(
             if row == len(indices) - 1:
                 ax.set_xlabel('Time bin')
 
-    fig2.suptitle('Waveform Reconstructions (channel by time)', y=0.99, fontweight='bold')
-    fig2.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig2.suptitle('Waveform Reconstructions (channel by time)', y=0.985, fontweight='bold')
+    compact_layout(fig2, rect=(0.0, 0.0, 1.0, 0.965))
     fig2.savefig(os.path.join(output_dir, 'example_heatmaps.png'), dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig2)
 

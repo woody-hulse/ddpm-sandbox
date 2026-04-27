@@ -46,9 +46,10 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 import numpy as np
-from scipy.stats import pearsonr
+from scipy.stats import ks_2samp, pearsonr, wasserstein_distance
 from scipy.ndimage import gaussian_filter1d
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DIAGNOSE_DIR = os.path.join(ROOT, "diagnose")
@@ -78,7 +79,7 @@ from eval_recon import (
 from lz_data_loader import TritiumSSDataLoader
 from plot_rq_distributions import plot_distributions
 from plot_real_event_3d import plot_waveform_3d_scatter
-from plot_style import COLORS, MODEL_COLORS, apply_style
+from plot_style import COLORS, MODEL_COLORS, apply_style, compact_layout
 
 
 apply_style()
@@ -94,6 +95,28 @@ class LoadedLightModel:
     checkpoint_path: str
     epoch: int
     ctx: Any
+
+
+class ProbeMLP(torch.nn.Module):
+    def __init__(self, in_dim: int, hidden_dims: Sequence[int], out_dim: int = 1, dropout: float = 0.1):
+        super().__init__()
+        layers: List[torch.nn.Module] = []
+        prev_dim = in_dim
+        for hidden_dim in hidden_dims:
+            layers.extend(
+                [
+                    torch.nn.Linear(prev_dim, hidden_dim),
+                    torch.nn.LayerNorm(hidden_dim),
+                    torch.nn.SiLU(),
+                    torch.nn.Dropout(dropout),
+                ]
+            )
+            prev_dim = hidden_dim
+        layers.append(torch.nn.Linear(prev_dim, out_dim))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 @dataclass
@@ -468,11 +491,66 @@ def collect_events(loader: Any, n_events: int, batch_size: int) -> np.ndarray:
 
 
 def waveform_roughness(batch_np: np.ndarray, n_channels: int, n_time: int) -> np.ndarray:
-    rough = np.empty(batch_np.shape[0], dtype=np.float32)
-    for i in range(batch_np.shape[0]):
-        z = wf_to_z_profile(batch_np[i, :, 0], n_channels, n_time)
+    arr = np.asarray(batch_np, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    rough = np.empty(arr.shape[0], dtype=np.float32)
+    for i in range(arr.shape[0]):
+        z = wf_to_z_profile(arr[i, :, 0], n_channels, n_time)
         rough[i] = np.abs(np.diff(z)).mean()
     return rough
+
+
+EVENT_SUMMARY_SPECS: Sequence[Tuple[str, str, str]] = (
+    ("total_charge", "Total charge", "Charge (AU)"),
+    ("peak_time_ns", "Peak time", "Peak time (ns)"),
+    ("roughness", "Waveform roughness", r"Mean $|\Delta z|$"),
+)
+
+
+def compute_event_summary_metrics(
+    flat_waveforms: np.ndarray,
+    n_channels: int,
+    n_time: int,
+    channel_positions: np.ndarray,
+    ns_per_bin: float,
+) -> Dict[str, np.ndarray]:
+    wave_2d = to_2d(flat_waveforms, n_channels, n_time)
+    marg = physics_marginals(wave_2d, channel_positions, ns_per_bin)
+    return {
+        "total_charge": np.asarray(marg["total_charge"], dtype=np.float32),
+        "peak_time_ns": np.asarray(marg["peak_time_ns"], dtype=np.float32),
+        "roughness": waveform_roughness(flat_waveforms, n_channels, n_time),
+    }
+
+
+def compute_sample_event_summary_metrics(
+    sample_waveforms: np.ndarray,
+    n_channels: int,
+    n_time: int,
+    channel_positions: np.ndarray,
+    ns_per_bin: float,
+) -> Dict[str, np.ndarray]:
+    k, bsz, n_nodes = sample_waveforms.shape
+    flat = sample_waveforms.reshape(k * bsz, n_nodes)
+    metrics = compute_event_summary_metrics(flat, n_channels, n_time, channel_positions, ns_per_bin)
+    return {name: values.reshape(k, bsz) for name, values in metrics.items()}
+
+
+def summary_rank_histogram_counts(samples: np.ndarray, truth: np.ndarray) -> np.ndarray:
+    k = samples.shape[0]
+    less = (samples < truth[None, :]).sum(axis=0)
+    return np.bincount(less, minlength=k + 1)
+
+
+def summary_interval_coverage(samples: np.ndarray, truth: np.ndarray, levels: np.ndarray) -> np.ndarray:
+    coverage = np.zeros_like(levels, dtype=np.float32)
+    for idx, level in enumerate(levels):
+        alpha = 0.5 * (1.0 - float(level))
+        lo = np.quantile(samples, alpha, axis=0)
+        hi = np.quantile(samples, 1.0 - alpha, axis=0)
+        coverage[idx] = float(np.mean((truth >= lo) & (truth <= hi)))
+    return coverage
 
 
 def make_lopsided_batch(batch_np: np.ndarray, frac: float, sigma: float, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
@@ -594,18 +672,23 @@ def save_latent_sampling_visualization(
 ) -> None:
     ensure_dir(os.path.dirname(output_path) or ".")
     n_samples = waveforms.shape[0]
-    fig, axes = plt.subplots(n_samples, 2, figsize=(11, 3.2 * n_samples), squeeze=False)
+    fig, axes = plt.subplots(n_samples, 2, figsize=(10.2, 2.7 * n_samples), squeeze=False)
+    charges = waveforms.sum(axis=2)
+    vmax = max(float(charges.max()), 1e-8)
+    scatter = None
 
     for idx in range(n_samples):
-        charge = waveforms[idx].sum(axis=1)
+        charge = charges[idx]
         trace = waveforms[idx].sum(axis=0)
 
         ax_xy = axes[idx, 0]
-        sc = ax_xy.scatter(
+        scatter = ax_xy.scatter(
             channel_positions[:, 0],
             channel_positions[:, 1],
             c=charge,
             cmap="viridis",
+            vmin=0.0,
+            vmax=vmax,
             s=72,
             edgecolors="k",
             linewidths=0.25,
@@ -614,7 +697,7 @@ def save_latent_sampling_visualization(
         ax_xy.set_title(f"Sample {idx + 1} charge map", fontweight="bold")
         ax_xy.set_xlabel("x (cm)")
         ax_xy.set_ylabel("y (cm)")
-        fig.colorbar(sc, ax=ax_xy, fraction=0.046, pad=0.04, label="Integrated charge")
+        ax_xy.grid(False)
 
         ax_t = axes[idx, 1]
         ax_t.plot(np.arange(trace.shape[0]), trace, color=COLORS["diffae"], linewidth=1.4)
@@ -623,8 +706,55 @@ def save_latent_sampling_visualization(
         ax_t.set_xlabel("Time bin")
         ax_t.set_ylabel("Amplitude")
 
-    fig.suptitle(title, fontweight="bold")
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig.subplots_adjust(left=0.08, right=0.92, bottom=0.06, top=0.91, wspace=0.28, hspace=0.36)
+    cax = fig.add_axes([0.935, 0.18, 0.014, 0.64])
+    cbar = fig.colorbar(scatter, cax=cax)
+    cbar.ax.set_ylabel("Integrated charge")
+    fig.suptitle(title, fontweight="bold", y=0.965)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_latent_sampling_visualization_3d(
+    waveforms: np.ndarray,
+    channel_positions: np.ndarray,
+    output_path: str,
+    title: str,
+    ns_per_bin: float,
+    threshold_quantile: float = 0.95,
+    min_amplitude: Optional[float] = None,
+) -> None:
+    ensure_dir(os.path.dirname(output_path) or ".")
+    n_samples = waveforms.shape[0]
+    n_cols = min(3, n_samples)
+    n_rows = (n_samples + n_cols - 1) // n_cols
+    fig = plt.figure(figsize=(4.15 * n_cols + 0.7, 4.55 * n_rows))
+    axes = [fig.add_subplot(n_rows, n_cols, idx + 1, projection="3d") for idx in range(n_samples)]
+
+    vmax = max(float(np.max(wf)) for wf in waveforms)
+    norm = Normalize(vmin=0.0, vmax=max(vmax, 1e-8))
+    cmap = plt.get_cmap("viridis")
+    scatter = None
+
+    for idx, ax in enumerate(axes):
+        panel = plot_waveform_3d_scatter(
+            ax,
+            waveforms[idx],
+            channel_positions,
+            ns_per_bin=ns_per_bin,
+            threshold_quantile=threshold_quantile,
+            min_amplitude=min_amplitude,
+            norm=norm,
+            cmap=cmap,
+            title=f"Sample {idx + 1}",
+        )
+        scatter = panel["scatter"]
+
+    fig.subplots_adjust(left=0.03, right=0.91, bottom=0.08, top=0.90, wspace=0.02, hspace=0.18)
+    cax = fig.add_axes([0.925, 0.20, 0.013, 0.58])
+    cbar = fig.colorbar(scatter, cax=cax)
+    cbar.ax.set_ylabel("Amplitude (AU)")
+    fig.suptitle(title, fontweight="bold", y=0.965)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -649,7 +779,12 @@ def plot_example_reconstructions_generic(
     n_cols = 1 + len(model_names)
     time_axis = np.arange(n_time)
 
-    fig, axes = plt.subplots(len(indices), n_cols, figsize=(3.8 * n_cols, 2.2 * len(indices)), squeeze=False)
+    fig, axes = plt.subplots(
+        len(indices),
+        n_cols,
+        figsize=(3.4 * n_cols, 1.95 * len(indices)),
+        squeeze=False,
+    )
     for row, idx in enumerate(indices):
         z_raw = wf_to_z_profile(raw[idx], n_channels, n_time)
         y_max = max(z_raw.max() * 1.15, 1.0)
@@ -679,12 +814,17 @@ def plot_example_reconstructions_generic(
             ax.set_ylim(0, y_max)
             ax.set_yticks([])
 
-    fig.suptitle("Z-Profile Reconstructions", y=0.99, fontweight="bold")
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig.suptitle("Z-Profile Reconstructions", y=0.985, fontweight="bold")
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
     fig.savefig(os.path.join(output_dir, "example_z_profiles.png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    fig2, axes2 = plt.subplots(len(indices), n_cols, figsize=(3.8 * n_cols, 2.0 * len(indices)), squeeze=False)
+    fig2, axes2 = plt.subplots(
+        len(indices),
+        n_cols,
+        figsize=(3.4 * n_cols, 1.8 * len(indices)),
+        squeeze=False,
+    )
     for row, idx in enumerate(indices):
         wf_2d_raw = raw[idx].reshape(n_channels, n_time, order="F")
         vmax = wf_2d_raw.max()
@@ -707,8 +847,8 @@ def plot_example_reconstructions_generic(
             if row == len(indices) - 1:
                 ax.set_xlabel("Time bin")
 
-    fig2.suptitle("Waveform Reconstructions (channel by time)", y=0.99, fontweight="bold")
-    fig2.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig2.suptitle("Waveform Reconstructions (channel by time)", y=0.985, fontweight="bold")
+    compact_layout(fig2, rect=(0.0, 0.0, 1.0, 0.965))
     fig2.savefig(os.path.join(output_dir, "example_heatmaps.png"), dpi=300, bbox_inches="tight")
     plt.close(fig2)
 
@@ -741,7 +881,7 @@ def plot_full_pmt_reconstruction_triptych(
         vmax = max(float(charge.max()) for charge in charges.values())
         vmax = max(vmax, 1e-8)
 
-        fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.1), squeeze=False)
+        fig, axes = plt.subplots(1, 3, figsize=(11.4, 3.7), squeeze=False)
         axes_row = axes[0]
         scatter = None
         for ax, (title, charge) in zip(axes_row, charges.items()):
@@ -764,11 +904,11 @@ def plot_full_pmt_reconstruction_triptych(
             ax.set_ylabel("y (cm)")
             ax.grid(False)
 
-        fig.subplots_adjust(left=0.06, right=0.90, bottom=0.12, top=0.86, wspace=0.22)
-        cax = fig.add_axes([0.92, 0.20, 0.015, 0.60])
+        fig.subplots_adjust(left=0.06, right=0.91, bottom=0.11, top=0.89, wspace=0.18)
+        cax = fig.add_axes([0.925, 0.19, 0.013, 0.63])
         cbar = fig.colorbar(scatter, cax=cax)
         cbar.ax.set_ylabel("Integrated charge")
-        fig.suptitle(f"Reconstruction Comparison (event {idx})", fontweight="bold")
+        fig.suptitle(f"Reconstruction Comparison (event {idx})", fontweight="bold", y=0.975)
         fig.savefig(os.path.join(output_dir, f"event_{idx:04d}_xy_full.png"), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
@@ -803,7 +943,7 @@ def plot_full_pmt_reconstruction_3d_triptych(
         vmax = max(float(max(np.max(wf), 0.0)) for wf in waveforms.values())
         norm = Normalize(vmin=0.0, vmax=max(vmax, 1e-8))
 
-        fig = plt.figure(figsize=(14.2, 5.8))
+        fig = plt.figure(figsize=(12.4, 5.0))
         axes = [fig.add_subplot(1, 3, i + 1, projection="3d") for i in range(3)]
         scatter = None
         for ax, (title, waveform) in zip(axes, waveforms.items()):
@@ -820,15 +960,15 @@ def plot_full_pmt_reconstruction_3d_triptych(
             )
             scatter = panel["scatter"]
 
-        fig.subplots_adjust(left=0.03, right=0.90, bottom=0.18, top=0.86, wspace=0.08)
-        cax = fig.add_axes([0.92, 0.20, 0.015, 0.56])
+        fig.subplots_adjust(left=0.03, right=0.91, bottom=0.16, top=0.87, wspace=0.05)
+        cax = fig.add_axes([0.925, 0.20, 0.013, 0.58])
         cbar = fig.colorbar(scatter, cax=cax)
         cbar.ax.set_ylabel("Amplitude (AU)")
-        fig.suptitle(f"3D Reconstruction Comparison (event {idx})", fontweight="bold")
+        fig.suptitle(f"3D Reconstruction Comparison (event {idx})", fontweight="bold", y=0.96)
         png_path = os.path.join(output_dir, f"event_{idx:04d}_3d_full.png")
         pdf_path = os.path.join(output_dir, f"event_{idx:04d}_3d_full.pdf")
-        fig.savefig(png_path, dpi=300)
-        fig.savefig(pdf_path)
+        fig.savefig(png_path, dpi=300, bbox_inches="tight")
+        fig.savefig(pdf_path, bbox_inches="tight")
         plt.close(fig)
 
 
@@ -848,7 +988,7 @@ def plot_node_metric_triptych(
 ) -> None:
     ensure_dir(os.path.dirname(output_path) or ".")
     arrays = [node_vector_to_grid(values, n_channels, n_time) for _, values in panels]
-    fig, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), 4.0), squeeze=False)
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.7 * len(panels), 3.55), squeeze=False)
     axes_row = axes[0]
 
     vmin = min(float(arr.min()) for arr in arrays)
@@ -866,11 +1006,11 @@ def plot_node_metric_triptych(
         ax.set_ylabel("Channel")
         ax.grid(False)
 
-    fig.subplots_adjust(left=0.06, right=0.90, bottom=0.10, top=0.86, wspace=0.26)
-    cax = fig.add_axes([0.92, 0.22, 0.015, 0.56])
+    fig.subplots_adjust(left=0.07, right=0.91, bottom=0.10, top=0.79, wspace=0.18)
+    cax = fig.add_axes([0.925, 0.19, 0.013, 0.61])
     cbar = fig.colorbar(images[-1], cax=cax)
     cbar.ax.set_ylabel(colorbar_label)
-    fig.suptitle(suptitle, fontweight="bold")
+    fig.suptitle(suptitle, fontweight="bold", y=0.94)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -884,7 +1024,7 @@ def plot_node_metric_profiles(
     title: str,
 ) -> None:
     ensure_dir(os.path.dirname(output_path) or ".")
-    fig, ax = plt.subplots(figsize=(8.5, 4.0))
+    fig, ax = plt.subplots(figsize=(7.8, 3.55))
     time_axis = np.arange(n_time)
     for idx, (name, values) in enumerate(metric_by_model.items()):
         arr = node_vector_to_grid(values, n_channels, n_time).mean(axis=0)
@@ -894,7 +1034,393 @@ def plot_node_metric_profiles(
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontweight="bold")
     ax.legend(loc="best", frameon=True)
-    fig.tight_layout()
+    compact_layout(fig)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def summary_shared_bins(values: Sequence[np.ndarray], n_bins: int = 50) -> np.ndarray:
+    finite = np.concatenate([np.asarray(v, dtype=np.float64).ravel() for v in values])
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return np.linspace(-0.5, 0.5, n_bins + 1)
+    lo = float(np.percentile(finite, 0.5))
+    hi = float(np.percentile(finite, 99.5))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        center = float(finite[0]) if finite.size else 0.0
+        pad = max(abs(center) * 0.05, 1e-3)
+        lo, hi = center - pad, center + pad
+    return np.linspace(lo, hi, n_bins + 1)
+
+
+def plot_event_summary_distributions(
+    truth_metrics: Dict[str, np.ndarray],
+    ae_metrics: Dict[str, np.ndarray],
+    diffae_metrics: Dict[str, np.ndarray],
+    diffae_sample_metrics: Dict[str, np.ndarray],
+    output_path: str,
+) -> None:
+    ensure_dir(os.path.dirname(output_path) or ".")
+    fig, axes = plt.subplots(1, len(EVENT_SUMMARY_SPECS), figsize=(4.0 * len(EVENT_SUMMARY_SPECS), 3.3), squeeze=False)
+    axes_row = axes[0]
+
+    for ax, (metric_key, display_name, xlabel) in zip(axes_row, EVENT_SUMMARY_SPECS):
+        truth = np.asarray(truth_metrics[metric_key], dtype=np.float32)
+        ae = np.asarray(ae_metrics[metric_key], dtype=np.float32)
+        diffae = np.asarray(diffae_metrics[metric_key], dtype=np.float32)
+        diffae_samples = np.asarray(diffae_sample_metrics[metric_key], dtype=np.float32).reshape(-1)
+        bins = summary_shared_bins([truth, ae, diffae, diffae_samples], n_bins=50)
+
+        ax.hist(truth, bins=bins, density=True, histtype="step", linewidth=1.7, color=COLORS["truth"], label="Truth")
+        ax.hist(ae, bins=bins, density=True, alpha=0.35, color=COLORS["ae"], edgecolor="none", label="AE")
+        ax.hist(diffae, bins=bins, density=True, alpha=0.35, color=COLORS["diffae"], edgecolor="none", label="DiffAE")
+        ax.hist(
+            diffae_samples,
+            bins=bins,
+            density=True,
+            histtype="step",
+            linewidth=1.3,
+            linestyle="--",
+            color=COLORS["diffae"],
+            label="DiffAE samples",
+        )
+        ax.set_title(display_name, fontweight="bold")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Density")
+        if metric_key == "roughness":
+            ax.legend(loc="best", fontsize=8, handlelength=1.5)
+
+    fig.suptitle("Event-summary distributions", fontweight="bold", y=0.98)
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_event_summary_rank_histograms(
+    rank_counts_by_model: Dict[str, Dict[str, np.ndarray]],
+    output_path: str,
+) -> None:
+    ensure_dir(os.path.dirname(output_path) or ".")
+    models = list(rank_counts_by_model.keys())
+    fig, axes = plt.subplots(len(models), len(EVENT_SUMMARY_SPECS), figsize=(4.0 * len(EVENT_SUMMARY_SPECS), 2.6 * len(models)), squeeze=False)
+
+    for row, model_name in enumerate(models):
+        for col, (metric_key, display_name, _) in enumerate(EVENT_SUMMARY_SPECS):
+            ax = axes[row, col]
+            counts = np.asarray(rank_counts_by_model[model_name][metric_key], dtype=np.float64)
+            frac = counts / max(float(counts.sum()), 1.0)
+            k = len(counts) - 1
+            ax.bar(np.arange(k + 1), frac, width=0.85, color=COLORS["ae"] if model_name == "AE" else COLORS["diffae"], alpha=0.78, edgecolor="none")
+            ax.axhline(1.0 / (k + 1), color=COLORS["truth"], linestyle="--", linewidth=0.9)
+            if row == 0:
+                ax.set_title(display_name, fontweight="bold")
+            if col == 0:
+                ax.set_ylabel(f"{model_name}\nFraction")
+            else:
+                ax.set_ylabel("Fraction")
+            ax.set_xlabel("Rank bin")
+
+    fig.suptitle("Event-summary rank histograms", fontweight="bold", y=0.98)
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_event_summary_coverage(
+    levels: np.ndarray,
+    coverage_by_model: Dict[str, Dict[str, np.ndarray]],
+    output_path: str,
+) -> None:
+    ensure_dir(os.path.dirname(output_path) or ".")
+    fig, axes = plt.subplots(1, len(EVENT_SUMMARY_SPECS), figsize=(4.0 * len(EVENT_SUMMARY_SPECS), 3.3), squeeze=False)
+    axes_row = axes[0]
+
+    for ax, (metric_key, display_name, _) in zip(axes_row, EVENT_SUMMARY_SPECS):
+        ax.plot(levels, levels, color=COLORS["truth"], linestyle="--", linewidth=1.0, label="Ideal")
+        for model_name, model_cov in coverage_by_model.items():
+            color = COLORS["ae"] if model_name == "AE" else COLORS["diffae"]
+            ax.plot(levels, model_cov[metric_key], marker="o", markersize=3.5, linewidth=1.4, color=color, label=model_name)
+        ax.set_title(display_name, fontweight="bold")
+        ax.set_xlabel("Nominal central coverage")
+        ax.set_ylabel("Empirical coverage")
+        ax.set_xlim(levels.min() - 0.02, levels.max() + 0.02)
+        ax.set_ylim(0.0, 1.0)
+        if metric_key == "roughness":
+            ax.legend(loc="best", fontsize=8)
+
+    fig.suptitle("Event-summary coverage calibration", fontweight="bold", y=0.98)
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_conditional_zprofile_examples(
+    raw_flat: np.ndarray,
+    ae_flat: np.ndarray,
+    diff_samples: np.ndarray,
+    n_channels: int,
+    n_time: int,
+    output_path: str,
+    indices: Sequence[int],
+    max_sample_lines: int = 12,
+) -> None:
+    ensure_dir(os.path.dirname(output_path) or ".")
+    if not indices:
+        return
+    n_cols = 2 if len(indices) > 1 else 1
+    n_rows = (len(indices) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.6 * n_cols, 2.65 * n_rows), squeeze=False)
+    axes_flat = axes.flatten()
+    time_axis = np.arange(n_time)
+
+    for ax, idx in zip(axes_flat, indices):
+        z_raw = wf_to_z_profile(raw_flat[idx], n_channels, n_time)
+        z_ae = wf_to_z_profile(ae_flat[idx], n_channels, n_time)
+        z_samples = np.stack([wf_to_z_profile(diff_samples[k, idx], n_channels, n_time) for k in range(diff_samples.shape[0])], axis=0)
+        z_mean = z_samples.mean(axis=0)
+        z_lo = np.quantile(z_samples, 0.10, axis=0)
+        z_hi = np.quantile(z_samples, 0.90, axis=0)
+        n_show = min(max_sample_lines, z_samples.shape[0])
+
+        for sample_idx in range(n_show):
+            ax.plot(time_axis, z_samples[sample_idx], color=COLORS["diffae"], linewidth=0.8, alpha=0.12, zorder=1)
+        ax.fill_between(time_axis, z_lo, z_hi, color=COLORS["diffae"], alpha=0.18, label="DiffAE 10-90%", zorder=2)
+        ax.plot(time_axis, z_mean, color=COLORS["diffae"], linewidth=1.5, label="DiffAE mean", zorder=3)
+        ax.plot(time_axis, z_ae, color=COLORS["ae"], linewidth=1.3, label="AE", zorder=4)
+        ax.plot(time_axis, z_raw, color=COLORS["truth"], linewidth=1.3, label="Truth", zorder=5)
+        ax.set_title(f"Event {idx}", fontweight="bold")
+        ax.set_xlabel("Time bin")
+        ax.set_ylabel("Summed amplitude")
+        ax.set_xlim(0, n_time - 1)
+
+    for ax in axes_flat[len(indices):]:
+        ax.set_visible(False)
+
+    handles = [
+        Line2D([0], [0], color=COLORS["truth"], linewidth=1.3, label="Truth"),
+        Line2D([0], [0], color=COLORS["ae"], linewidth=1.3, label="AE"),
+        Line2D([0], [0], color=COLORS["diffae"], linewidth=1.5, label="DiffAE mean"),
+        Line2D([0], [0], color=COLORS["diffae"], linewidth=4.0, alpha=0.18, label="DiffAE 10-90%"),
+    ]
+    axes_flat[min(len(indices), len(axes_flat)) - 1].legend(handles=handles, loc="upper right", fontsize=8, frameon=True)
+    fig.suptitle("Conditional DiffAE z-profile spread for selected events", fontweight="bold", y=0.98)
+    compact_layout(fig, rect=(0.0, 0.0, 1.0, 0.965))
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_regression_split_indices(n_total: int, seed: int) -> Dict[str, np.ndarray]:
+    perm = np.random.default_rng(seed).permutation(n_total)
+    n_train = int(0.7 * n_total)
+    n_val = int(0.15 * n_total)
+    return {
+        "train": perm[:n_train],
+        "val": perm[n_train:n_train + n_val],
+        "test": perm[n_train + n_val:],
+    }
+
+
+def standardize_features(
+    features: np.ndarray,
+    train_idx: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mean = features[train_idx].mean(axis=0, keepdims=True)
+    std = features[train_idx].std(axis=0, keepdims=True)
+    std = np.clip(std, 1e-6, None)
+    return ((features - mean) / std).astype(np.float32), mean.astype(np.float32), std.astype(np.float32)
+
+
+def standardize_targets(
+    targets: np.ndarray,
+    train_idx: np.ndarray,
+) -> Tuple[np.ndarray, float, float]:
+    mean = float(np.mean(targets[train_idx]))
+    std = float(np.std(targets[train_idx]))
+    std = max(std, 1e-6)
+    return ((targets - mean) / std).astype(np.float32), mean, std
+
+
+def build_tensor_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
+    dataset = TensorDataset(torch.from_numpy(x.astype(np.float32)), torch.from_numpy(y.astype(np.float32)))
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+
+
+def train_regression_probe(
+    features: np.ndarray,
+    targets: np.ndarray,
+    split_indices: Dict[str, np.ndarray],
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    hidden_dims: Sequence[int],
+    seed: int,
+) -> Dict[str, Any]:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    x_std, _, _ = standardize_features(features, split_indices["train"])
+    y_std, y_mean, y_scale = standardize_targets(targets, split_indices["train"])
+
+    train_loader = build_tensor_loader(x_std[split_indices["train"]], y_std[split_indices["train"]], batch_size, shuffle=True)
+    val_loader = build_tensor_loader(x_std[split_indices["val"]], y_std[split_indices["val"]], batch_size, shuffle=False)
+    test_loader = build_tensor_loader(x_std[split_indices["test"]], y_std[split_indices["test"]], batch_size, shuffle=False)
+
+    mlp = ProbeMLP(in_dim=features.shape[1], hidden_dims=list(hidden_dims), out_dim=1, dropout=0.1).to(device)
+    optimizer = torch.optim.AdamW(mlp.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    train_losses: List[float] = []
+    val_losses: List[float] = []
+    val_mae: List[float] = []
+    val_times: List[float] = []
+    best_epoch = 0
+    best_val_mae = float("inf")
+    best_state: Dict[str, torch.Tensor] | None = None
+    t0 = time.perf_counter()
+
+    for epoch in range(epochs):
+        mlp.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            pred = mlp(xb).squeeze(-1)
+            loss = torch.nn.functional.mse_loss(pred, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(mlp.parameters(), 1.0)
+            optimizer.step()
+            epoch_loss += float(loss.item())
+            n_batches += 1
+        scheduler.step()
+        train_losses.append(epoch_loss / max(n_batches, 1))
+
+        mlp.eval()
+        epoch_val_loss = 0.0
+        n_val_batches = 0
+        val_pred_chunks: List[np.ndarray] = []
+        val_target_chunks: List[np.ndarray] = []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                pred = mlp(xb).squeeze(-1)
+                epoch_val_loss += float(torch.nn.functional.mse_loss(pred, yb).item())
+                n_val_batches += 1
+                val_pred_chunks.append(pred.cpu().numpy())
+                val_target_chunks.append(yb.cpu().numpy())
+        val_losses.append(epoch_val_loss / max(n_val_batches, 1))
+
+        val_pred = np.concatenate(val_pred_chunks) * y_scale + y_mean
+        val_true = np.concatenate(val_target_chunks) * y_scale + y_mean
+        epoch_val_mae = float(np.mean(np.abs(val_pred - val_true)))
+        val_mae.append(epoch_val_mae)
+        val_times.append(float(time.perf_counter() - t0))
+
+        if epoch_val_mae < best_val_mae:
+            best_val_mae = epoch_val_mae
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in mlp.state_dict().items()}
+
+    if best_state is None:
+        raise RuntimeError("Regression probe training failed to produce a checkpoint.")
+    mlp.load_state_dict(best_state)
+    mlp.eval()
+
+    preds: List[np.ndarray] = []
+    truths: List[np.ndarray] = []
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(device)
+            pred = mlp(xb).squeeze(-1).cpu().numpy() * y_scale + y_mean
+            true = yb.numpy() * y_scale + y_mean
+            preds.append(pred)
+            truths.append(true)
+    pred_all = np.concatenate(preds)
+    true_all = np.concatenate(truths)
+    test_mae = float(np.mean(np.abs(pred_all - true_all)))
+    test_rmse = float(np.sqrt(np.mean((pred_all - true_all) ** 2)))
+
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_mae": val_mae,
+        "val_times": val_times,
+        "best_epoch": int(best_epoch),
+        "best_val_mae": float(best_val_mae),
+        "test_mae": test_mae,
+        "test_rmse": test_rmse,
+        "predictions": pred_all.astype(np.float32),
+        "targets": true_all.astype(np.float32),
+    }
+
+
+def plot_delta_mu_probe_convergence(
+    trial_results: Dict[str, List[Dict[str, Any]]],
+    output_epoch_path: str,
+    output_time_path: str,
+) -> None:
+    ensure_dir(os.path.dirname(output_epoch_path) or ".")
+    model_order = ["Original", "AE", "DiffAE"]
+    colors = {"Original": COLORS["truth"], "AE": COLORS["ae"], "DiffAE": COLORS["diffae"]}
+
+    fig_epoch, ax_epoch = plt.subplots(figsize=(6.4, 4.0))
+    for name in model_order:
+        curves = np.asarray([trial["val_mae"] for trial in trial_results[name]], dtype=np.float32)
+        mean_curve = curves.mean(axis=0)
+        std_curve = curves.std(axis=0)
+        epochs_axis = np.arange(1, mean_curve.shape[0] + 1)
+        ax_epoch.plot(epochs_axis, mean_curve, color=colors[name], linewidth=1.7, label=name)
+        ax_epoch.fill_between(epochs_axis, mean_curve - std_curve, mean_curve + std_curve, color=colors[name], alpha=0.15)
+    ax_epoch.set_xlabel("Epoch")
+    ax_epoch.set_ylabel(r"Validation MAE on $\Delta \mu$ (ns)")
+    ax_epoch.set_title(r"$\Delta \mu$ probe convergence by epoch", fontweight="bold")
+    ax_epoch.legend(loc="best", fontsize=8)
+    compact_layout(fig_epoch)
+    fig_epoch.savefig(output_epoch_path, dpi=300, bbox_inches="tight")
+    plt.close(fig_epoch)
+
+    fig_time, ax_time = plt.subplots(figsize=(6.4, 4.0))
+    for name in model_order:
+        curves = np.asarray([trial["val_mae"] for trial in trial_results[name]], dtype=np.float32)
+        times = np.asarray([trial["val_times"] for trial in trial_results[name]], dtype=np.float32)
+        mean_curve = curves.mean(axis=0)
+        std_curve = curves.std(axis=0)
+        mean_time = times.mean(axis=0)
+        ax_time.plot(mean_time, mean_curve, color=colors[name], linewidth=1.7, label=name)
+        ax_time.fill_between(mean_time, mean_curve - std_curve, mean_curve + std_curve, color=colors[name], alpha=0.15)
+    ax_time.set_xlabel("Elapsed training time (s)")
+    ax_time.set_ylabel(r"Validation MAE on $\Delta \mu$ (ns)")
+    ax_time.set_title(r"$\Delta \mu$ probe convergence by wall-clock time", fontweight="bold")
+    ax_time.legend(loc="best", fontsize=8)
+    compact_layout(fig_time)
+    fig_time.savefig(output_time_path, dpi=300, bbox_inches="tight")
+    plt.close(fig_time)
+
+
+def plot_delta_mu_probe_mae_bars(
+    trial_results: Dict[str, List[Dict[str, Any]]],
+    output_path: str,
+) -> None:
+    ensure_dir(os.path.dirname(output_path) or ".")
+    model_order = ["Original", "AE", "DiffAE"]
+    colors = {"Original": COLORS["truth"], "AE": COLORS["ae"], "DiffAE": COLORS["diffae"]}
+    means = [float(np.mean([trial["test_mae"] for trial in trial_results[name]])) for name in model_order]
+    stds = [float(np.std([trial["test_mae"] for trial in trial_results[name]])) for name in model_order]
+
+    fig, ax = plt.subplots(figsize=(5.2, 3.8))
+    x = np.arange(len(model_order))
+    bars = ax.bar(x, means, yerr=stds, capsize=4, color=[colors[name] for name in model_order], alpha=0.85, edgecolor="none")
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_order)
+    ax.set_ylabel(r"Test MAE on $\Delta \mu$ (ns)")
+    ax.set_title(r"$\Delta \mu$ probe accuracy", fontweight="bold")
+    for rect, mean in zip(bars, means):
+        ax.text(rect.get_x() + rect.get_width() / 2.0, rect.get_height(), f"{mean:.2f}", ha="center", va="bottom", fontsize=8)
+    compact_layout(fig)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -914,7 +1440,7 @@ def plot_continuous_embedding_panels(
     all_color_values = np.concatenate([panel["color_values"] for panel in panels])
     vmax = float(np.percentile(all_color_values, 98)) if len(all_color_values) > 0 else 1.0
     norm = Normalize(vmin=0.0, vmax=max(vmax, 1e-8))
-    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 5.2), squeeze=False)
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.8 * len(panels), 4.45), squeeze=False)
     axes_row = axes[0]
     sc = None
     stats: Dict[str, Dict[str, float]] = {}
@@ -940,10 +1466,10 @@ def plot_continuous_embedding_panels(
         stats[panel["name"]] = {"knn_smoothness": float(smoothness)}
 
     assert sc is not None
-    cbar = fig.colorbar(sc, ax=axes_row.tolist(), shrink=0.82, pad=0.04)
+    cbar = fig.colorbar(sc, ax=axes_row.tolist(), shrink=0.84, pad=0.02)
     cbar.set_label(value_label)
-    fig.suptitle(title, fontweight="bold")
-    fig.subplots_adjust(left=0.05, right=0.93, bottom=0.08, top=0.88, wspace=0.20)
+    fig.suptitle(title, fontweight="bold", y=0.965)
+    fig.subplots_adjust(left=0.05, right=0.94, bottom=0.08, top=0.87, wspace=0.14)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return stats
@@ -957,7 +1483,7 @@ def plot_lopsided_embedding_panels(
 ) -> Dict[str, Dict[str, int]]:
     ensure_dir(os.path.dirname(output_path) or ".")
     colors = {0: COLORS["lop_none"], 1: COLORS["lop_left"], 2: COLORS["lop_right"]}
-    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 5.2), squeeze=False)
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.8 * len(panels), 4.45), squeeze=False)
     axes_row = axes[0]
     counts: Dict[str, Dict[str, int]] = {}
 
@@ -998,8 +1524,8 @@ def plot_lopsided_embedding_panels(
         Line2D([0], [0], marker="o", color="w", markerfacecolor=colors[2], markersize=6, label="Right"),
     ]
     axes_row[-1].legend(handles=legend, loc="upper right", fontsize=8, frameon=True, edgecolor="0.8")
-    fig.suptitle(title, fontweight="bold")
-    fig.subplots_adjust(left=0.05, right=0.97, bottom=0.08, top=0.88, wspace=0.20)
+    fig.suptitle(title, fontweight="bold", y=0.965)
+    fig.subplots_adjust(left=0.05, right=0.96, bottom=0.08, top=0.87, wspace=0.14)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return counts
@@ -1449,9 +1975,17 @@ def run_latent_sampling(
         waveforms = reshape_flat_waveforms(flat_waveforms, ctx.n_channels, ctx.n_time_points)
 
         figure_path = os.path.join(prior_dir, "diffae_latent_samples.png")
+        figure_3d_path = os.path.join(prior_dir, "diffae_latent_samples_3d.png")
         array_path = os.path.join(prior_dir, "diffae_latent_samples.npz")
         title = f"DiffAE latent samples ({prior} prior, z={diffae_model.latent_dim})"
         save_latent_sampling_visualization(waveforms, channel_positions, figure_path, title)
+        save_latent_sampling_visualization_3d(
+            waveforms,
+            channel_positions,
+            figure_3d_path,
+            title,
+            ns_per_bin=ctx.cfg.ms_data.ns_per_bin,
+        )
         np.savez_compressed(
             array_path,
             waveforms=waveforms.astype(np.float32),
@@ -1470,6 +2004,7 @@ def run_latent_sampling(
             "prior_source": prior_source,
             "prior_fit_samples": int(fitted_latents.shape[0]),
             "figure_path": os.path.abspath(figure_path),
+            "figure_3d_path": os.path.abspath(figure_3d_path),
             "array_path": os.path.abspath(array_path),
             "latent_mean_l2": float(np.linalg.norm(prior_mean)),
             "latent_std_mean": float(np.mean(prior_std)),
@@ -1655,6 +2190,224 @@ def run_node_distribution_stochasticity(
             "mean_abs_bias_advantage": float(np.mean(abs_bias_delta)),
         },
     }
+    write_json(os.path.join(out_dir, "summary.json"), summary)
+    return summary
+
+
+def run_distribution_alignment(
+    models: Sequence[LoadedLightModel],
+    shared_store: SharedSampleStore,
+    out_dir: str,
+    n_events: int,
+    n_examples: int,
+    seed: int,
+) -> Dict[str, Any]:
+    ensure_dir(out_dir)
+    model_map = {model.display_name: model for model in models}
+    if "AE" not in model_map or "DiffAE" not in model_map:
+        raise RuntimeError("Distribution alignment requires both AE and DiffAE models.")
+    if shared_store.diffae_samples < 2:
+        raise RuntimeError(
+            "Distribution alignment requires repeated DiffAE samples. "
+            "Rebuild the shared cache with --diffae-samples >= 2 and --regenerate."
+        )
+
+    n_events = min(n_events, shared_store.n_samples)
+    raw = load_shared_raw(shared_store, n_samples=n_events)[:, :, 0]
+    ae = load_shared_reconstruction(shared_store, "ae_light", n_samples=n_events)
+    diffae = load_shared_reconstruction(shared_store, "diffae_light", n_samples=n_events)
+    diff_samples = load_shared_diffae_samples(shared_store, n_samples=n_events)
+
+    n_channels = shared_store.n_channels
+    n_time = shared_store.n_time_points
+    ns_per_bin = default_config.ms_data.ns_per_bin
+    channel_positions = np.asarray(models[0].ctx.loader.channel_positions, dtype=np.float32)
+
+    truth_metrics = compute_event_summary_metrics(raw, n_channels, n_time, channel_positions, ns_per_bin)
+    ae_metrics = compute_event_summary_metrics(ae, n_channels, n_time, channel_positions, ns_per_bin)
+    diffae_metrics = compute_event_summary_metrics(diffae, n_channels, n_time, channel_positions, ns_per_bin)
+    diff_sample_metrics = compute_sample_event_summary_metrics(diff_samples, n_channels, n_time, channel_positions, ns_per_bin)
+    diff_sample_metrics_pooled = {name: values.reshape(-1) for name, values in diff_sample_metrics.items()}
+    ae_sample_metrics = {
+        name: np.repeat(values[None, :], shared_store.diffae_samples, axis=0) for name, values in ae_metrics.items()
+    }
+
+    plot_event_summary_distributions(
+        truth_metrics=truth_metrics,
+        ae_metrics=ae_metrics,
+        diffae_metrics=diffae_metrics,
+        diffae_sample_metrics=diff_sample_metrics_pooled,
+        output_path=os.path.join(out_dir, "event_summary_distributions.png"),
+    )
+
+    rank_counts_by_model = {
+        "AE": {name: summary_rank_histogram_counts(ae_sample_metrics[name], truth_metrics[name]) for name, _, _ in EVENT_SUMMARY_SPECS},
+        "DiffAE": {name: summary_rank_histogram_counts(diff_sample_metrics[name], truth_metrics[name]) for name, _, _ in EVENT_SUMMARY_SPECS},
+    }
+    plot_event_summary_rank_histograms(
+        rank_counts_by_model=rank_counts_by_model,
+        output_path=os.path.join(out_dir, "event_summary_rank_histograms.png"),
+    )
+
+    coverage_levels = np.linspace(0.1, 0.9, 9, dtype=np.float32)
+    coverage_by_model = {
+        "AE": {name: summary_interval_coverage(ae_sample_metrics[name], truth_metrics[name], coverage_levels) for name, _, _ in EVENT_SUMMARY_SPECS},
+        "DiffAE": {name: summary_interval_coverage(diff_sample_metrics[name], truth_metrics[name], coverage_levels) for name, _, _ in EVENT_SUMMARY_SPECS},
+    }
+    plot_event_summary_coverage(
+        levels=coverage_levels,
+        coverage_by_model=coverage_by_model,
+        output_path=os.path.join(out_dir, "event_summary_coverage.png"),
+    )
+
+    example_indices = [int(i) for i in select_nonzero_example_indices(raw, n_examples=n_examples, seed=seed)]
+    plot_conditional_zprofile_examples(
+        raw_flat=raw,
+        ae_flat=ae,
+        diff_samples=diff_samples,
+        n_channels=n_channels,
+        n_time=n_time,
+        output_path=os.path.join(out_dir, "conditional_zprofile_examples.png"),
+        indices=example_indices,
+    )
+
+    summary: Dict[str, Any] = {
+        "n_events": int(n_events),
+        "diffae_samples": int(shared_store.diffae_samples),
+        "example_indices": example_indices,
+        "metrics": {},
+    }
+    for metric_key, _, _ in EVENT_SUMMARY_SPECS:
+        truth = truth_metrics[metric_key]
+        ae_vals = ae_metrics[metric_key]
+        diffae_vals = diffae_metrics[metric_key]
+        diff_sample_vals = diff_sample_metrics_pooled[metric_key]
+        summary["metrics"][metric_key] = {
+            "truth": {"mean": float(np.mean(truth)), "std": float(np.std(truth))},
+            "ae": {"mean": float(np.mean(ae_vals)), "std": float(np.std(ae_vals))},
+            "diffae": {"mean": float(np.mean(diffae_vals)), "std": float(np.std(diffae_vals))},
+            "diffae_samples": {"mean": float(np.mean(diff_sample_vals)), "std": float(np.std(diff_sample_vals))},
+            "ks_pvalue": {
+                "truth_vs_ae": float(ks_2samp(truth, ae_vals).pvalue),
+                "truth_vs_diffae": float(ks_2samp(truth, diffae_vals).pvalue),
+                "truth_vs_diffae_samples": float(ks_2samp(truth, diff_sample_vals).pvalue),
+            },
+            "wasserstein": {
+                "truth_vs_ae": float(wasserstein_distance(truth, ae_vals)),
+                "truth_vs_diffae": float(wasserstein_distance(truth, diffae_vals)),
+                "truth_vs_diffae_samples": float(wasserstein_distance(truth, diff_sample_vals)),
+            },
+            "coverage_rmse": {
+                model_name: float(np.sqrt(np.mean((coverage_by_model[model_name][metric_key] - coverage_levels) ** 2)))
+                for model_name in coverage_by_model
+            },
+            "rank_histogram_counts": {
+                model_name: rank_counts_by_model[model_name][metric_key]
+                for model_name in rank_counts_by_model
+            },
+        }
+
+    write_json(os.path.join(out_dir, "summary.json"), summary)
+    return summary
+
+
+def run_delta_mu_probe(
+    models: Sequence[LoadedLightModel],
+    shared_store: SharedSampleStore,
+    out_dir: str,
+    n_events: int,
+    encode_batch_size: int,
+    train_batch_size: int,
+    epochs: int,
+    n_trials: int,
+    lr: float,
+    seed: int,
+) -> Dict[str, Any]:
+    ensure_dir(out_dir)
+    model_map = {model.display_name: model for model in models}
+    if "AE" not in model_map or "DiffAE" not in model_map:
+        raise RuntimeError(r"$\Delta \mu$ probe requires both AE and DiffAE models.")
+
+    n_events = min(n_events, shared_store.n_samples)
+    raw_col = load_shared_raw(shared_store, n_samples=n_events)
+    raw_flat = raw_col[:, :, 0]
+    delta_mu = load_shared_delta_mu(shared_store, n_samples=n_events)
+
+    features_by_model: Dict[str, np.ndarray] = {
+        "Original": raw_flat.astype(np.float32),
+        "AE": encode_raw_flat_batch(model_map["AE"], raw_col, batch_size=encode_batch_size).astype(np.float32),
+        "DiffAE": encode_raw_flat_batch(model_map["DiffAE"], raw_col, batch_size=encode_batch_size).astype(np.float32),
+    }
+
+    hidden_dims_by_model = {
+        "Original": (256, 128),
+        "AE": (128, 64),
+        "DiffAE": (128, 64),
+    }
+    device = model_map["AE"].ctx.device
+    trial_results: Dict[str, List[Dict[str, Any]]] = {name: [] for name in features_by_model}
+
+    for trial_idx in range(n_trials):
+        split_indices = build_regression_split_indices(n_events, seed + trial_idx)
+        for model_name, features in features_by_model.items():
+            print(f"  Δμ probe trial {trial_idx + 1}/{n_trials} — {model_name}")
+            result = train_regression_probe(
+                features=features,
+                targets=delta_mu,
+                split_indices=split_indices,
+                device=device,
+                epochs=epochs,
+                batch_size=train_batch_size,
+                lr=lr,
+                hidden_dims=hidden_dims_by_model[model_name],
+                seed=seed + 1000 * (trial_idx + 1) + len(model_name),
+            )
+            trial_results[model_name].append(result)
+            print(
+                f"    best_epoch={result['best_epoch']}  "
+                f"best_val_mae={result['best_val_mae']:.2f}  "
+                f"test_mae={result['test_mae']:.2f}",
+                flush=True,
+            )
+
+    plot_delta_mu_probe_convergence(
+        trial_results=trial_results,
+        output_epoch_path=os.path.join(out_dir, "delta_mu_probe_convergence_epoch.png"),
+        output_time_path=os.path.join(out_dir, "delta_mu_probe_convergence_time.png"),
+    )
+    plot_delta_mu_probe_mae_bars(
+        trial_results=trial_results,
+        output_path=os.path.join(out_dir, "delta_mu_probe_mae_bar.png"),
+    )
+
+    summary: Dict[str, Any] = {
+        "n_events": int(n_events),
+        "epochs": int(epochs),
+        "n_trials": int(n_trials),
+        "train_batch_size": int(train_batch_size),
+        "encode_batch_size": int(encode_batch_size),
+        "models": {},
+    }
+    for model_name, results in trial_results.items():
+        test_mae = np.asarray([res["test_mae"] for res in results], dtype=np.float32)
+        test_rmse = np.asarray([res["test_rmse"] for res in results], dtype=np.float32)
+        best_epoch = np.asarray([res["best_epoch"] for res in results], dtype=np.float32)
+        best_val_mae = np.asarray([res["best_val_mae"] for res in results], dtype=np.float32)
+        final_time = np.asarray([res["val_times"][-1] for res in results], dtype=np.float32)
+        summary["models"][model_name] = {
+            "feature_dim": int(features_by_model[model_name].shape[1]),
+            "test_mae_mean": float(np.mean(test_mae)),
+            "test_mae_std": float(np.std(test_mae)),
+            "test_rmse_mean": float(np.mean(test_rmse)),
+            "test_rmse_std": float(np.std(test_rmse)),
+            "best_epoch_mean": float(np.mean(best_epoch)),
+            "best_epoch_std": float(np.std(best_epoch)),
+            "best_val_mae_mean": float(np.mean(best_val_mae)),
+            "best_val_mae_std": float(np.std(best_val_mae)),
+            "final_time_sec_mean": float(np.mean(final_time)),
+            "final_time_sec_std": float(np.std(final_time)),
+        }
+
     write_json(os.path.join(out_dir, "summary.json"), summary)
     return summary
 
@@ -1906,6 +2659,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recon-events", type=int, default=2048)
     parser.add_argument("--recon-compare-examples", type=int, default=6, help="Full-PMT reconstruction comparison figures to save.")
     parser.add_argument("--diffae-samples", type=int, default=4, help="Independent DiffAE Light samples per event for stochasticity metrics.")
+    parser.add_argument("--distribution-events", type=int, default=1024, help="Cached events to use for distribution-alignment plots.")
+    parser.add_argument("--distribution-examples", type=int, default=6, help="Selected events for conditional z-profile alignment figures.")
+    parser.add_argument("--delta-mu-probe-events", type=int, default=1024, help="Cached events to use for the Δμ regression probe.")
+    parser.add_argument("--delta-mu-probe-epochs", type=int, default=80, help="Epochs for each Δμ regression probe.")
+    parser.add_argument("--delta-mu-probe-trials", type=int, default=3, help="Independent train/val/test splits for Δμ probe error bars.")
+    parser.add_argument("--delta-mu-probe-batch-size", type=int, default=256, help="Batch size for Δμ probe MLP training.")
+    parser.add_argument("--delta-mu-probe-lr", type=float, default=1e-3, help="Learning rate for the Δμ probe MLPs.")
     parser.add_argument("--rq-samples", type=int, default=500)
     parser.add_argument("--rq-examples", type=int, default=6)
     parser.add_argument("--latent-samples", type=int, default=5000)
@@ -1929,6 +2689,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-recon", action="store_true")
     parser.add_argument("--skip-recon-compare", action="store_true")
+    parser.add_argument("--skip-distribution", action="store_true")
+    parser.add_argument("--skip-delta-mu-probe", action="store_true")
     parser.add_argument("--skip-rq", action="store_true")
     parser.add_argument("--skip-latent", action="store_true")
     parser.add_argument("--skip-latent-sampling", action="store_true")
@@ -2019,6 +2781,44 @@ def main() -> None:
                 shared_store=shared_store,
                 out_dir=out_dir,
                 n_examples=args.recon_compare_examples,
+                seed=args.seed,
+            ),
+        )
+
+    if not args.skip_distribution:
+        out_dir = os.path.join(output_root, "distribution_alignment")
+        run_experiment(
+            summary,
+            summary_path,
+            "distribution_alignment",
+            out_dir,
+            lambda: run_distribution_alignment(
+                models=models,
+                shared_store=shared_store,
+                out_dir=out_dir,
+                n_events=args.distribution_events,
+                n_examples=args.distribution_examples,
+                seed=args.seed,
+            ),
+        )
+
+    if not args.skip_delta_mu_probe:
+        out_dir = os.path.join(output_root, "delta_mu_probe")
+        run_experiment(
+            summary,
+            summary_path,
+            "delta_mu_probe",
+            out_dir,
+            lambda: run_delta_mu_probe(
+                models=models,
+                shared_store=shared_store,
+                out_dir=out_dir,
+                n_events=args.delta_mu_probe_events,
+                encode_batch_size=args.batch_size,
+                train_batch_size=args.delta_mu_probe_batch_size,
+                epochs=args.delta_mu_probe_epochs,
+                n_trials=args.delta_mu_probe_trials,
+                lr=args.delta_mu_probe_lr,
                 seed=args.seed,
             ),
         )

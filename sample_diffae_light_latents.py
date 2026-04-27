@@ -24,6 +24,7 @@ import torch
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
 from config import get_config
 from diffae_light import (
@@ -32,6 +33,7 @@ from diffae_light import (
     sample_from_latent_diffae_light,
 )
 from plot_style import COLORS, apply_style
+from plot_real_event_3d import plot_waveform_3d_scatter
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,6 +234,49 @@ def save_visualization(
     plt.close(fig)
 
 
+def save_visualization_3d(
+    waveforms: np.ndarray,
+    channel_positions: np.ndarray,
+    output_path: str,
+    ns_per_bin: float,
+    threshold_quantile: float = 0.95,
+    min_amplitude: float | None = None,
+) -> None:
+    apply_style()
+    n_samples = waveforms.shape[0]
+    n_cols = min(3, n_samples)
+    n_rows = (n_samples + n_cols - 1) // n_cols
+    fig = plt.figure(figsize=(4.15 * n_cols + 0.7, 4.55 * n_rows))
+    axes = [fig.add_subplot(n_rows, n_cols, idx + 1, projection="3d") for idx in range(n_samples)]
+
+    vmax = max(float(np.max(wf)) for wf in waveforms)
+    norm = Normalize(vmin=0.0, vmax=max(vmax, 1e-8))
+    cmap = plt.get_cmap("viridis")
+    scatter = None
+
+    for idx, ax in enumerate(axes):
+        panel = plot_waveform_3d_scatter(
+            ax,
+            waveforms[idx],
+            channel_positions,
+            ns_per_bin=ns_per_bin,
+            threshold_quantile=threshold_quantile,
+            min_amplitude=min_amplitude,
+            norm=norm,
+            cmap=cmap,
+            title=f"Sample {idx + 1}",
+        )
+        scatter = panel["scatter"]
+
+    fig.subplots_adjust(left=0.03, right=0.91, bottom=0.08, top=0.90, wspace=0.02, hspace=0.18)
+    cax = fig.add_axes([0.925, 0.20, 0.013, 0.58])
+    cbar = fig.colorbar(scatter, cax=cax)
+    cbar.ax.set_ylabel("Amplitude (AU)")
+    fig.suptitle("DiffAE Light samples from random latent draws", fontweight="bold", y=0.965)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -278,9 +323,16 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
     stem = f"diffae_light_latent_samples_seed{args.seed}"
     figure_path = os.path.join(output_dir, f"{stem}.png")
+    figure_3d_path = os.path.join(output_dir, f"{stem}_3d.png")
     array_path = os.path.join(output_dir, f"{stem}.npz")
 
     save_visualization(waveforms, ctx.loader.channel_positions, figure_path)
+    save_visualization_3d(
+        waveforms,
+        ctx.loader.channel_positions,
+        figure_3d_path,
+        ns_per_bin=ctx.cfg.ms_data.ns_per_bin,
+    )
     np.savez_compressed(
         array_path,
         waveforms=waveforms.astype(np.float32),
@@ -295,6 +347,7 @@ def main() -> None:
 
     print(f"Saved samples to {array_path}")
     print(f"Saved quick-look figure to {figure_path}")
+    print(f"Saved 3D quick-look figure to {figure_3d_path}")
 
 
 if __name__ == "__main__":
