@@ -27,7 +27,7 @@ from plot_style import apply_style, COLORS
 from tqdm import tqdm
 
 from data import Graph, visualize_event, visualize_event_z, SparseGraph
-from lz_data_loader import TritiumSSDataLoader, OnlineMSBatcher
+from data_loader import TritiumSSDataLoader, OnlineMSBatcher
 from config import Config, default_config, get_config, print_config
 
 from models.graph_unet import (
@@ -36,6 +36,13 @@ from models.graph_unet import (
 )
 from diffusion.schedule import build_cosine_schedule, sinusoidal_embedding
 from utils.sparse_ops import to_coalesced_coo, subgraph_coo, to_binary
+from utils.run_paths import (
+    ensure_dir,
+    ensure_parent_dir,
+    epoch_plot_dir,
+    latest_checkpoint,
+    resolve_model_run_dirs,
+)
 from utils.visualization import build_xy_adjacency_radius
 
 from ae import (
@@ -119,7 +126,7 @@ class DiffAEContext:
 
         schedule = build_cosine_schedule(cfg.diffusion.timesteps, device)
 
-        encoder_type = (getattr(cfg.encoder, "encoder_type", "graph") or "graph").lower()
+        encoder_type = cfg.encoder.encoder_type.lower()
         if encoder_type == "cnn":
             encoder = Conv1DEncoder(
                 in_dim=cfg.model.in_dim,
@@ -137,7 +144,7 @@ class DiffAEContext:
                 hidden_dim=cfg.encoder.mlp_hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
-                num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
+                num_layers=cfg.encoder.mlp_encoder_layers,
                 dropout=cfg.encoder.dropout,
                 use_stochastic=cfg.encoder.use_stochastic,
             ).to(device)
@@ -165,19 +172,20 @@ class DiffAEContext:
             out_dim=cfg.model.out_dim,
             dropout=cfg.model.dropout,
             pos_dim=cfg.model.pos_dim,
-            skip_scale=getattr(cfg.model, 'skip_scale', 1.0),
+            skip_scale=cfg.model.skip_scale,
+            cache_norm_top=cfg.model.cache_norm_top,
         ).to(device)
 
         regressive_decoder = None
         if cfg.encoder.use_regressive_head:
-            decoder_type = (getattr(cfg.encoder, "decoder_type", "mlp") or "mlp").lower()
+            decoder_type = cfg.encoder.decoder_type.lower()
             if decoder_type == "mlp":
                 regressive_decoder = MLPDecoder(
                     latent_dim=cfg.encoder.latent_dim,
                     hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                     out_dim=cfg.model.out_dim,
                     n_nodes=n_nodes,
-                    num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
+                    num_layers=cfg.encoder.mlp_decoder_layers,
                     dropout=cfg.encoder.dropout,
                 ).to(device)
             else:
@@ -196,9 +204,11 @@ class DiffAEContext:
         ema_decoder = None
         ema_regressive_decoder = None
         optim = None
-        subdir = cfg.paths.diffae_subdir.format(latent_dim=cfg.encoder.latent_dim)
-        checkpoint_dir = os.path.join(cfg.paths.checkpoint_dir, subdir)
-        plot_dir = os.path.join(cfg.paths.plot_dir, subdir)
+        checkpoint_dir, plot_dir = resolve_model_run_dirs(
+            cfg,
+            "diffae_subdir",
+            create=for_training,
+        )
 
         if for_training:
             ema_encoder = deepcopy(encoder).to(device)
@@ -216,8 +226,6 @@ class DiffAEContext:
                 betas=(0.9, 0.999),
                 weight_decay=cfg.training.weight_decay,
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
         if verbose:
             n_enc = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
             n_dec = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
@@ -254,19 +262,7 @@ class DiffAEContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = glob.glob(os.path.join(self.checkpoint_dir, "diffae_epoch_*.pt"))
-        if not files:
-            return None
-
-        def _epoch_num(path: str) -> int:
-            base = os.path.basename(path)
-            stem = os.path.splitext(base)[0]
-            try:
-                return int(stem.split("_")[-1])
-            except (ValueError, IndexError):
-                return -1
-
-        return max(files, key=_epoch_num)
+        return latest_checkpoint(self.checkpoint_dir, "diffae_epoch_*.pt")
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
@@ -447,7 +443,7 @@ def save_encoded_dataset(
 
     latents = np.concatenate(all_latents, axis=0)
 
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    ensure_parent_dir(output_path)
 
     with h5py.File(output_path, 'w') as f:
         f.create_dataset('latents', data=latents, dtype=np.float32)
@@ -682,8 +678,9 @@ def sample_diffae_partial(
     return x.permute(0, 2, 1)
 
 
-def train_diffae(cfg: Config = default_config):
+def train_diffae(cfg: Optional[Config] = None):
     """Main DiffAE training function."""
+    cfg = get_config() if cfg is None else cfg
     print_config(cfg, include_encoder=True)
 
     ctx = DiffAEContext.build(cfg, for_training=True, verbose=True)
@@ -751,7 +748,7 @@ def train_diffae(cfg: Config = default_config):
 
     B = cfg.training.batch_size
 
-    steps_per_epoch = tr.n_samples // B
+    steps_per_epoch = cfg.training.resolved_steps_per_epoch(tr.n_samples)
     print(f"  Steps per epoch: {tr.n_samples} samples // batch {B} = {steps_per_epoch}")
 
     global_step = start_epoch * steps_per_epoch
@@ -932,8 +929,7 @@ def train_diffae(cfg: Config = default_config):
                 print(f"\n  [Vis] True data - mean: {true_data.mean():.4f}, std: {true_data.std():.4f}")
                 print(f"  [Vis] Gen data  - mean: {gen_data.mean():.4f}, std: {gen_data.std():.4f}")
 
-            plots_dir = f"{ctx.plot_dir}/epoch_{epoch}"
-            os.makedirs(plots_dir, exist_ok=True)
+            plots_dir = epoch_plot_dir(ctx.plot_dir, epoch)
 
             adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
             Gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))
@@ -992,8 +988,9 @@ def train_diffae(cfg: Config = default_config):
             torch.cuda.empty_cache()
 
 
-def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
+def interpolate_latents(cfg: Optional[Config] = None, n_steps: int = 5):
     """Generate interpolations between two events in latent space."""
+    cfg = get_config() if cfg is None else cfg
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=True)
 
     latest_ckpt = ctx.latest_checkpoint()
@@ -1032,8 +1029,7 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
         samples_denorm = ctx.data_stats.denormalize(samples.cpu().numpy())
         samples_denorm = np.clip(samples_denorm, 0, None)
 
-    plots_dir = f"{ctx.plot_dir}/interpolation"
-    os.makedirs(plots_dir, exist_ok=True)
+    plots_dir = ensure_dir(os.path.join(ctx.plot_dir, "interpolation"))
 
     channel_positions = ctx.loader.channel_positions
     adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)

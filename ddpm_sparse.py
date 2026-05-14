@@ -16,8 +16,8 @@ from tqdm import tqdm
 from copy import deepcopy
 
 from data import Graph, visualize_event, visualize_event_z, SparseGraph
-from lz_data_loader import TritiumSSDataLoader
-from config import Config, default_config, print_config
+from data_loader import TritiumSSDataLoader
+from config import Config, get_config, print_config
 
 # ddpm_sparse uses its own physics-cond projection dimension (not from DiffAE's latent_proj)
 _COND_PROJ_DIM: int = 64
@@ -91,6 +91,7 @@ class ModelContext:
             out_dim=cfg.model.out_dim,
             dropout=cfg.model.dropout,
             pos_dim=cfg.model.pos_dim,
+            cache_norm_top=cfg.model.cache_norm_top,
         ).to(device)
 
         ema_core = None
@@ -273,8 +274,9 @@ def visualize_event_3d(G: SparseGraph, event: np.ndarray, ax=None, colorbar: boo
     return ax
 
 
-def train(cfg: Config = default_config):
+def train(cfg: Optional[Config] = None):
     """Main training function using configuration."""
+    cfg = get_config() if cfg is None else cfg
     print_config(cfg)
     
     ctx = ModelContext.build(cfg, for_training=True, verbose=True)
@@ -334,13 +336,14 @@ def train(cfg: Config = default_config):
     optim.zero_grad()
 
     B = cfg.training.batch_size
+    steps_per_epoch = cfg.training.resolved_steps_per_epoch(tr.n_samples)
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.epochs):
         core.train()
         epoch_loss = 0.0
         loss_by_t_range = {'low': 0.0, 'mid': 0.0, 'high': 0.0, 'count_low': 0, 'count_mid': 0, 'count_high': 0}
-        pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
+        pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
         
         for step in pbar:
             batch_np, batch_cond, _ = tr.get_batch(B)
@@ -679,5 +682,5 @@ def generate_samples(cfg: Config):
     return samples_denorm
 
 if __name__ == "__main__":
-    train(default_config)
-    # generate_samples(default_config)
+    train()
+    # generate_samples(get_config())

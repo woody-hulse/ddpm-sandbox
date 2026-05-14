@@ -301,7 +301,7 @@ class TestGraphAEEncoder:
         assert len(pool_indices) == depth
 
     def test_pool_indices_format(self):
-        """Each entry must be (assign: LongTensor, K: int, adj_fine: sparse, adj_coarse: sparse)."""
+        """Each entry must be (keep_idx, total_before, npg_before, adj_after)."""
         N, B, depth = 16, 2, 3
         adj = grid_adj(4, 4)
         pos = torch.randn(N, 3)
@@ -309,13 +309,15 @@ class TestGraphAEEncoder:
         enc = self._make_encoder(depth=depth)
         _, pool_indices = enc(x, adj, pos, batch_size=B)
         for i, entry in enumerate(pool_indices):
-            assign, K, adj_fine, adj_coarse = entry
-            assert assign.dtype == torch.long, f"stage {i}: assign must be long"
-            assert isinstance(K, int), f"stage {i}: K must be int"
-            assert adj_fine.is_sparse, f"stage {i}: adj_fine must be sparse"
-            assert adj_coarse.is_sparse, f"stage {i}: adj_coarse must be sparse"
-            assert assign.shape == (adj_fine.size(0),), f"stage {i}: assign length must equal N_fine"
-            assert adj_coarse.size() == (K, K), f"stage {i}: adj_coarse must be K×K"
+            keep_idx, total_before, npg_before, adj_after = entry
+            assert keep_idx.dtype == torch.long, f"stage {i}: keep_idx must be long"
+            assert isinstance(total_before, int), f"stage {i}: total_before must be int"
+            assert isinstance(npg_before, int), f"stage {i}: npg_before must be int"
+            assert adj_after.is_sparse, f"stage {i}: adj_after must be sparse"
+            assert keep_idx.ndim == 1, f"stage {i}: keep_idx must be rank-1"
+            assert keep_idx.numel() < total_before, f"stage {i}: pooling must reduce node count"
+            assert total_before % npg_before == 0, f"stage {i}: total_before must be batch-aligned"
+            assert adj_after.size() == (keep_idx.numel(), keep_idx.numel()), f"stage {i}: adj_after must match kept nodes"
 
     def test_coarsening_monotone(self):
         """Each pooling stage must strictly reduce the number of nodes."""
@@ -325,9 +327,10 @@ class TestGraphAEEncoder:
         x = torch.randn(N, 1)
         enc = self._make_encoder(depth=depth)
         _, pool_indices = enc(x, adj, pos, batch_size=B)
-        sizes = [pool_indices[0][2].size(0)]  # adj_fine of first stage = original
-        for assign, K, adj_fine, adj_coarse in pool_indices:
-            sizes.append(K)
+        sizes = [pool_indices[0][1]]
+        for keep_idx, total_before, npg_before, adj_after in pool_indices:
+            assert adj_after.size(0) == keep_idx.numel()
+            sizes.append(adj_after.size(0))
         for i in range(1, len(sizes)):
             assert sizes[i] < sizes[i - 1], f"stage {i}: K={sizes[i]} not < {sizes[i-1]}"
 

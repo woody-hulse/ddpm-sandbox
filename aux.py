@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 from config import Config, default_config, MSDataConfig, AuxTaskConfig
-from lz_data_loader import TritiumSSDataLoader, create_3d_adjacency_matrix_sparse_
+from data_loader import TritiumSSDataLoader, create_3d_adjacency_matrix_sparse_
 from data import SparseGraph
 from diffae import DiffAEContext, DiffAEDataStats, sample_diffae
 from diffusion.schedule import build_cosine_schedule
@@ -135,7 +135,7 @@ def load_graph_ae(
 ) -> Tuple[GraphAE, int]:
     """Load Graph AE from checkpoint. Returns (model, latent_dim)."""
     if cfg is None:
-        cfg = default_config
+        cfg = default_config.copy()
     ckpt = torch.load(ckpt_path, map_location=device)
     latent_dim = int(ckpt["latent_dim"])
     n_nodes = int(ckpt["n_nodes"])
@@ -1077,8 +1077,8 @@ def plot_reconstruction_overlays(
     if not has_ae and not has_diffae:
         return
     if cfg is None:
-        cfg = default_config
-    parametrization = getattr(cfg.diffusion, 'parametrization', 'v')
+        cfg = default_config.copy()
+    parametrization = cfg.diffusion.parametrization
     n_nodes = n_channels * n_time
 
     collected: List[Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]] = []
@@ -1645,7 +1645,7 @@ Examples:
     
     args = parser.parse_args()
     
-    cfg = default_config
+    cfg = default_config.copy()
     latent_dim = args.latent_dim if args.latent_dim is not None else cfg.encoder.latent_dim
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

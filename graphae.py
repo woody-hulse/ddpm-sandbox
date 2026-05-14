@@ -32,8 +32,9 @@ from torch.utils.checkpoint import checkpoint as grad_ckpt
 from ae import DiffAEDataStats, apply_lopsided_augmentation
 from config import Config, default_config, get_config, print_config
 from data import Graph, SparseGraph, visualize_event, visualize_event_z
-from lz_data_loader import OnlineMSBatcher, TritiumSSDataLoader
+from data_loader import OnlineMSBatcher, TritiumSSDataLoader
 from models.graph_unet import SAGPool, build_block_diagonal_adj, _unpool_like
+from utils.run_paths import epoch_plot_dir, latest_checkpoint, resolve_model_run_dirs
 from utils.sparse_ops import sparse_multi_agg, subgraph_coo, to_binary, to_coalesced_coo
 from utils.visualization import build_xy_adjacency_radius
 
@@ -1033,9 +1034,11 @@ class GraphAEContext:
             out_dim=cfg.model.out_dim,
         ).to(device)
 
-        subdir = cfg.paths.graph_ae_subdir.format(latent_dim=cfg.encoder.latent_dim)
-        checkpoint_dir = os.path.join(cfg.paths.checkpoint_dir, subdir)
-        plot_dir = os.path.join(cfg.paths.plot_dir, subdir)
+        checkpoint_dir, plot_dir = resolve_model_run_dirs(
+            cfg,
+            "graph_ae_subdir",
+            create=for_training,
+        )
         ema_model = None
         optim = None
         if for_training:
@@ -1046,8 +1049,6 @@ class GraphAEContext:
                 betas=(0.9, 0.999),
                 weight_decay=cfg.training.weight_decay,
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
         if verbose:
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"GraphAE parameters: {n_params:,}")
@@ -1072,19 +1073,7 @@ class GraphAEContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = glob.glob(os.path.join(self.checkpoint_dir, "graphae_epoch_*.pt"))
-        if not files:
-            return None
-
-        def _epoch_num(path: str) -> int:
-            base = os.path.basename(path)
-            stem = os.path.splitext(base)[0]
-            try:
-                return int(stem.split("_")[-1])
-            except (ValueError, IndexError):
-                return -1
-
-        return max(files, key=_epoch_num)
+        return latest_checkpoint(self.checkpoint_dir, "graphae_epoch_*.pt")
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
@@ -1134,8 +1123,7 @@ def _save_training_visualizations(
     n_channels = ctx.n_channels
     n_time_points = ctx.n_time_points
     channel_positions = ctx.loader.channel_positions
-    plots_dir = f"{ctx.plot_dir}/epoch_{epoch}"
-    os.makedirs(plots_dir, exist_ok=True)
+    plots_dir = epoch_plot_dir(ctx.plot_dir, epoch)
 
     adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
     gxy = Graph(
@@ -1197,8 +1185,9 @@ def _save_training_visualizations(
         plt.close(fig)
 
 
-def train_graphae(cfg: Config = default_config):
+def train_graphae(cfg: Optional[Config] = None):
     """Train GraphAE with visualization outputs similar to AE/DiffAE scripts."""
+    cfg = get_config() if cfg is None else cfg
     print("=" * 50)
     print("GraphAE Training")
     print("=" * 50)
@@ -1214,7 +1203,7 @@ def train_graphae(cfg: Config = default_config):
     pos = ctx.pos
     n_nodes = ctx.n_nodes
     B = cfg.training.batch_size
-    steps_per_epoch = tr.n_samples // B
+    steps_per_epoch = cfg.training.resolved_steps_per_epoch(tr.n_samples)
 
     start_epoch = 0
     if cfg.resume:

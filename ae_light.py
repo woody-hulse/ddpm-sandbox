@@ -37,7 +37,14 @@ from diffae_light import (
     _load_compatible_state_dict,
     build_graph_pyramid,
 )
-from lz_data_loader import OnlineMSBatcher, TritiumSSDataLoader
+from data_loader import OnlineMSBatcher, TritiumSSDataLoader
+from utils.run_paths import (
+    ensure_parent_dir,
+    epoch_plot_dir,
+    latest_checkpoint,
+    latest_checkpoint_across_runs,
+    resolve_model_run_dirs,
+)
 from utils.visualization import build_xy_adjacency_radius
 
 
@@ -132,7 +139,7 @@ class AELightContext:
         if verbose:
             print(f"Decoder pyramid nodes: {[level.n_nodes for level in decoder_pyramid.levels]}")
 
-        encoder_type = (getattr(cfg.encoder, "encoder_type", "graph") or "graph").lower()
+        encoder_type = cfg.encoder.encoder_type.lower()
         encoder_pyramid: Optional[GraphPyramid] = None
         if encoder_type == "graph":
             same_pyramid = (
@@ -186,21 +193,21 @@ class AELightContext:
                 hidden_dim=cfg.encoder.mlp_hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
-                num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
+                num_layers=cfg.encoder.mlp_encoder_layers,
                 dropout=cfg.encoder.dropout,
                 use_stochastic=cfg.encoder.use_stochastic,
             ).to(device)
         else:
             raise ValueError(f"Unsupported encoder_type: {encoder_type}")
 
-        decoder_type = (getattr(cfg.encoder, "decoder_type", "graph") or "graph").lower()
+        decoder_type = cfg.encoder.decoder_type.lower()
         if decoder_type == "mlp":
             decoder = MLPDecoder(
                 latent_dim=cfg.encoder.latent_dim,
                 hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
-                num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
+                num_layers=cfg.encoder.mlp_decoder_layers,
                 dropout=cfg.encoder.dropout,
             ).to(device)
         else:
@@ -219,8 +226,11 @@ class AELightContext:
         ema_encoder = None
         ema_decoder = None
         optim = None
-        checkpoint_dir = os.path.join(cfg.paths.checkpoint_dir, f"ae_light_z{cfg.encoder.latent_dim}")
-        plot_dir = os.path.join(cfg.paths.plot_dir, f"ae_light_z{cfg.encoder.latent_dim}")
+        checkpoint_dir, plot_dir = resolve_model_run_dirs(
+            cfg,
+            "ae_light_subdir",
+            create=for_training,
+        )
 
         if for_training:
             ema_encoder = deepcopy(encoder).to(device)
@@ -231,9 +241,6 @@ class AELightContext:
                 betas=(0.9, 0.999),
                 weight_decay=cfg.training.weight_decay,
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            os.makedirs(plot_dir, exist_ok=True)
-
         if verbose:
             n_enc = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
             n_dec = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
@@ -263,10 +270,7 @@ class AELightContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = glob.glob(os.path.join(self.checkpoint_dir, "ae_light_epoch_*.pt"))
-        if not files:
-            return None
-        return max(files, key=lambda path: int(os.path.splitext(os.path.basename(path))[0].split("_")[-1]))
+        return latest_checkpoint(self.checkpoint_dir, "ae_light_epoch_*.pt")
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
@@ -305,19 +309,7 @@ class AELightContext:
         if same_latent is not None:
             return same_latent
 
-        parent_dir = os.path.dirname(self.checkpoint_dir)
-        if not os.path.isdir(parent_dir):
-            return None
-
-        all_ckpts = []
-        for subdir in os.listdir(parent_dir):
-            if subdir.startswith("ae_light_z"):
-                ckpts = sorted(glob.glob(os.path.join(parent_dir, subdir, "ae_light_epoch_*.pt")))
-                if ckpts:
-                    all_ckpts.append(ckpts[-1])
-        if not all_ckpts:
-            return None
-        return max(all_ckpts, key=os.path.getmtime)
+        return latest_checkpoint_across_runs(self.checkpoint_dir, "ae_light_z", "ae_light_epoch_*.pt")
 
 
 def _encode_with_context(
@@ -390,7 +382,7 @@ def save_encoded_dataset(
         all_latents.append(z.cpu().numpy())
         samples_encoded += actual_batch_size
 
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    ensure_parent_dir(output_path)
     with h5py.File(output_path, "w") as f:
         f.create_dataset("latents", data=np.concatenate(all_latents, axis=0), dtype=np.float32)
         if all_delta_mu:
@@ -436,7 +428,8 @@ def sample_from_latent(
     return rec_flat.reshape(batch_size, ctx.n_nodes, 1).permute(0, 2, 1)
 
 
-def train_ae_light(cfg: Config = default_config) -> None:
+def train_ae_light(cfg: Optional[Config] = None) -> None:
+    cfg = get_config() if cfg is None else cfg
     print("=" * 50)
     print("AE Light Training")
     print("=" * 50)
@@ -464,7 +457,7 @@ def train_ae_light(cfg: Config = default_config) -> None:
         group["lr"] = cfg.training.lr
 
     batch_size = cfg.training.batch_size
-    steps_per_epoch = max(1, ctx.loader.n_samples // batch_size)
+    steps_per_epoch = cfg.training.resolved_steps_per_epoch(ctx.loader.n_samples)
     encoded_output_path = os.path.join(ctx.checkpoint_dir, "ae_light_encoded_ms_latents.h5")
     amp_enabled = cfg.training.use_amp and ctx.device.type == "cuda"
     amp_dtype = torch.bfloat16 if amp_enabled else torch.float32
@@ -585,8 +578,7 @@ def train_ae_light(cfg: Config = default_config) -> None:
                 samples = reconstruct_ae_light(ctx, x_ref, encoder=enc_vis, decoder=dec_vis)
                 samples_denorm = np.clip(ctx.data_stats.denormalize(samples.cpu().numpy()), 0, None)
 
-            plots_dir = os.path.join(ctx.plot_dir, f"epoch_{epoch}")
-            os.makedirs(plots_dir, exist_ok=True)
+            plots_dir = epoch_plot_dir(ctx.plot_dir, epoch)
             channel_positions = ctx.loader.channel_positions
             adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
             graph_xy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(ctx.n_channels, dtype=np.float32))

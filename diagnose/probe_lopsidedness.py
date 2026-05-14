@@ -229,7 +229,7 @@ def finetune_diffae(ctx, cfg, epochs: int, steps_per_epoch: int, batch_size: int
 
             z, mu, logvar = ctx.encoder(x0.view(B * N, C), ctx.A_sparse, ctx.pos, batch_size=B)
 
-            t_min = int(getattr(cfg.diffusion, 't_min_frac', 0.0) * cfg.diffusion.timesteps)
+            t_min = int(cfg.diffusion.t_min_frac * cfg.diffusion.timesteps)
             t = torch.randint(t_min, cfg.diffusion.timesteps, (B,), device=ctx.device, dtype=torch.long)
             t_emb = sinusoidal_embedding(t, cfg.conditioning.time_dim)
             cond_full = torch.cat([z, t_emb], dim=-1)
@@ -574,7 +574,7 @@ def parse_args():
     parser.add_argument("--finetune-batch-size", type=int, default=8, help="Fine-tuning batch size")
     parser.add_argument("--finetune-lr", type=float, default=None, help="Fine-tuning LR (default: config training.lr)")
     parser.add_argument("--plot-events", type=int, default=4, help="Events to plot for AE/DiffAE reconstructions")
-    parser.add_argument("--plot-dir", type=str, default="probe_outputs", help="Directory for generated plots")
+    parser.add_argument("--plot-dir", type=str, default="figures/diagnostics/probe_lopsidedness", help="Directory for generated plots")
     parser.add_argument("--no-autoencoding-plots", action="store_true", help="Disable reconstruction plot generation")
     parser.add_argument("--skip-diffae-diagnostics", action="store_true", help="Skip DiffAE-only tests 2-5")
     return parser.parse_args()
@@ -582,7 +582,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    cfg = default_config
+    cfg = default_config.copy()
     print("Loading DiffAE model...")
     diffae_ctx = load_diffae_model(cfg)
     print("Loading AE model...")

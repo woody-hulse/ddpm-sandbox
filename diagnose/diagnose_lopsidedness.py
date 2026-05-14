@@ -7,7 +7,7 @@ Runs three inference-only experiments on an existing checkpoint:
   C) Per-timestep loss analysis          (tests H1)
 
 Usage:
-    python diagnose_lopsidedness.py [--n_events 200] [--out_dir lopsided_diagnostics]
+    python -m diagnose.diagnose_lopsidedness [--n_events 200] [--out_dir figures/diagnostics/lopsidedness]
 """
 import os
 import argparse
@@ -410,11 +410,11 @@ def experiment_p2_analysis(ctx, cfg, batch_np, labels, out_dir):
 def main():
     parser = argparse.ArgumentParser(description="Diagnose DiffAE lopsidedness reconstruction")
     parser.add_argument('--n_events', type=int, default=200)
-    parser.add_argument('--out_dir', type=str, default='lopsided_diagnostics')
+    parser.add_argument('--out_dir', type=str, default='figures/diagnostics/lopsidedness')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    cfg = default_config
+    cfg = default_config.copy()
 
     print("Building DiffAE context and loading checkpoint...")
     ctx = DiffAEContext.build(cfg, for_training=False, verbose=True)

@@ -287,7 +287,7 @@ def test_cond_mlp_analysis(ctx, cfg):
 
 
 def main():
-    cfg = default_config
+    cfg = default_config.copy()
     print("Loading model...")
     ctx = load_model_mlp(cfg)
 

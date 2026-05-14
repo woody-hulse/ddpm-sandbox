@@ -9,14 +9,11 @@ __pycache__/
 *.egg
 
 checkpoints/
-light_eval/
-
-plots/
-correlation_analysis/
+figures/
 
 data/*.npz
 data/*.h5
-event_database/*
+event_database/db/
 event_db/*
 
 .claude/
@@ -28,5 +25,3 @@ event_db/*
 
 .DS_Store
 Thumbs.db
-
-archive/

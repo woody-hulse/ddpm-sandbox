@@ -38,7 +38,7 @@ from matplotlib.lines import Line2D
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import default_config, get_config
-from lz_data_loader import shift_waveform_2d
+from data_loader import shift_waveform_2d
 from plot_style import apply_style, COLORS, compact_layout
 
 apply_style()
@@ -310,7 +310,7 @@ def parse_args():
                    choices=["pca", "umap", "tsne"],
                    help="Dimensionality reduction method (default: umap)")
     p.add_argument("--probe-epochs", type=int,  default=1000)
-    p.add_argument("--output-dir",  type=str,   default="diagnose_ss_ms")
+    p.add_argument("--output-dir",  type=str,   default="figures/diagnostics/ss_ms")
     p.add_argument("--point-size",  type=float, default=3.0)
     p.add_argument("--seed",        type=int,   default=42)
     p.add_argument("--latent-dim",  type=int,   default=None,
@@ -322,7 +322,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    cfg = get_config(latent_dim=args.latent_dim) if args.latent_dim else default_config
+    cfg = get_config(latent_dim=args.latent_dim) if args.latent_dim else get_config()
     method_label = {"pca": "PCA", "umap": "UMAP", "tsne": "t-SNE"}[args.method]
     os.makedirs(args.output_dir, exist_ok=True)
 

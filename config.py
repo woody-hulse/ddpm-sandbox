@@ -13,8 +13,33 @@ Usage:
     # Or create with overrides
     cfg = get_config(latent_dim=128, lr=1e-4)
 """
+from __future__ import annotations
+
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Optional
+import os
+from typing import Any, Optional
+
+
+_SECTION_NAMES = (
+    "training",
+    "encoder",
+    "model",
+    "diffusion",
+    "graph",
+    "ms_data",
+    "aux_task",
+    "paths",
+    "conditioning",
+)
+
+_OVERRIDE_ALIASES = {
+    "hidden_dim": ("model", "hidden_dim"),
+    "model_hidden_dim": ("model", "hidden_dim"),
+    "unet_hidden_dim": ("model", "hidden_dim"),
+    "encoder_hidden_dim": ("encoder", "hidden_dim"),
+    "graph_encoder_hidden_dim": ("encoder", "hidden_dim"),
+}
 
 
 # =============================================================================
@@ -37,7 +62,7 @@ class ModelConfig:
     pos_dim: int = 3                # Position embedding dimension (x, y, z)
     pos_dropout: float = 0.0        # Dropout on position embeddings
     cache_norm_top: bool = True     # Cache normalization at top level
-#     skip_scale: float = 0.1         # Scale factor for U-Net skip connections (lower = more reliance on z)
+    skip_scale: float = 1.0         # Scale factor for U-Net skip connections
 
 
 @dataclass
@@ -98,6 +123,7 @@ class DiffusionConfig:
     parametrization: str = "v"      # Prediction target: "v" (velocity) or "eps" (noise)
     p2_gamma: float = 0.0           # P2 loss weighting gamma (0 = uniform, >0 upweights high-noise steps)
     p2_k: float = 1.0               # P2 loss weighting k
+    t_min_frac: float = 0.0         # Optional minimum timestep fraction for fine-tuning probes
 
 # =============================================================================
 # Graph Construction  
@@ -148,6 +174,7 @@ class TrainingConfig:
     # Optimization
     epochs: int = 20_000            # Total training epochs
     batch_size: int = 8             # Batch size
+    steps_per_epoch: Optional[int] = None  # None => use all available batches from the loader
     lr: float = 5e-4                # Learning rate
     lr_schedule: str = "cosine"     # LR schedule: "constant" or "cosine"
     warmup_epochs: int = 0        # Linear warmup epochs (0 = no warmup)
@@ -175,6 +202,11 @@ class TrainingConfig:
     encode_dataset_every: int = 0    # Export encoded latents every N epochs (0 = disable)
     encode_n_samples: int = 500_000       # Number of MS samples to encode and save
 
+    def resolved_steps_per_epoch(self, n_samples: int) -> int:
+        if self.steps_per_epoch is not None:
+            return max(1, int(self.steps_per_epoch))
+        return max(1, int(n_samples) // int(self.batch_size))
+
 
 @dataclass
 class AuxTaskConfig:
@@ -188,7 +220,7 @@ class AuxTaskConfig:
     lr: float = 1e-3                # Learning rate
     hidden_dims: tuple = (128, 64)  # MLP hidden layer dimensions
     dropout: float = 0.1            # Dropout rate
-    output_dir: str = "aux_results" # Directory for aux task outputs
+    output_dir: str = "figures/aux_results" # Directory for aux task outputs
 
 
 # =============================================================================
@@ -207,17 +239,26 @@ class PathConfig:
     
     # Output directories
     checkpoint_dir: str = "checkpoints"
-    plot_dir: str = "plots"
+    plot_dir: str = "figures/plots"
     
     # Subdirectory templates (use .format(latent_dim=N))
     diffae_subdir: str = "diffae_z{latent_dim}"
     ae_subdir: str = "ae_z{latent_dim}"
-    graph_ae_subdir: str = "graph_ae_z{latent_dim}_full"
+    ae_light_subdir: str = "ae_light_z{latent_dim}"
+    diffae_light_subdir: str = "diffae_light_z{latent_dim}"
+    graph_ae_subdir: str = "graph_ae_z{latent_dim}"
 
     # Encoded latent filenames (written by encode_dataset_every)
     ae_latents_file:      str = "ae_encoded_ms_latents.h5"
     graphae_latents_file: str = "graphae_encoded_ms_latents.h5"
     diffae_latents_file:  str = "encoded_ms_latents.h5"
+
+    def run_subdir(self, subdir_attr: str, latent_dim: int) -> str:
+        return getattr(self, subdir_attr).format(latent_dim=latent_dim)
+
+    def run_dirs(self, subdir_attr: str, latent_dim: int) -> tuple[str, str]:
+        subdir = self.run_subdir(subdir_attr, latent_dim)
+        return os.path.join(self.checkpoint_dir, subdir), os.path.join(self.plot_dir, subdir)
 
 
 # =============================================================================
@@ -249,12 +290,42 @@ class Config:
     resume: bool = True             # Resume from checkpoint if available
     visualize: bool = True          # Generate visualizations during training
 
+    def copy(self) -> "Config":
+        return deepcopy(self)
+
+    def update(self, **overrides: Any) -> "Config":
+        for key, value in overrides.items():
+            _apply_override(self, key, value)
+        return self
+
+    def updated(self, **overrides: Any) -> "Config":
+        return self.copy().update(**overrides)
+
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
 default_config = Config()
+
+
+def _apply_override(cfg: Config, key: str, value: Any) -> None:
+    if key in _OVERRIDE_ALIASES:
+        section_name, attr_name = _OVERRIDE_ALIASES[key]
+        setattr(getattr(cfg, section_name), attr_name, value)
+        return
+
+    if hasattr(cfg, key):
+        setattr(cfg, key, value)
+        return
+
+    for section_name in _SECTION_NAMES:
+        section = getattr(cfg, section_name)
+        if hasattr(section, key):
+            setattr(section, key, value)
+            return
+
+    raise KeyError(f"Unknown config override: {key}")
 
 
 def get_config(**overrides) -> Config:
@@ -266,39 +337,7 @@ def get_config(**overrides) -> Config:
         get_config(model_hidden_dim=64)   # sets model.hidden_dim
         get_config(encoder_hidden_dim=64) # sets encoder.hidden_dim
     """
-    cfg = Config()
-    aliases = {
-        "hidden_dim": ("model", "hidden_dim"),
-        "model_hidden_dim": ("model", "hidden_dim"),
-        "unet_hidden_dim": ("model", "hidden_dim"),
-        "encoder_hidden_dim": ("encoder", "hidden_dim"),
-        "graph_encoder_hidden_dim": ("encoder", "hidden_dim"),
-    }
-    
-    for key, value in overrides.items():
-        if key in aliases:
-            section_name, attr_name = aliases[key]
-            setattr(getattr(cfg, section_name), attr_name, value)
-            continue
-
-        # Check top-level
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
-        # Check nested configs
-        elif hasattr(cfg.training, key):
-            setattr(cfg.training, key, value)
-        elif hasattr(cfg.encoder, key):
-            setattr(cfg.encoder, key, value)
-        elif hasattr(cfg.model, key):
-            setattr(cfg.model, key, value)
-        elif hasattr(cfg.diffusion, key):
-            setattr(cfg.diffusion, key, value)
-        elif hasattr(cfg.ms_data, key):
-            setattr(cfg.ms_data, key, value)
-        elif hasattr(cfg.aux_task, key):
-            setattr(cfg.aux_task, key, value)
-    
-    return cfg
+    return Config().update(**overrides)
 
 
 def print_config(cfg: Config, include_encoder: bool = False, include_ms: bool = False) -> None:
@@ -350,3 +389,5 @@ def print_config(cfg: Config, include_encoder: bool = False, include_ms: bool = 
     print(f"  radius: {cfg.graph.radius}")
     print(f"  z_hops: {cfg.graph.z_hops}")
     print("=" * 50)
+
+ 

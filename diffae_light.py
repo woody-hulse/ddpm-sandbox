@@ -42,7 +42,13 @@ from ae import (
 from config import Config, default_config, get_config, print_config
 from data import Graph, SparseGraph, visualize_event, visualize_event_z
 from diffusion.schedule import build_cosine_schedule, sinusoidal_embedding
-from lz_data_loader import OnlineMSBatcher, TritiumSSDataLoader
+from utils.run_paths import (
+    ensure_parent_dir,
+    epoch_plot_dir,
+    latest_checkpoint,
+    resolve_model_run_dirs,
+)
+from data_loader import OnlineMSBatcher, TritiumSSDataLoader
 from plot_style import COLORS, apply_style
 from utils.sparse_ops import to_coalesced_coo
 from utils.visualization import build_xy_adjacency_radius
@@ -187,7 +193,7 @@ class DiffAELightContext:
             scales = [lvl.n_nodes for lvl in decoder_pyramid.levels]
             print(f"Decoder pyramid nodes: {scales}")
 
-        encoder_type = (getattr(cfg.encoder, "encoder_type", "graph") or "graph").lower()
+        encoder_type = cfg.encoder.encoder_type.lower()
         encoder_pyramid: Optional[GraphPyramid] = None
         actual_lpe_dim = 0
         if encoder_type == "graph":
@@ -242,7 +248,7 @@ class DiffAELightContext:
                 hidden_dim=cfg.encoder.mlp_hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
-                num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
+                num_layers=cfg.encoder.mlp_encoder_layers,
                 dropout=cfg.encoder.dropout,
                 use_stochastic=cfg.encoder.use_stochastic,
             ).to(device)
@@ -259,21 +265,22 @@ class DiffAELightContext:
             dropout=cfg.model.dropout,
             pos_dim=cfg.model.pos_dim,
             pos_dropout=cfg.model.pos_dropout,
-            skip_scale=getattr(cfg.model, "skip_scale", 1.0),
+            skip_scale=cfg.model.skip_scale,
+            cache_norm_top=cfg.model.cache_norm_top,
             anchor_count=cfg.encoder.latent_anchor_count,
             anchor_value_dim=max(cfg.encoder.latent_anchor_value_dim, cfg.model.hidden_dim // 4),
         ).to(device)
 
         regressive_decoder: Optional[nn.Module] = None
         if cfg.encoder.use_regressive_head:
-            decoder_type = (getattr(cfg.encoder, "decoder_type", "graph") or "graph").lower()
+            decoder_type = cfg.encoder.decoder_type.lower()
             if decoder_type == "mlp":
                 regressive_decoder = MLPDecoder(
                     latent_dim=cfg.encoder.latent_dim,
                     hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                     out_dim=cfg.model.out_dim,
                     n_nodes=n_nodes,
-                    num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
+                    num_layers=cfg.encoder.mlp_decoder_layers,
                     dropout=cfg.encoder.dropout,
                 ).to(device)
             else:
@@ -294,8 +301,11 @@ class DiffAELightContext:
         ema_regressive_decoder = None
         optim = None
 
-        checkpoint_dir = os.path.join(cfg.paths.checkpoint_dir, f"diffae_light_z{cfg.encoder.latent_dim}")
-        plot_dir = os.path.join(cfg.paths.plot_dir, f"diffae_light_z{cfg.encoder.latent_dim}")
+        checkpoint_dir, plot_dir = resolve_model_run_dirs(
+            cfg,
+            "diffae_light_subdir",
+            create=for_training,
+        )
 
         if for_training:
             ema_encoder = deepcopy(encoder).to(device)
@@ -310,9 +320,6 @@ class DiffAELightContext:
                 betas=(0.9, 0.999),
                 weight_decay=cfg.training.weight_decay,
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            os.makedirs(plot_dir, exist_ok=True)
-
         if verbose:
             n_enc = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
             n_dec = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
@@ -348,10 +355,7 @@ class DiffAELightContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = glob.glob(os.path.join(self.checkpoint_dir, "diffae_light_epoch_*.pt"))
-        if not files:
-            return None
-        return max(files, key=lambda path: int(os.path.splitext(os.path.basename(path))[0].split("_")[-1]))
+        return latest_checkpoint(self.checkpoint_dir, "diffae_light_epoch_*.pt")
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
@@ -1247,7 +1251,7 @@ def save_encoded_dataset(
         samples_encoded += actual_batch_size
 
     latents = np.concatenate(all_latents, axis=0)
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    ensure_parent_dir(output_path)
 
     with h5py.File(output_path, "w") as f:
         f.create_dataset("latents", data=latents, dtype=np.float32)
@@ -1347,7 +1351,8 @@ def sample_from_latent_diffae_light(
     return x.permute(0, 2, 1)
 
 
-def train_diffae_light(cfg: Config = default_config) -> None:
+def train_diffae_light(cfg: Optional[Config] = None) -> None:
+    cfg = get_config() if cfg is None else cfg
     print_config(cfg, include_encoder=True)
     ctx = DiffAELightContext.build(cfg, for_training=True, verbose=True)
 
@@ -1395,7 +1400,7 @@ def train_diffae_light(cfg: Config = default_config) -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=_lr_lambda, last_epoch=start_epoch - 1)
 
     batch_size = cfg.training.batch_size
-    steps_per_epoch = tr.n_samples // batch_size
+    steps_per_epoch = cfg.training.resolved_steps_per_epoch(tr.n_samples)
     print(f"  Steps per epoch: {tr.n_samples} samples // batch {batch_size} = {steps_per_epoch}")
 
     encoded_output_path = os.path.join(ctx.checkpoint_dir, cfg.paths.diffae_latents_file)
@@ -1573,8 +1578,7 @@ def train_diffae_light(cfg: Config = default_config) -> None:
                     reg_samples_denorm = data_stats.denormalize(reg_samples.cpu().numpy())
                     reg_samples_denorm = np.clip(reg_samples_denorm, 0, None)
 
-            plots_dir = os.path.join(ctx.plot_dir, f"epoch_{epoch}")
-            os.makedirs(plots_dir, exist_ok=True)
+            plots_dir = epoch_plot_dir(ctx.plot_dir, epoch)
 
             adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
             gxy = Graph(adjacency=adj2d, positions_xy=channel_positions, positions_z=np.zeros(n_channels, dtype=np.float32))

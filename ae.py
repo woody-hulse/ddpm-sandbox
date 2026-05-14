@@ -22,8 +22,16 @@ from tqdm import tqdm
 
 from typing import Union
 from data import Graph, visualize_event, visualize_event_z, SparseGraph
-from lz_data_loader import TritiumSSDataLoader, OnlineMSBatcher
+from data_loader import TritiumSSDataLoader, OnlineMSBatcher
 from config import Config, default_config, get_config, print_config
+from utils.run_paths import (
+    ensure_dir,
+    ensure_parent_dir,
+    epoch_plot_dir,
+    latest_checkpoint,
+    latest_checkpoint_across_runs,
+    resolve_model_run_dirs,
+)
 
 DataLoaderType = Union[TritiumSSDataLoader, OnlineMSBatcher]
 
@@ -496,7 +504,7 @@ class AEContext:
         if verbose:
             print(f"Data mean: {data_stats.mean:.4f}, std: {data_stats.std:.4f}")
 
-        encoder_type = (getattr(cfg.encoder, "encoder_type", "cnn") or "cnn").lower()
+        encoder_type = cfg.encoder.encoder_type.lower()
         if encoder_type == "cnn":
             encoder = Conv1DEncoder(
                 in_dim=cfg.model.in_dim,
@@ -513,7 +521,7 @@ class AEContext:
                 hidden_dim=cfg.encoder.mlp_hidden_dim,
                 latent_dim=cfg.encoder.latent_dim,
                 n_nodes=n_nodes,
-                num_layers=getattr(cfg.encoder, "mlp_encoder_layers", 3),
+                num_layers=cfg.encoder.mlp_encoder_layers,
                 dropout=cfg.encoder.dropout,
             ).to(device)
         else:
@@ -527,14 +535,14 @@ class AEContext:
                 pool_size=cfg.encoder.conv_pool_size,
             ).to(device)
 
-        decoder_type = (getattr(cfg.encoder, "decoder_type", "mlp") or "mlp").lower()
+        decoder_type = cfg.encoder.decoder_type.lower()
         if decoder_type == "mlp":
             decoder = MLPDecoder(
                 latent_dim=cfg.encoder.latent_dim,
                 hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
-                num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
+                num_layers=cfg.encoder.mlp_decoder_layers,
                 dropout=cfg.encoder.dropout,
             ).to(device)
         elif decoder_type == "cnn":
@@ -553,16 +561,18 @@ class AEContext:
                 hidden_dim=cfg.encoder.mlp_decoder_hidden_dim,
                 out_dim=cfg.model.out_dim,
                 n_nodes=n_nodes,
-                num_layers=getattr(cfg.encoder, "mlp_decoder_layers", 3),
+                num_layers=cfg.encoder.mlp_decoder_layers,
                 dropout=cfg.encoder.dropout,
             ).to(device)
 
         ema_encoder = None
         ema_decoder = None
         optim = None
-        subdir = cfg.paths.ae_subdir.format(latent_dim=cfg.encoder.latent_dim)
-        checkpoint_dir = os.path.join(cfg.paths.checkpoint_dir, subdir)
-        plot_dir = os.path.join(cfg.paths.plot_dir, subdir)
+        checkpoint_dir, plot_dir = resolve_model_run_dirs(
+            cfg,
+            "ae_subdir",
+            create=for_training,
+        )
 
         if for_training:
             ema_encoder = deepcopy(encoder).to(device)
@@ -574,8 +584,6 @@ class AEContext:
                 betas=(0.9, 0.999),
                 weight_decay=cfg.training.weight_decay,
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
         if verbose:
             n_enc = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
             n_dec = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
@@ -605,19 +613,7 @@ class AEContext:
         )
 
     def latest_checkpoint(self) -> Optional[str]:
-        files = glob.glob(os.path.join(self.checkpoint_dir, "ae_epoch_*.pt"))
-        if not files:
-            return None
-
-        def _epoch_num(path: str) -> int:
-            base = os.path.basename(path)
-            stem = os.path.splitext(base)[0]
-            try:
-                return int(stem.split("_")[-1])
-            except (ValueError, IndexError):
-                return -1
-
-        return max(files, key=_epoch_num)
+        return latest_checkpoint(self.checkpoint_dir, "ae_epoch_*.pt")
 
     def save_checkpoint(self, epoch: int) -> str:
         state = {
@@ -654,21 +650,7 @@ class AEContext:
         if same_latent is not None:
             return same_latent
 
-        parent_dir = os.path.dirname(self.checkpoint_dir)
-        if not os.path.isdir(parent_dir):
-            return None
-
-        all_ckpts = []
-        for subdir in os.listdir(parent_dir):
-            if subdir.startswith("ae_z"):
-                subdir_path = os.path.join(parent_dir, subdir)
-                ckpt_files = sorted(glob.glob(os.path.join(subdir_path, "ae_epoch_*.pt")))
-                if ckpt_files:
-                    all_ckpts.append(ckpt_files[-1])
-
-        if all_ckpts:
-            return max(all_ckpts, key=os.path.getmtime)
-        return None
+        return latest_checkpoint_across_runs(self.checkpoint_dir, "ae_z", "ae_epoch_*.pt")
 
     def load_checkpoint_partial(self, path: str, verbose: bool = True) -> Tuple[int, bool]:
         """
@@ -792,7 +774,7 @@ def save_encoded_dataset(
 
     latents = np.concatenate(all_latents, axis=0)
 
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    ensure_parent_dir(output_path)
 
     with h5py.File(output_path, 'w') as f:
         f.create_dataset('latents', data=latents, dtype=np.float32)
@@ -866,8 +848,9 @@ def sample_from_latent(
     return rec
 
 
-def train_ae(cfg: Config = default_config):
+def train_ae(cfg: Optional[Config] = None):
     """Main AE training function."""
+    cfg = get_config() if cfg is None else cfg
     print("=" * 50)
     print("Graph AE Training")
     print("=" * 50)
@@ -920,7 +903,8 @@ def train_ae(cfg: Config = default_config):
 
     B = cfg.training.batch_size
 
-    global_step = start_epoch * cfg.training.steps_per_epoch
+    steps_per_epoch = cfg.training.resolved_steps_per_epoch(tr.n_samples)
+    global_step = start_epoch * steps_per_epoch
     encoded_output_path = os.path.join(ctx.checkpoint_dir, cfg.paths.ae_latents_file)
 
     if cfg.training.lopsided_aug:
@@ -937,7 +921,7 @@ def train_ae(cfg: Config = default_config):
         epoch_loss = 0.0
         epoch_recon = 0.0
         epoch_l1 = 0.0
-        pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
+        pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch+1}/{cfg.training.epochs}", ncols=120, file=sys.stdout)
 
         for step in pbar:
             batch_np, _, sample_idx = tr.get_batch(B)
@@ -1032,8 +1016,7 @@ def train_ae(cfg: Config = default_config):
                 print(f"\n  [Vis] True data - mean: {true_data.mean():.4f}, std: {true_data.std():.4f}")
                 print(f"  [Vis] Gen data  - mean: {gen_data.mean():.4f}, std: {gen_data.std():.4f}")
 
-            plots_dir = f"{ctx.plot_dir}/epoch_{epoch}"
-            os.makedirs(plots_dir, exist_ok=True)
+            plots_dir = epoch_plot_dir(ctx.plot_dir, epoch)
 
             for idx in range(samples.shape[0]):
                 rec_int = samples_denorm[idx, 0]
@@ -1067,8 +1050,9 @@ def train_ae(cfg: Config = default_config):
                 plt.close(fig)
 
 
-def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
+def interpolate_latents(cfg: Optional[Config] = None, n_steps: int = 5):
     """Generate interpolations between two events in latent space."""
+    cfg = get_config() if cfg is None else cfg
     ctx = AEContext.build(cfg, for_training=False, verbose=True)
 
     latest_ckpt = ctx.latest_checkpoint()
@@ -1103,8 +1087,7 @@ def interpolate_latents(cfg: Config = default_config, n_steps: int = 5):
         samples_denorm = ctx.data_stats.denormalize(samples.cpu().numpy())
         samples_denorm = np.clip(samples_denorm, 0, None)
 
-    plots_dir = f"{ctx.plot_dir}/interpolation"
-    os.makedirs(plots_dir, exist_ok=True)
+    plots_dir = ensure_dir(os.path.join(ctx.plot_dir, "interpolation"))
 
     channel_positions = ctx.loader.channel_positions
     adj2d = build_xy_adjacency_radius(channel_positions, radius=cfg.graph.radius)
